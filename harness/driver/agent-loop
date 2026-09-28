@@ -27,6 +27,11 @@ export WRAPUP_HANDOVER=$HANDOVER_MODE   # the hand-over extension words its mess
 VIEWER=${VIEWER:-tui}            # tui: Pi's own TUI in tmux window $AGENT_TMUX; json: headless (pi-live viewer)
 AGENT_TMUX=${AGENT_TMUX:-main:agent}
 THINKING=${THINKING:-xhigh}  # Pi level; models.json maps it to Qwen3.8's reasoning_effort
+# The agent harness: pi (default) or omp (Oh My Pi, a Pi fork). omp runs headless (print mode, JSON events) with the
+# same extensions loaded through --hook; its thinking level "high" = thinking on (the chat template's default effort
+# is xhigh, the same as Pi's setting here).
+AGENT_CMD=${AGENT_CMD:-pi}
+[ "$AGENT_CMD" = omp ] && VIEWER=json
 export PI_SKIP_VERSION_CHECK=1
 export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
 cd "$P" || exit 1
@@ -78,14 +83,15 @@ harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
       --arg server_notes "$([ -f "$notes" ] && keep < "$notes")" \
       --arg webtools "$([ -f /opt/webtools/fetch.py ] && keep < /opt/webtools/fetch.py)" \
       --argjson notes "$(jq -c . "$notes" 2>/dev/null || echo null)" --argjson vllm "${vllm:-null}" \
-      --arg pi_version "$(pi --version 2>/dev/null)" \
+      --arg pi_version "$(pi --version 2>/dev/null)" --arg agent_cmd "$AGENT_CMD" \
+      --arg agent_version "$("$AGENT_CMD" --version 2>/dev/null < /dev/null | head -1)" \
       --arg thinking "$THINKING" --arg test_cmd "$TEST_CMD" --argjson iter_timeout "$ITER_TIMEOUT" \
       --argjson settings "$(cat "$pc/settings.json")" --argjson models "${models:-null}" --argjson props "${props:-null}" '
     {files: {driver: $driver, archiver: $archiver, task_tools: $task_tools, extensions: $extensions, agents_md: $agents_md,
              pi_settings: $pi_settings, pi_models: $pi_models, server_props: $server_props, server_notes: $server_notes,
              webtools: $webtools},
      server_notes: $notes, vllm: $vllm,
-     pi_version: $pi_version, thinking: $thinking, test_cmd: $test_cmd, iter_timeout: $iter_timeout,
+     pi_version: $pi_version, agent_cmd: $agent_cmd, agent_version: $agent_version, thinking: $thinking, test_cmd: $test_cmd, iter_timeout: $iter_timeout,
      compaction: $settings.compaction,
      model: ([$models.providers[$settings.defaultProvider].models[]? | select(.id == $settings.defaultModel)
               | {id, contextWindow, maxTokens, input}] | first),
@@ -363,6 +369,14 @@ for i in $(seq "$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 )
     rc=$(cat .agent/rc 2>/dev/null || echo 1)
     f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
     if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi
+  elif [ "$AGENT_CMD" = omp ]; then
+    hooks=(); for x in "$HOME"/.pi/agent/extensions/*.ts; do hooks+=(--hook "$x"); done
+    PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
+      --session-dir ".agent/sessions/iter-$n4.d" "${hooks[@]}" "$PROMPT" \
+      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
+    echo $! > .agent/pi.pid
+    wait $!
+    rc=$?
   else
     timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
@@ -409,6 +423,8 @@ for i in $(seq "$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 )
   # A session whose last model request failed (e.g. HTTP 400 from the server) ended without its hand-over.
   serr=$(jq -s -r '[.[] | select(.type == "message" or .type == "message_end") | .message | select(.role == "assistant")]
                    | last | select(.stopReason == "error") | (.errorMessage // "error")' ".agent/sessions/iter-$n4.jsonl" 2>/dev/null | head -c 300)
+  # the hand-over's own hard stop aborts the last request ("This operation was aborted"): that is not a server error
+  if [ -n "$serr" ] && grep -q '^\[wrapup\] abort' ".agent/sessions/iter-$n4.stderr" 2>/dev/null && [[ $serr == *aborted* ]]; then serr=""; fi
   [ -n "$serr" ] && log "WARNING: session $i ended with a model-server error: $serr"
   searches=$(grep -c '^\[research\] search' "$err" 2>/dev/null); searches=${searches:-0}
   fetches=$(grep -c '^\[research\] fetch' "$err" 2>/dev/null); fetches=${fetches:-0}

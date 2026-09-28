@@ -1,0 +1,18 @@
+# Oh My Pi -> the lab's vLLM server (through the VM's tunnel), same Qwen settings as the Pi config
+providers:
+  lab:
+    baseUrl: http://127.0.0.1:8080/v1
+    api: openai-completions
+    auth: none
+    models:
+      - id: qwen3.8-27b
+        name: Qwen3.8-27B W4A16 (vLLM HyperQwen)
+        reasoning: true
+        input: [text, image]
+        contextWindow: 150000
+        maxTokens: 32768
+        compat:
+          thinkingFormat: qwen-chat-template
+          reasoningContentField: reasoning
+          supportsDeveloperRole: false
+          supportsReasoningEffort: false

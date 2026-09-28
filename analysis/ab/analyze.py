@@ -5,7 +5,10 @@ For every session after the first: the notes the previous session left (arm A: P
 ## Hand-over plus, for a subtask, the parent's) and what the next session actually did first (first tool calls and
 first text). Pairs go to ~/ab/pairs.json shuffled, labelled only by a random id; the key goes to ~/ab/pairs-key.json.
 """
-import json, os, random, re, subprocess, statistics as st
+import json, os, random, re, subprocess, statistics as st, sys
+
+# where each arm keeps its hand-over notes (arm O = Oh My Pi with PROGRESS.md notes, A2/B2 = repeats of A/B)
+TASK_NOTES = {"B", "B2"}
 
 HOME = os.path.expanduser("~")
 MEM = re.compile(r"(PROGRESS|DECISIONS|CODEMAP|AGENTS)\.md|tasks/")
@@ -27,9 +30,9 @@ def handover(d, commit, task):
 
 def first_actions(d, it, n=8):
     f = os.path.join(d, f".agent/sessions/iter-{it:04d}.jsonl")
-    acts, text, ctx, first_edit = [], "", 0, None
+    acts, text, ctx, first_edit, think = [], "", 0, None, 0
     if not os.path.exists(f) or os.path.getsize(f) == 0:
-        return acts, text, first_edit
+        return acts, text, first_edit, think
     for line in open(f):
         try:
             e = json.loads(line)
@@ -40,7 +43,9 @@ def first_actions(d, it, n=8):
         m = e.get("message") or {}
         if m.get("role") != "assistant":
             continue
-        ctx = (m.get("usage") or {}).get("totalTokens") or ctx
+        u = m.get("usage") or {}
+        ctx = u.get("totalTokens") or ctx
+        think += u.get("reasoning") or u.get("reasoningTokens") or 0   # Pi: reasoning, Oh My Pi: reasoningTokens
         for c in m.get("content") or []:
             if c.get("type") == "text" and not text and c.get("text", "").strip():
                 text = c["text"].strip()[:600]
@@ -52,7 +57,7 @@ def first_actions(d, it, n=8):
                 if len(acts) < n:
                     what = p or str(a.get("command") or a.get("query") or a.get("url") or "")
                     acts.append(f"{c.get('name')}: {what[:160]}")
-    return acts, text, first_edit
+    return acts, text, first_edit, think
 
 
 def arm(name):
@@ -60,13 +65,13 @@ def arm(name):
     led = [json.loads(l) for l in open(os.path.join(d, ".agent/iterations.jsonl")) if l.strip()]
     rows, pairs = [], []
     for i, r in enumerate(led):
-        acts, text, fe = first_actions(d, r["iter"])
-        rows.append(dict(r, first_edit=fe))
+        acts, text, fe, think = first_actions(d, r["iter"])
+        rows.append(dict(r, first_edit=fe, think=think))
         if i == 0:
             continue
         prev = led[i - 1]
         c = commit_at(d, prev["end"])
-        if name == "A":
+        if name not in TASK_NOTES:
             notes = git(d, "show", f"{c}:PROGRESS.md").strip()
         else:
             notes = handover(d, c, r["task"])
@@ -90,7 +95,9 @@ def summary(name, rows):
           f"total hours {sum(r.get('agent_secs') or 0 for r in rows) / 3600:.2f}")
     fe = [r["first_edit"] for r in rows if r.get("first_edit")]
     print(f"  median context at first code edit: {st.median(fe) / 1000:.0f}k" if fe else "  no code edits")
-    if name == "B":
+    errs = sum(1 for r in rows if r.get("session_error"))
+    print(f"  sessions ending on a server error: {errs}, reasoning tokens total: {sum(r.get('think', 0) for r in rows)}")
+    if name in TASK_NOTES:
         inn = sum(r.get("handover_in_task") is True for r in rows); g = sum(r.get("handover_guard") is True for r in rows)
         clean = sum(r.get("handover_in_task") is True and r.get("handover_guard") is not True for r in rows)
         print(f"  COMPLIANCE: hand-over written in the task file {inn}/{n}, cleanly (no PROGRESS.md write) {clean}/{n}, "
@@ -99,7 +106,7 @@ def summary(name, rows):
 
 if __name__ == "__main__":
     allpairs = []
-    for name in ("A", "B"):
+    for name in (sys.argv[1:] or ["A", "B", "O", "A2", "B2"]):
         try:
             rows, pairs = arm(name)
         except FileNotFoundError:
