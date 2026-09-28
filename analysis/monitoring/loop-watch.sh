@@ -9,7 +9,7 @@ while [ $(( $(date +%s) - t0 )) -lt ${DUR:-1500} ]; do
   sleep ${SLEEP:-60}
   out=$(ssh -n -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 harnessvm "c=\$(sudo wc -l $L | cut -d' ' -f1); echo N \$c; [ \$c -gt ${ln:-0} ] && sudo sed -n \"$(( ${ln:-0} + 1 )),\${c}p\" $L; pgrep -f 'bin/agent-l[o]op' >/dev/null && echo RUN 1 || echo RUN 0; echo MK \$(sudo sh -c 'cat /home/agent/projects/hollowdeep/.agent/sessions/*.stderr 2>/dev/null' | grep -c '\[loop\]'); sudo tail -1 /home/agent/projects/hollowdeep/.agent/iterations.jsonl | jq -r '\"WEB \\(.iter) \\(.web_searches // 0) \\(.web_fetches // 0)\"'" 2>/dev/null) || { echo "harness VM unreachable"; continue; }
   n=$(awk '/^N /{print $2}' <<<"$out"); [ -n "$n" ] && ln=$n
-  grep -vE '^(N|RUN|MK|WEB) ' <<<"$out" | grep -E 'REJECTED|STALLED|STUCK|unreachable|server back|queue empty|timeout|blocked|TOP-LEVEL|PROPOSAL|WARNING: acceptance|WARNING: codemap|WARNING: decisions|malformed|flaky' | grep -v 'over Pi.s 50 KB'
+  grep -vE '^(N|RUN|MK|WEB) ' <<<"$out" | grep -E 'WARNING: session|REJECTED|STALLED|STUCK|unreachable|server back|queue empty|timeout|blocked|TOP-LEVEL|PROPOSAL|WARNING: acceptance|WARNING: codemap|WARNING: decisions|malformed|flaky' | grep -v 'over Pi.s 50 KB'
   t=$(grep -oE 'iteration [0-9]+: tasks/[0-9]+' <<<"$out" | tail -1 | grep -oE '[0-9]+$')
   [ -n "$t" ] && [ -n "$lasttask" ] && [ "$t" != "$lasttask" ] && echo "loop moved to task $t"
   [ -n "$t" ] && lasttask=$t

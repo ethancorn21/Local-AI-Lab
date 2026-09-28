@@ -95,6 +95,7 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 | 09-28 | Driver waits for the model server; short driver notes; STALLED flag; `agent-report` | General robustness and a standard before/after report |
 | 09-28 | "Check facts by running code instead of reasoning about them" | The model spent thousands of thinking tokens on arithmetic a one-line script answers |
 | 09-28 | "Things noticed outside the task become new tasks" | Its logs show it notices problems and leaves them as "out of scope" |
+| 09-28 | Keep only the 6 newest images in each model request (`image-budget.ts`); log sessions that end on a server error | The server accepts at most 8 images per request and every earlier turn is resent: sessions that checked their work with 9+ screenshots died on HTTP 400 with no hand-over (found by the hand-over A/B) |
 
 **Decided against (do not re-propose):** lowering thinking effort from xhigh; lowering the 16k per-turn thinking cap (it fires in ~9% of sessions and the model recovers well); a same-model reviewer agent (it shares the model's blind spots, and done claims are already honest); RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for their own sake; locking down the VM's internet access.
 
@@ -117,7 +118,7 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 - Measured per arm: compliance (share of sessions whose notes landed in the task file without the safety net), resume quality (does the next session's first real action follow the previous "exact next step": follows / partly / ignores or redoes, graded with the arm labels removed), whether the returning parent task still has usable notes, context and time to the first edit, subtasks accepted, rejections.
 - About 10 sessions per arm: enough to see a clear compliance problem or a clear difference, not small effects.
 
-Results will be added here.
+Run 1 (2026-09-28) was stopped and discarded after arm A's sessions on 025b started dying on the image limit above (a harness bug, not a hand-over effect); its 025a part (4 sessions, accepted) is kept for reference. Run 2 started after the fix. Results will be added here.
 
 ## Planned: two agents on one project (when the second 3090 Ti arrives)
 
