@@ -3,6 +3,7 @@
 The hub note for the local AI lab: the GPU server, the model it serves, the isolated VM where the coding agent works, how they are connected and secured, what was measured, and what is planned. Kept up to date after every change (see the changelog at the end). Internal addresses, VLAN numbers, account names and key material are left out on purpose.
 
 Related notes:
+- [Architecture](architecture.md): how the work is split between the cloud architect, the orchestrator script and the per-task local agents.
 - [Local Coding Agent Harness - Architecture and Decisions](agent-harness.md): the agent side (loop, memory, tasks, experiments, operating commands).
 - [Local Autonomous Coding Agent Build (first build, 2026-09-25)](history/first-build-2026-09-25.md): the first build session (2026-09-25), partly out of date.
 

@@ -7,6 +7,32 @@ unattended, for days. Everything here is the technical side: specs, code, config
 150k-token context. The agent (the Pi coding agent plus this repo's extensions and driver) works in an isolated VM,
 one fresh session per step, with its memory in files and git.
 
+## Architecture
+
+A cloud model designs, a script orchestrates, local agents implement:
+
+```mermaid
+flowchart LR
+    H["Human: intent + definition of done"] --> C["Cloud architect (Claude): designs, seed tasks, harness rules"]
+    C --> Q[("Project repo: tasks, memory files, code")]
+    D["Orchestrator: agent-loop (bash, no model)"] -->|spawns one fresh agent per task step| A["Local agent: Qwen3.8-27B"]
+    A -->|splits tasks, codes, tests, commits, exits| Q
+    D -->|verifies done claims, ledger| Q
+    D -->|exceptions| C
+```
+
+- **Agents are spawned per task step and then discarded.** Each session starts with an empty context, reads the
+  project's memory files and its task, does one step, writes its notes, commits and exits. No long-running agent, no
+  context rot, no compaction; memory lives in files and git.
+- **A cloud model is the architect.** It turns the human's intent into design documents and seed tasks with acceptance
+  criteria, and designs the harness the agents work under. The local model does the implementation, around the clock.
+- **The orchestrator is deliberately not a model.** Task selection, done-verification, loop detection and context
+  limits are enforced by a script, so no model can talk its way past them.
+- **The human owns "done".** Agents split tasks into their own subtasks and propose new ones; a task only counts as done
+  when the human's acceptance criteria are met and the tests pass.
+
+Full description: [docs/architecture.md](docs/architecture.md).
+
 ## Highlights
 
 - The agent built a browser game from three successive design documents: ~7,400 lines of code, ~12,200 lines of tests
@@ -22,7 +48,7 @@ one fresh session per step, with its memory in files and git.
 
 | Path | What |
 |---|---|
-| [docs/](docs/) | [ai-lab.md](docs/ai-lab.md): hardware, power and heat, serving, benchmarks, network and security, changelog. [agent-harness.md](docs/agent-harness.md): the agent loop, design principles, measurements, decisions, experiments, plans. [history/](docs/history/): earlier write-ups |
+| [docs/](docs/) | [architecture.md](docs/architecture.md): the three layers (cloud architect, script orchestrator, per-task local agents). [ai-lab.md](docs/ai-lab.md): hardware, power and heat, serving, benchmarks, network and security, changelog. [agent-harness.md](docs/agent-harness.md): the agent loop, design principles, measurements, decisions, experiments, plans. [history/](docs/history/): earlier write-ups |
 | [server/](server/) | The GPU box: boot-time power limits, a thermal guard that stops the model server on overheating, vLLM (HyperQwen) and llama.cpp configs, benchmark scripts and raw results |
 | [harness/](harness/) | The agent's VM: the loop driver (`agent-loop`) and helpers, Pi extensions (hand-over, status footer, thinking budget, web research), the project template, web tools, system snippets |
 | [analysis/](analysis/) | Session-log analysers used for every number in the docs, the hand-over A/B test, stub-agent tests for the driver, monitoring scripts |

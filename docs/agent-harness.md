@@ -2,7 +2,7 @@
 
 The current state of the local autonomous coding agent: how it is built, why each part is the way it is, what was measured, what is being tested, and what is planned. It continues [Local Autonomous Coding Agent Build (first build, 2026-09-25)](history/first-build-2026-09-25.md) (the first build session, 2026-09-25), which is now partly out of date. Internal addresses, VLAN numbers, account names and key material are left out on purpose.
 
-This note is the reference for starting a new Claude Code chat about the agent: read it first. The hardware, model serving, network and lab-wide changelog are in [AI Lab](ai-lab.md).
+This note is the reference for starting a new Claude Code chat about the agent: read it first. The hardware, model serving, network and lab-wide changelog are in [AI Lab](ai-lab.md); the big picture (cloud architect, orchestrator script, per-task local agents) is in [Architecture](architecture.md).
 
 ## What changed since the first build
 
