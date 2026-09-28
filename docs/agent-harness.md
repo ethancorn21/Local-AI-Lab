@@ -99,7 +99,7 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 
 **Decided against (do not re-propose):** lowering thinking effort from xhigh; lowering the 16k per-turn thinking cap (it fires in ~9% of sessions and the model recovers well); a same-model reviewer agent (it shares the model's blind spots, and done claims are already honest); RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for their own sake; locking down the VM's internet access.
 
-## In progress: A/B test of hand-over notes in the task file
+## A/B test: hand-over notes in the task file
 
 **Question:** should hand-over notes move from the single `PROGRESS.md` snapshot into a `## Hand-over` section of the task being worked on? This is needed before two agents work on one project, and it has to be something the agent follows reliably.
 
@@ -118,7 +118,38 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 - Measured per arm: compliance (share of sessions whose notes landed in the task file without the safety net), resume quality (does the next session's first real action follow the previous "exact next step": follows / partly / ignores or redoes, graded with the arm labels removed), whether the returning parent task still has usable notes, context and time to the first edit, subtasks accepted, rejections.
 - About 10 sessions per arm: enough to see a clear compliance problem or a clear difference, not small effects.
 
-Run 1 (2026-09-28) was stopped and discarded after arm A's sessions on 025b started dying on the image limit above (a harness bug, not a hand-over effect); its 025a part (4 sessions, accepted) is kept for reference. Run 2 started after the fix. Results will be added here.
+Run 1 (2026-09-28) was stopped and discarded after arm A's sessions on 025b started dying on the image limit above (a harness bug, not a hand-over effect). Run 2 ran each arm twice (A, A2, B, B2) to measure run-to-run noise, 12 sessions at most per run.
+
+**Results (run 2):**
+
+| Run | Notes in | Sessions to finish 025 (split to parent accepted) | Hours | Context at first code edit | Edit failures |
+|---|---|---|---|---|---|
+| A | PROGRESS.md | 10 (one done claim rejected for unticked boxes) | 1.06 | 64k | 13% |
+| A2 | PROGRESS.md | 11 (split the parent once more before closing it) | 1.16 | 59k | 0% |
+| B | task file | 10 | 1.17 | 68k | 14% |
+| B2 | task file | 8 | 1.00 | 68k | 6% |
+
+- **Compliance:** in the task-file runs the notes landed in the task file in 21 of 21 sessions, 20 of them without touching PROGRESS.md; the safety net was needed once.
+- **Performance:** identical within noise. Two identical runs differ by 1-2 sessions and ~0.1-0.17 h; the difference between the designs is smaller than that.
+- **Returning to the parent:** every run closed the parent task in one session. In the task-file runs the parent's notes were the plan written when it was split; one agent noticed they were dated and checked `git log`, as intended.
+- **Resume behaviour:** sessions in both designs opened by stating the step from the notes, and no run redid finished work. (The resume-quality grading could not be made fully blind in the first pass because file paths revealed the arm; the behaviour showed no difference between designs either way.)
+- **Conclusion:** hand-over notes in the task file are followed reliably and cost nothing, and they merge cleanly for two agents (Part 1). Adopt them for the two-agent setup.
+
+## Harness bake-off: Pi vs Oh My Pi (2026-09-28)
+
+Oh My Pi v18.3.3 (a Pi fork with hash-anchored edits and language-server tools) ran the same replay with the lab's extensions loaded unchanged, notes in PROGRESS.md, compared with runs A and A2.
+
+| | Pi (A, A2) | Oh My Pi (O) |
+|---|---|---|
+| Sessions / hours to finish 025 | 10-11 / 1.06-1.16 | 12 / 1.87 |
+| First prompt (system + tools) | ~3k tokens | ~9k tokens |
+| Context at first code edit | 59-64k | 81k |
+| Sessions cut off by the context limit | 1 of 12 | 4 of 12 |
+| Thinking tokens (12 sessions) | 204-219k | 360k |
+| Edit failures | 0-13% | 11% |
+| Tool calls | ~110 reads, ~190 bash | 195 reads, 45 grep, 118 bash |
+
+Oh My Pi finished the task but ~70% slower: a larger built-in prompt, more reading before acting, more thinking, and more sessions hitting the context limit. Its hash-anchored edits did not reduce edit failures for this model. Decision: stay on Pi (one run, but the gap is far outside the run-to-run noise).
 
 ## Planned: two agents on one project (when the second 3090 Ti arrives)
 
