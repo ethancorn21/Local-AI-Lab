@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# agent-watch [project dir] : live Claude Code-style view of a running agent-loop. Safe to Ctrl-C / close anytime.
+exec "$(dirname "$(realpath "$0")")/pi-live" --follow "$(realpath "${1:-.}")"

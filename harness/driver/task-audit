@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""task-audit <init|scan|owner FILE|missing FILE> : who owns each task, and what the agent changed in the queue.
+
+The agent owns HOW work is done: it may split tasks into subtasks (tasks/025a-*.md), add tasks, rewrite its own tasks.
+The human owns WHAT done means: the acceptance boxes of tasks the agent did not create. Registry: .agent/tasks.json.
+  init         register every task file not yet known as the human's (run at loop start: files present when a loop
+               starts were written by a human), recording its acceptance boxes
+  scan         after an iteration: register new task files as the agent's, and report (one line each, for the loop
+               log) new tasks, human tasks whose boxes went missing, and new or changed `## Proposed changes` sections
+  owner FILE   print human or agent
+  missing FILE print the human's boxes that are no longer in the file (one per line)
+Box identity = the first line of a `- [ ]` / `- [x]` item, whitespace-normalised, tick state ignored.
+"""
+import glob, hashlib, json, os, re, sys
+
+REG = ".agent/tasks.json"
+TASK_FILE = re.compile(r"^(\d{3}[a-z]*)-.+\.md$")
+BOX = re.compile(r"^\s*- \[[ xX]\]\s*(.*)$")
+
+
+def boxes(path):
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        m = BOX.match(line)
+        if m:
+            out.append(re.sub(r"\s+", " ", m.group(1)).strip())
+    return out
+
+
+def proposal(path):
+    text = open(path, encoding="utf-8", errors="replace").read()
+    m = re.search(r"(?ms)^## Proposed changes\s*\n(.*?)(?=^## |\Z)", text)
+    return m.group(1).strip() if m else ""
+
+
+def sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def tasks():
+    out = {}
+    for f in sorted(glob.glob("tasks/*.md")):
+        m = TASK_FILE.match(os.path.basename(f))
+        if m:
+            out[m.group(1)] = f
+    return out
+
+
+def load():
+    return json.load(open(REG)) if os.path.exists(REG) else {}
+
+
+def save(reg):
+    tmp = REG + ".tmp"
+    json.dump(reg, open(tmp, "w"), indent=1, sort_keys=True)
+    os.replace(tmp, REG)
+
+
+def title(f):
+    for line in open(f, encoding="utf-8", errors="replace"):
+        if line.startswith("# "):
+            return line[2:].strip()[:120]
+    return ""
+
+
+def missing(reg, tid, f):
+    e = reg.get(tid)
+    if not e or e["owner"] != "human":
+        return []
+    have = set(boxes(f))
+    return [b for b in e["boxes"] if b not in have]
+
+
+def main():
+    cmd = sys.argv[1]
+    reg, ts = load(), tasks()
+    if cmd == "init":
+        n = 0
+        for tid, f in ts.items():
+            if tid not in reg:
+                reg[tid] = {"owner": "human", "file": f, "boxes": boxes(f), "proposal": sha(proposal(f)), "reported": ""}
+                n += 1
+        save(reg)
+        if n:
+            print(f"registered {n} task file(s) present at loop start as the human's")
+        return 0
+    if cmd == "scan":
+        for tid, f in ts.items():
+            if tid not in reg:
+                reg[tid] = {"owner": "agent", "file": f, "boxes": [], "proposal": "", "reported": ""}
+                parent = re.match(r"^(\d{3}[a-z]*?)[a-z]$", tid)
+                kind = f"subtask of {parent.group(1)}" if parent else "TOP-LEVEL task - review it (veto: set Status: dropped)"
+                print(f"NEW TASK by agent: {f} ({kind}): {title(f)}")
+        for tid, e in reg.items():
+            if e["owner"] != "human":
+                continue
+            f = ts.get(tid)
+            if not f:
+                if e.get("reported") != "deleted":
+                    print(f"WARNING: the human's task {e['file']} was deleted or renamed")
+                    e["reported"] = "deleted"
+                continue
+            e["file"] = f
+            gone = missing(reg, tid, f)
+            mark = sha("\n".join(gone)) if gone else ""
+            if mark != e.get("reported", ""):
+                if gone:
+                    print(f"WARNING: acceptance criteria of {f} changed by the agent - missing: " + " | ".join(g[:80] for g in gone))
+                e["reported"] = mark
+            p = proposal(f)
+            if sha(p) != e.get("proposal") :
+                if p:
+                    print(f"PROPOSAL in {f}: " + re.sub(r"\s+", " ", p)[:300])
+                e["proposal"] = sha(p)
+        save(reg)
+        return 0
+    if cmd in ("owner", "missing"):
+        f = sys.argv[2]
+        m = TASK_FILE.match(os.path.basename(f))
+        tid = m.group(1) if m else ""
+        if cmd == "owner":
+            print(reg.get(tid, {}).get("owner", "agent"))
+        else:
+            for b in missing(reg, tid, f):
+                print(b)
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

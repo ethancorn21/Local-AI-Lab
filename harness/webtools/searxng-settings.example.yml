@@ -1,0 +1,10 @@
+# SearXNG for the agent's web_search tool (research.ts). Local only: published on 127.0.0.1:8888.
+use_default_settings: true
+server:
+  secret_key: "CHANGE-ME"   # generate your own: openssl rand -hex 32
+  limiter: false
+  image_proxy: false
+  public_instance: false
+search:
+  formats: [html, json]
+  safe_search: 0

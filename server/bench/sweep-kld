@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# sweep-kld base | <label> <model.gguf> <k:v> : KL divergence vs a Q8_0 reference on the code+docs eval text
+set -u
+B=/opt/llm/llama.cpp/build/bin; OUT=/opt/llm/sweep/results; BASE=/opt/llm/sweep/kld-base-q8.bin
+MD=/opt/llm/openjev-lab/models/qwen27b/unsloth; ARGS=(-f /opt/llm/sweep/eval.txt -c 4096 --chunks 12 -fa on)
+if [ "$1" = base ]; then
+  $B/llama-perplexity -m $MD/Qwen3.8-27B-Q8_0.gguf "${ARGS[@]}" --fit on --kl-divergence-base $BASE > $OUT/kld-base.log 2>&1
+  echo "base rc=$? $(ls -la $BASE 2>/dev/null | awk '{print $5}') bytes"; exit
+fi
+LABEL=$1; M=$2; k=${3%:*}; v=${3#*:}; f=$OUT/kld-$LABEL-$k-$v.log
+$B/llama-perplexity -m "$M" "${ARGS[@]}" -ngl 99 -ctk $k -ctv $v --kl-divergence-base $BASE --kl-divergence > $f 2>&1
+echo "{\"label\":\"$LABEL\",\"kv\":\"$k/$v\",\"mean_kld\":\"$(grep -m1 'Mean    KLD' $f | awk '{print $3}')\",\"same_top_p\":\"$(grep -m1 'Same top p' $f | awk '{print $4}')\",\"ppl\":\"$(grep -m1 'Mean PPL(Q)' $f | awk '{print $4}')\"}" | tee -a $OUT/kld.jsonl

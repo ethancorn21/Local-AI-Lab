@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# agent-loop <project dir> : run fresh Pi sessions, one step each, until the task queue is empty or a guard trips.
+# Each iteration: pick task -> pi (reads AGENTS.md + memory files) -> one step -> memory + commit -> exit.
+# The driver is plain bash (no model): it picks tasks, verifies "done" claims, and stops runaway loops.
+# Guards (env overrides): MAX_ITERS, ITER_TIMEOUT (seconds), NO_PROGRESS_LIMIT (iterations without an agent commit).
+# Test command: TEST_CMD env, else `npm test` if package.json exists, else `python3 -m pytest -q`.
+# Every iteration appends one JSON line to .agent/iterations.jsonl: the harness configuration it ran under + its outcome.
+# DECISIONS.md entries of done tasks are moved to DECISIONS-archive.md by `decisions-archive` (one index line per task).
+# Tasks: the agent owns how work is split (subtasks tasks/<id><letter>-*.md, worked before their parent, which comes
+# back once they are all finished) and may add tasks; `task-audit` keeps the human's acceptance boxes (tasks present at
+# loop start) as the definition of done and reports new tasks, changed criteria and `## Proposed changes` to the log.
+# CODEMAP.md is regenerated from the code by `codemap-gen` before every iteration.
+# To stop cleanly between iterations (e.g. to change the harness): touch .agent/PAUSE; remove it before restarting.
+set -uo pipefail
+DRIVER_FILE=$(realpath "${BASH_SOURCE[0]}")
+P=$(realpath "${1:?usage: agent-loop <project dir>}")
+MAX_ITERS=${MAX_ITERS:-200}
+ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
+NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
+STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
+LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
+VIEWER=${VIEWER:-tui}            # tui: Pi's own TUI in tmux window $AGENT_TMUX; json: headless (pi-live viewer)
+AGENT_TMUX=${AGENT_TMUX:-main:agent}
+THINKING=${THINKING:-xhigh}  # Pi level; models.json maps it to Qwen3.8's reasoning_effort
+export PI_SKIP_VERSION_CHECK=1
+export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
+cd "$P" || exit 1
+mkdir -p .agent/sessions .agent/harness
+LOG=.agent/loop.log
+LEDGER=.agent/iterations.jsonl
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+
+# One loop per project, and never start while a previous loop's agent is still running.
+# fd 9 holds the lock. Children get it closed (9>&-): an agent that outlives a killed loop must not keep the lock, or a
+# restarted loop fails the flock instead of reaching the wait below.
+exec 9> .agent/loop.lock
+flock -n 9 || { echo "another agent-loop is running on $P" >&2; exit 1; }
+# The running session's pid is recorded in .agent/pi.pid (text matching with pgrep -f is fooled by any process whose
+# command line merely mentions pi, including the check itself).
+while [ -f .agent/pi.pid ] && kill -0 "$(cat .agent/pi.pid)" 2>/dev/null; do log "waiting for running agent session (pid $(cat .agent/pi.pid))"; sleep 30; done
+
+if [ -z "${TEST_CMD:-}" ]; then
+  if [ -f package.json ]; then TEST_CMD="npm test --silent"; else TEST_CMD="python3 -m pytest -q"; fi
+fi
+
+# Harness stamp. Each iteration records exactly which configuration produced it, so a change to AGENTS.md, the driver,
+# Pi or the server can be attributed later. Every config file is kept once under its sha256 in .agent/harness/, so the
+# configurations of any two iterations can be diffed. The server is seen only through /props (this VM cannot reach
+# aibox): model, build, context size and speculative decoding type are visible; offload and KV cache flags are not.
+keep() {  # keep < content : store content under its sha256, print the sha
+  local t s; t=$(mktemp -p .agent/harness); cat > "$t"; s=$(sha256sum < "$t" | cut -c1-64)
+  if [ -e ".agent/harness/$s" ]; then rm -f "$t"; else mv "$t" ".agent/harness/$s"; fi; echo "$s"
+}
+masked() { jq 'walk(if type == "object" then with_entries(if (.key | test("apikey|secret|password"; "i")) then .value = "***" else . end) else . end)' "$1"; }
+DRIVER_SHA=$(keep < "$DRIVER_FILE")  # hashed at start: the file may be replaced while this copy keeps running
+harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
+  local pc=$HOME/.pi/agent props models f vllm notes=$HOME/.agent-kit/server-notes.json
+  # llama-server answers /props; vLLM answers /version + /v1/models (and a JSON 404 on /props, hence the select).
+  props=$(curl -s -m 5 127.0.0.1:8080/props | jq -S 'select(.model_path) | del(.is_sleeping)' 2>/dev/null)
+  vllm=$({ curl -s -m 5 127.0.0.1:8080/version; curl -s -m 5 127.0.0.1:8080/v1/models; } | jq -s -S -c \
+    'if length == 2 and (.[0].version // null) != null then {version: .[0].version, model: (.[1].data[0] | {id, max_model_len})} else null end' 2>/dev/null)
+  models=$(masked "$pc/models.json" 2>/dev/null)
+  HARNESS=$(jq -n -S -c \
+      --arg driver "$DRIVER_SHA" \
+      --arg archiver "$(keep < "$(command -v decisions-archive)" 2>/dev/null)" \
+      --arg task_tools "$(cat "$(command -v task-audit)" "$(command -v codemap-gen)" 2>/dev/null | keep)" \
+      --arg extensions "$([ -d "$pc/extensions" ] && for f in $(find "$pc/extensions" -type f | sort); do
+                            echo "== ${f#"$pc"/}"; cat "$f"; done | keep)" \
+      --arg agents_md "$([ -f AGENTS.md ] && keep < AGENTS.md)" \
+      --arg pi_settings "$(keep < "$pc/settings.json")" \
+      --arg pi_models "$([ -n "$models" ] && keep <<<"$models")" \
+      --arg server_props "$([ -n "$props" ] && keep <<<"$props")" \
+      --arg server_notes "$([ -f "$notes" ] && keep < "$notes")" \
+      --arg webtools "$([ -f /opt/webtools/fetch.py ] && keep < /opt/webtools/fetch.py)" \
+      --argjson notes "$(jq -c . "$notes" 2>/dev/null || echo null)" --argjson vllm "${vllm:-null}" \
+      --arg pi_version "$(pi --version 2>/dev/null)" \
+      --arg thinking "$THINKING" --arg test_cmd "$TEST_CMD" --argjson iter_timeout "$ITER_TIMEOUT" \
+      --argjson settings "$(cat "$pc/settings.json")" --argjson models "${models:-null}" --argjson props "${props:-null}" '
+    {files: {driver: $driver, archiver: $archiver, task_tools: $task_tools, extensions: $extensions, agents_md: $agents_md,
+             pi_settings: $pi_settings, pi_models: $pi_models, server_props: $server_props, server_notes: $server_notes,
+             webtools: $webtools},
+     server_notes: $notes, vllm: $vllm,
+     pi_version: $pi_version, thinking: $thinking, test_cmd: $test_cmd, iter_timeout: $iter_timeout,
+     compaction: $settings.compaction,
+     model: ([$models.providers[$settings.defaultProvider].models[]? | select(.id == $settings.defaultModel)
+              | {id, contextWindow, maxTokens, input}] | first),
+     server: (if $props then {gguf: ($props.model_path | split("/") | last), build: $props.build_info,
+                              n_ctx: $props.default_generation_settings.n_ctx,
+                              speculative: $props.default_generation_settings.params["speculative.types"]}
+              else null end)}') || HARNESS='{"error":"harness stamp failed"}'
+  HARNESS_ID=$(sha256sum <<<"$HARNESS" | cut -c1-12)
+}
+
+status_of() { head -1 "$1" | sed -E 's/^Status:[[:space:]]*//I' | tr -d '[:space:]' | tr 'A-Z' 'a-z'; }
+task_id() { basename "$1" .md | cut -d- -f1; }
+# Subtasks of task 025 are tasks/025a-*.md, 025b-*.md (and theirs 025aa-*.md). A task with unfinished subtasks waits for
+# them whatever its own status says (the agent may forget to set `split`); once all are done or dropped it is workable
+# again, so its own acceptance boxes get checked.
+pending_subtasks() {
+  local f n=0
+  for f in tasks/"$1"[a-z]*-*.md; do [ -f "$f" ] || continue
+    case $(status_of "$f") in done|dropped) ;; *) n=$((n + 1)) ;; esac
+  done
+  echo "$n"
+}
+has_subtasks() { compgen -G "tasks/$1[a-z]*-*.md" > /dev/null; }
+workable() {  # workable <file> in-progress|open
+  local s; s=$(status_of "$1")
+  [ "$(pending_subtasks "$(task_id "$1")")" -eq 0 ] || return 1
+  if [ "$2" = in-progress ]; then [ "$s" = in-progress ]; else [ "$s" = open ] || [ "$s" = split ]; fi
+}
+next_task() {
+  local f
+  for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" in-progress && { echo "$f"; return; }; done
+  for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" open && { echo "$f"; return; }; done
+}
+# New tasks, changed human criteria and proposals go to the loop log (task-audit prints one line per finding).
+task_scan() { task-audit scan 2>&1 | while IFS= read -r l; do log "$l"; done; }
+# CODEMAP.md is generated from the code (header comments + exports); nobody maintains it by hand.
+codemap_sync() {
+  codemap-gen .
+  case $? in
+    0) ;;
+    3) git add CODEMAP.md && git commit -q -m "[driver] CODEMAP regenerated from the code ($1)" ;;
+    *) log "WARNING: codemap-gen failed - CODEMAP.md left unchanged ($1)" ;;
+  esac
+}
+agent_commits() { git log --oneline --invert-grep --grep='^\[driver\]' | wc -l; }
+commit_leftovers() {
+  if [ -n "$(git status --porcelain)" ]; then git add -A && git commit -q -m "[driver] $1"; log "driver committed: $1"; fi
+}
+# Move DECISIONS.md entries of done tasks to the archive (and back for reopened tasks). Refuses rather than lose text.
+archive_sync() {
+  decisions-archive .
+  case $? in
+    0) ;;
+    3) git add DECISIONS.md DECISIONS-archive.md && git commit -q -m "[driver] decisions archive synced with task status ($1)"
+       log "decisions archive synced ($1)" ;;
+    *) log "WARNING: decisions-archive failed - DECISIONS.md left unchanged ($1)" ;;
+  esac
+}
+
+# Test suite gate. Runs the suite; on failure runs it once more: a failure that disappears on rerun is FLAKY (logged
+# as a warning, never used to reopen a task); a failure that repeats is real. Sets TEST_REPORT for the log/reason.
+# Model server health: sessions against a dead server fail instantly and would trip NO_PROGRESS_LIMIT overnight
+# (e.g. after the AI box's overheat guard stops the container). Wait for it instead, with backoff.
+server_ok() { curl -sf -m 10 "$LLM_URL/v1/models" > /dev/null 2>&1; }
+wait_for_server() {
+  server_ok && return 0
+  local t0 d=30; t0=$(date +%s)
+  log "WARNING: model server unreachable at $LLM_URL - waiting, no sessions run until it answers"
+  until server_ok; do
+    [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the model server - stopping"; exit 0; }
+    sleep "$d"; d=$(( d < 300 ? d * 2 : 600 ))
+  done
+  log "model server back after $(( ($(date +%s) - t0) / 60 )) min"
+}
+# Driver notes in DECISIONS.md stay short (every agent reads that file): a list goes in as its first 8 lines plus a
+# pointer; the whole list is kept in .agent/reports/<name>.txt for the agent to read when it needs it.
+compact_list() {  # compact_list <name> < lines
+  local all n; all=$(sed '/^[[:space:]]*$/d'); n=$(grep -c . <<<"$all")
+  mkdir -p .agent/reports; printf '%s\n' "$all" > ".agent/reports/$1.txt"
+  head -8 <<<"$all" | sed 's/^/    /'
+  [ "$n" -gt 8 ] && echo "    ... and $((n - 8)) more (full list: .agent/reports/$1.txt)"
+  return 0
+}
+VERIFY="" FLAKY=false TEST_OUT=""
+failing_names() { grep -E '^not ok|FAILED|^E ' <<<"$1" | head -10 | sed 's/^/    /'; }
+# Names of failing tests (node --test TAP "not ok N - name" at any depth, pytest "FAILED path::name"), sorted, unique.
+failing_set() { grep -E '^[[:space:]]*not ok [0-9]+ - |^FAILED ' <<<"$1" | sed -E 's/^[[:space:]]*not ok [0-9]+ - //; s/^FAILED ([^ ]+).*/\1/; s/ # .*$//' | sort -u; }
+# Ratchet for the agent's own tasks: each task is judged against the tests that were already failing when it was first
+# handed out (.agent/baselines/<id>.txt, recorded by the driver before that iteration). A subtask split off to fix some
+# of a sibling's red tests can then be accepted while the other siblings' reds remain, never with new ones; the human's
+# task at the top still needs a fully green suite. .agent/test-baseline.txt is the loop-start fallback.
+BASELINE=.agent/test-baseline.txt
+mkdir -p .agent/baselines
+task_baseline() {  # task_baseline <task file> : record the failing tests at the task's first hand-out
+  local b=.agent/baselines/$(task_id "$1").txt
+  [ -f "$b" ] && return
+  if run_tests; then : > "$b"; else failing_set "$TEST_OUT" > "$b"; fi
+  log "baseline for $(task_id "$1"): $(grep -c . "$b") failing test(s) at its first hand-out"
+  if [ -n "$(git status --porcelain DECISIONS.md)" ]; then git add DECISIONS.md && git commit -q -m "[driver] flaky test logged (baseline run)"; fi
+}
+run_tests() {
+  local out1 out2 rc
+  TEST_OUT=""
+  out1=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); rc=$?
+  [ $rc -eq 0 ] && return 0
+  # pytest exits 5 when it collects no tests: a project with no tests yet is not a failing one
+  [ $rc -eq 5 ] && [[ $TEST_CMD == *pytest* ]] && return 0
+  if out2=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); then
+    printf '\n## %s DRIVER FLAKY: test failed once, passed on rerun (fix or de-flake it)\n%s\n' "$(date +%F)" \
+      "$(failing_names "$out1")" >> DECISIONS.md
+    log "flaky test detected (logged in DECISIONS.md), not blocking"
+    FLAKY=true
+    return 0
+  fi
+  TEST_OUT=$out2
+  mkdir -p .agent/reports; printf '%s\n' "$out2" > .agent/reports/last-test-output.txt
+  TEST_REPORT="$(failing_set "$out2" | compact_list last-failing-tests)"$'\n'"$(tail -4 <<<"$out2" | sed 's/^/    /')"$'\n'"    (full test output: .agent/reports/last-test-output.txt)"
+  return 1
+}
+
+# A task counts as done only if every acceptance box is ticked AND the test suite passes when the driver runs it.
+# Otherwise the driver reopens it and explains why in DECISIONS.md, where the next agent will read it.
+reopen() {  # reopen <task file> <reasons>
+  local f=$1 id; id=$(basename "$f" .md | cut -d- -f1)
+  sed -i '1s/.*/Status: in-progress/' "$f"
+  printf '\n## %s %s DRIVER: done claim rejected, task reopened\n%s' "$(date +%F)" "$id" "$2" >> DECISIONS.md
+  git add -A && git commit -q -m "[driver] reopened $id: done claim failed verification"
+  log "REJECTED done claim for $f - reopened"
+}
+unticked() { grep -E '^[[:space:]]*- \[ \]' "$1" || true; }
+verify_done() {
+  local f=$1 reasons="" u gone new cur
+  u=$(unticked "$f")
+  [ -n "$u" ] && reasons+="- Acceptance criteria not ticked (verify each one, then tick it):"$'\n'"$(sed 's/^/    /' <<<"$u")"$'\n'
+  gone=$(task-audit missing "$f")
+  [ -n "$gone" ] && reasons+="- Acceptance criteria missing: they are the human's and define done. Restore them; if one is wrong, say so under \`## Proposed changes\` in the task file:"$'\n'"$(sed 's/^/    - [ ] /' <<<"$gone")"$'\n'
+  if run_tests; then
+    : > "$BASELINE"
+  elif [ "$(task-audit owner "$f")" = agent ]; then
+    cur=$(failing_set "$TEST_OUT")
+    local base=.agent/baselines/$(task_id "$f").txt; [ -f "$base" ] || base=$BASELINE
+    new=$(comm -13 <(sort -u "$base" 2>/dev/null) <(echo "$cur" | sed '/^$/d'))
+    if [ -z "$cur" ]; then reasons+="- Test suite failed twice, and no failing test could be named (crash?):"$'\n'"$TEST_REPORT"$'\n'
+    elif [ -n "$new" ]; then reasons+="- Tests failing that were not failing before this task (known failures are allowed, new ones are not):"$'\n'"$(compact_list "new-failures-$(task_id "$f")" <<<"$new")"$'\n'
+    else [ -z "$reasons" ] && log "accepting $f with $(wc -l <<<"$cur") known failing test(s), none new"
+    fi
+  else
+    reasons+="- Test suite failed twice when the driver ran \`$TEST_CMD\`:"$'\n'"$TEST_REPORT"$'\n'
+  fi
+  [ -z "$reasons" ] && { VERIFY=accepted; log "verified done: $f"; return 0; }
+  VERIFY=rejected
+  reopen "$f" "$reasons"
+}
+
+# Start-up: save anything an interrupted session left behind, and audit tasks already marked done:
+# checkboxes per task, the test suite ONCE (a suite failure can't be pinned on one task, so it is logged, not reopened).
+commit_leftovers "uncommitted work found at loop start"
+task-audit init | while IFS= read -r l; do log "$l"; done
+task_scan
+for f in tasks/[0-9]*.md; do
+  [ -f "$f" ] && [ "$(status_of "$f")" = done ] || continue
+  u=$(unticked "$f")
+  if [ -n "$u" ]; then reopen "$f" "- Acceptance criteria not ticked (verify each one, then tick it):"$'\n'"$(sed 's/^/    /' <<<"$u")"$'\n'; fi
+done
+if ! run_tests; then
+  failing_set "$TEST_OUT" > "$BASELINE"
+  if cmp -s "$BASELINE" .agent/reports/start-failing-last.txt 2>/dev/null; then
+    log "test suite failing at loop start: the same $(grep -c . "$BASELINE") test(s) as at the last start (not re-logged)"
+  else
+    cp "$BASELINE" .agent/reports/start-failing-last.txt
+    printf '\n## %s DRIVER: test suite failing at loop start (%s tests)\n%s\n' "$(date +%F)" "$(grep -c . "$BASELINE")" "$TEST_REPORT" >> DECISIONS.md
+    git add -A && git commit -q -m "[driver] test suite failing at loop start" ; log "test suite failing at loop start - logged ($(grep -c . "$BASELINE") failing test(s) = baseline)"
+  fi
+else : > "$BASELINE"; rm -f .agent/reports/start-failing-last.txt; log "start-up audit: test suite green"; fi
+archive_sync "start-up"
+codemap_sync "start-up"
+
+no_progress=0
+for i in $(seq "$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 ))" "$MAX_ITERS"); do
+  if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
+  wait_for_server
+  task=$(next_task)
+  if [ -z "$task" ]; then log "queue empty - stopping"; break; fi
+  before=$(agent_commits)
+  harness_stamp
+  log "iteration $i: $task (harness $HARNESS_ID)"
+  codemap_sync "before iteration $i"
+  task_baseline "$task"
+  PROMPT="You are iteration $i of an autonomous coding loop. Follow the session protocol in AGENTS.md exactly. Your task file is $task. Do ONE step, update PROGRESS.md and DECISIONS.md, commit, then stop."
+  tid=$(task_id "$task")
+  if has_subtasks "$tid"; then
+    PROMPT="$PROMPT All subtasks of this task are finished: check its own acceptance boxes, tick the ones you verify, and set it done, or add subtasks for what is still missing."
+  else
+    # A task that keeps going session after session is too big for one step at a time: say so (AGENTS.md, Tasks).
+    runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
+    [ "$runs" -ge 5 ] && PROMPT="$PROMPT This task has taken $runs sessions so far: if what remains is more than a few sessions of work, split it into subtasks first (AGENTS.md, Tasks)."
+  fi
+  # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).
+  pb=$(stat -c %s PROGRESS.md 2>/dev/null || echo 0)
+  [ "$pb" -gt 30720 ] && PROMPT="$PROMPT FIRST, before anything else: PROGRESS.md is $((pb / 1024)) KB, far over its ~150-line budget. Rewrite it to the current state only (drop finished and superseded notes; git history keeps them) and commit that on its own." \
+    && log "PROGRESS.md is $((pb / 1024)) KB - this iteration is told to rewrite it first"
+  # Pi's read tool returns at most 50 KB per call and DECISIONS.md keeps the current task's newest entries at the end:
+  # iterations 143, 144 and 146 read only the first 50 KB of a 60+ KB file and never saw them.
+  db=$(stat -c %s DECISIONS.md 2>/dev/null || echo 0)
+  [ "$db" -gt 46080 ] && PROMPT="$PROMPT DECISIONS.md is $((db / 1024)) KB, more than one read returns: read it to the end (continue with the offset the read tool gives you). Your task's newest entries are at the bottom."
+  t0=$(date -Iseconds); s0=$(date +%s); md0=$(sha256sum < AGENTS.md 2>/dev/null); VERIFY="" FLAKY=false
+  arc0=$({ sha256sum < DECISIONS-archive.md; } 2>/dev/null)
+  # Memory files every agent reads at start: sizes go in the ledger; past Pi's 50 KB single-read limit is a warning.
+  mem_bytes=$(for f in AGENTS.md PROGRESS.md DECISIONS.md CODEMAP.md; do
+                n=$(stat -c %s "$f" 2>/dev/null || echo 0); echo "$f $n"
+                [ "$n" -gt 51200 ] && log "WARNING: $f is $((n / 1024)) KB, over Pi's 50 KB single-read limit" >&2
+              done | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add')
+  n4=$(printf %04d "$i")
+  if [ "$VIEWER" = tui ]; then
+    # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
+    # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
+    sess=${AGENT_TMUX%%:*}; win=${AGENT_TMUX#*:}; sdir=".agent/sessions/iter-$n4.d"
+    printf '%s' "$PROMPT" > .agent/prompt.txt; rm -f .agent/rc
+    tmux has-session -t "$sess" 2>/dev/null || tmux new-session -d -s "$sess"
+    tmux list-windows -t "$sess" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "$sess" -n "$win"
+    tmux set-option -w -t "$AGENT_TMUX" remain-on-exit on   # keep the last screen up between iterations
+    tmux respawn-window -k -t "$AGENT_TMUX" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S agent-done-$i"
+    tmux display -p -t "$AGENT_TMUX" '#{pane_pid}' > .agent/pi.pid
+    timeout $((ITER_TIMEOUT + 120)) tmux wait-for "agent-done-$i"   # bounded: a killed window cannot hang the loop
+    rc=$(cat .agent/rc 2>/dev/null || echo 1)
+    f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
+    if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi
+  else
+    timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
+      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
+    echo $! > .agent/pi.pid
+    wait $!
+    rc=$?
+  fi
+  rm -f .agent/pi.pid
+  t1=$(date -Iseconds); s1=$(date +%s)
+  [ "$rc" -eq 124 ] && log "iteration $i hit the ${ITER_TIMEOUT}s timeout"
+  # The agent should have committed. Save anything it left behind, marked so it does not count as progress.
+  # Code the agent left uncommitted (the wrapup hand-over leaves code for the harness to save) is progress too;
+  # only memory-file edits alone are not. A loop that changes nothing still trips NO_PROGRESS_LIMIT.
+  leftovers=false; code_leftovers=0
+  if [ -n "$(git status --porcelain)" ]; then
+    leftovers=true; code_leftovers=$(git status --porcelain | grep -cvE ' (PROGRESS|DECISIONS|CODEMAP)\.md$| codemap/')
+  fi
+  commit_leftovers "uncommitted work after iteration $i"
+  if [ "$(agent_commits)" -gt "$before" ]; then no_progress=0
+  elif [ "$code_leftovers" -gt 0 ]; then no_progress=0; log "no agent commit, but the driver saved $code_leftovers changed code file(s) - counts as progress"
+  elif ! server_ok; then log "model server down during iteration $i - not counted toward the no-progress limit"
+  else no_progress=$((no_progress + 1)); log "no agent commit ($no_progress/$NO_PROGRESS_LIMIT)"; fi
+  status_after=$(status_of "$task")
+  [ "$status_after" = done ] && verify_done "$task"
+  task_scan
+  # AGENTS.md is harness config, not agent memory: flag (don't revert) an agent that edits its own instructions.
+  md_changed=false
+  if [ "$(sha256sum < AGENTS.md 2>/dev/null)" != "$md0" ]; then md_changed=true; log "WARNING: AGENTS.md changed during iteration $i (not reverted)"; fi
+  # Only the driver writes the archive; an agent editing it has misread the setup.
+  arc_changed=false
+  if [ "$({ sha256sum < DECISIONS-archive.md; } 2>/dev/null)" != "$arc0" ]; then arc_changed=true; log "WARNING: DECISIONS-archive.md edited during iteration $i"; fi
+  archive_sync "after iteration $i"
+  # The wrapup extension marks its actions on the session's stderr.
+  err=".agent/sessions/iter-$(printf %04d "$i").stderr"
+  wrapup=null
+  grep -q '^\[wrapup\] steer' "$err" 2>/dev/null && wrapup='"steered"'
+  grep -q '^\[wrapup\] abort' "$err" 2>/dev/null && wrapup='"aborted"'
+  cancelled=$(grep -c '^\[wrapup\] compaction cancelled' "$err" 2>/dev/null); cancelled=${cancelled:-0}
+  searches=$(grep -c '^\[research\] search' "$err" 2>/dev/null); searches=${searches:-0}
+  fetches=$(grep -c '^\[research\] fetch' "$err" 2>/dev/null); fetches=${fetches:-0}
+  jq -n -c --argjson iter "$i" --arg task "$task" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \
+      --argjson rc "$rc" --argjson agent_commits "$(( $(agent_commits) - before ))" --argjson leftovers "$leftovers" \
+      --argjson code_leftovers "$code_leftovers" \
+      --arg status_after "$status_after" --arg verify "$VERIFY" --argjson flaky "$FLAKY" \
+      --argjson md_changed "$md_changed" --argjson wrapup "$wrapup" \
+      --argjson mem_bytes "${mem_bytes:-null}" --argjson arc_changed "$arc_changed" \
+      --argjson compactions_cancelled "$cancelled" --argjson web_searches "$searches" --argjson web_fetches "$fetches" \
+      --arg harness_id "$HARNESS_ID" --argjson harness "$HARNESS" '
+    {iter: $iter, task: $task, start: $start, end: $end, agent_secs: $agent_secs, rc: $rc, timed_out: ($rc == 124),
+     agent_commits: $agent_commits, driver_saved_leftovers: $leftovers, code_files_saved: $code_leftovers, status_after: $status_after,
+     verify: (if $verify == "" then null else $verify end), flaky_tests: $flaky, agents_md_changed: $md_changed,
+     archive_edited: $arc_changed, memory_bytes: $mem_bytes, wrapup: $wrapup, compactions_cancelled: $compactions_cancelled,
+     web_searches: $web_searches, web_fetches: $web_fetches, harness_id: $harness_id, harness: $harness}' >> "$LEDGER"
+  # A task that keeps running without finishing is flagged for the humans (the split nudge in the prompt starts at 5).
+  runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
+  if [ "$(status_of "$task")" != done ] && [ "$runs" -ge "$STALL_SESSIONS" ] && [ $(( (runs - STALL_SESSIONS) % 4 )) -eq 0 ]; then
+    log "STALLED: $task has run $runs sessions without finishing"
+  fi
+  if [ "$no_progress" -ge "$NO_PROGRESS_LIMIT" ]; then
+    { echo "# STUCK - $(date '+%F %T')"; echo; echo "$NO_PROGRESS_LIMIT iterations in a row without an agent commit on $task."; echo;
+      echo "## PROGRESS.md"; cat PROGRESS.md; echo; echo "## DECISIONS.md (tail)"; tail -40 DECISIONS.md; echo;
+      echo "## git log"; git log --oneline -15; } > STUCK.md
+    log "STUCK - wrote STUCK.md and stopped"; exit 2
+  fi
+done
+log "loop finished (live view: tmux window $AGENT_TMUX; headless runs: agent-watch $P)"; git --no-pager log --oneline -10

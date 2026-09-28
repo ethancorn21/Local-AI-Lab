@@ -1,0 +1,12 @@
+[Unit]
+Description=AI box power policy (CPU RAPL + GPU caps), must hold before llama-server starts
+After=systemd-modules-load.service
+Before=llama-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/power-limits
+
+[Install]
+WantedBy=multi-user.target

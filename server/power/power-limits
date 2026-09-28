@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# power-limits: boot-time power policy for the AI box, applied before llama-server starts.
+# CPU: Intel RAPL package limits. The i9-14900KF has a degradation history and is on temporary cooling.
+# GPUs: persistence mode + per-model caps. The EVGA 1300 G2 has 6 VGA sockets for two 3090 Tis + a 5060 Ti, so one
+# 3090 Ti shares a daisy-chained cable: the cap is what keeps that cable in spec.
+# Every limit is read back; any mismatch exits non-zero, and llama-server (Requires=power-limits.service) stays down.
+set -uo pipefail
+CPU_PL1_W=125   # sustained
+CPU_PL2_W=125   # burst
+declare -A GPU_PL_W=(["NVIDIA GeForce RTX 3090 Ti"]=350)
+R=/sys/class/powercap/intel-rapl:0
+fail=0
+echo $((CPU_PL1_W * 1000000)) > $R/constraint_0_power_limit_uw
+echo $((CPU_PL2_W * 1000000)) > $R/constraint_1_power_limit_uw
+if [ "$(cat $R/constraint_0_power_limit_uw)" != $((CPU_PL1_W * 1000000)) ] || [ "$(cat $R/constraint_1_power_limit_uw)" != $((CPU_PL2_W * 1000000)) ]; then
+  echo "CPU RAPL limits did not stick"; fail=1
+fi
+nvidia-smi -pm 1 > /dev/null || { echo "persistence mode failed"; fail=1; }
+while IFS=, read -r idx name; do
+  name=${name# }; w=${GPU_PL_W[$name]:-}
+  [ -z "$w" ] && continue
+  nvidia-smi -i "$idx" -pl "$w" > /dev/null
+  got=$(nvidia-smi -i "$idx" --query-gpu=power.limit --format=csv,noheader,nounits | cut -d. -f1)
+  [ "$got" = "$w" ] || { echo "GPU $idx ($name): limit $got W, wanted $w W"; fail=1; }
+done < <(nvidia-smi --query-gpu=index,name --format=csv,noheader)
+echo "power-limits: CPU PL1/PL2 $(( $(cat $R/constraint_0_power_limit_uw) / 1000000 ))/$(( $(cat $R/constraint_1_power_limit_uw) / 1000000 )) W;" \
+     "GPUs: $(nvidia-smi --query-gpu=index,name,power.limit --format=csv,noheader | tr '\n' ';')"
+exit $fail

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+D=/opt/llm/sweep; MD=/opt/llm/openjev-lab/models/qwen27b/unsloth
+IQ4=$MD/Qwen3.8-27B-UD-IQ4_XS.gguf; Q5M=$MD/Qwen3.8-27B-UD-Q5_K_M.gguf; Q6=$MD/Qwen3.8-27B-UD-Q6_K.gguf
+$D/sweep-spec iq4xs $IQ4 q8_0:q8_0 131072 none
+$D/sweep-spec iq4xs $IQ4 q8_0:q8_0 131072 mtp
+$D/sweep-spec q5km $Q5M q8_0:q8_0 131072 none
+$D/sweep-spec q5km $Q5M q8_0:q8_0 131072 ngram
+$D/sweep-spec q5km-kv4 $Q5M q4_0:q4_0 131072 mtp
+$D/sweep-spec q5km-k8v4 $Q5M q8_0:q4_0 98304 mtp
+$D/sweep-spec q6k $Q6 q8_0:q4_0 114688 none
+$D/sweep-spec q6k $Q6 q8_0:q4_0 114688 ngram
+echo SPEC_ALL_DONE

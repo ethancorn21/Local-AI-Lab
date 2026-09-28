@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+D=/opt/llm/sweep; MD=/opt/llm/openjev-lab/models/qwen27b/unsloth
+$D/sweep-spec iq4xs $MD/Qwen3.8-27B-UD-IQ4_XS.gguf q8_0:q8_0 131072 none
+$D/sweep-spec iq4xs $MD/Qwen3.8-27B-UD-IQ4_XS.gguf q8_0:q8_0 131072 mtp
+$D/sweep-spec q5km $MD/Qwen3.8-27B-UD-Q5_K_M.gguf q8_0:q8_0 131072 none
+echo RERUN_DONE

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# scenario stub for pi: runs .stub/N.sh (N = call number) in the project with TASK and PROMPT set
+[ "${1:-}" = --version ] && { echo "stub-pi 0"; exit 0; }
+n=$(( $(cat .stub/count 2>/dev/null || echo 0) + 1 )); echo $n > .stub/count
+PROMPT="${@: -1}"; TASK=$(grep -o 'tasks/[^ ]*\.md' <<<"$PROMPT" | head -1); export TASK PROMPT
+echo "$PROMPT" > .stub/prompt-$n.txt
+[ -f .stub/$n.sh ] && bash -e .stub/$n.sh
+echo '{"type":"stub"}'

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# sweep phases 2 (bigger-quant speed), 3 (all-GPU fit), 5 (KLD quality); phase 4 (MTP speed) runs after reviewing fit
+set -u
+D=/opt/llm/sweep; MD=/opt/llm/openjev-lab/models/qwen27b/unsloth
+IQ4=$MD/Qwen3.8-27B-UD-IQ4_XS.gguf; Q5M=$MD/Qwen3.8-27B-UD-Q5_K_M.gguf; Q5XL=$MD/Qwen3.8-27B-UD-Q5_K_XL.gguf
+Q6=$MD/Qwen3.8-27B-UD-Q6_K.gguf; Q8=$MD/Qwen3.8-27B-Q8_0.gguf
+while systemctl is-active --quiet sweep-p1; do sleep 30; done
+until [ -f $Q6 ] && [ -f $Q8 ] && [ -f $Q5XL ]; do sleep 30; done; echo "phase 2 start $(date +%T)"
+$D/sweep-bench $Q5M q5km q8_0:q8_0 q8_0:q4_0 q4_0:q4_0
+$D/sweep-bench $Q5XL q5kxl q8_0:q8_0 q8_0:q4_0 q4_0:q4_0
+$D/sweep-bench $Q6 q6k q8_0:q4_0 q4_0:q4_0
+echo "phase 3 start $(date +%T)"
+for kv in q4_0:q4_0 q8_0:q8_0 q8_0:q4_0; do for sp in none mtp; do
+  $D/sweep-fit iq4xs $IQ4 $kv $sp; $D/sweep-fit q5km $Q5M $kv $sp; $D/sweep-fit q5kxl $Q5XL $kv $sp
+done; $D/sweep-fit q6k $Q6 $kv none; done
+echo "phase 5 start $(date +%T)"
+$D/sweep-kld base
+for kv in q4_0:q4_0 q8_0:q8_0 q8_0:q4_0; do $D/sweep-kld iq4xs $IQ4 $kv; done
+for kv in q8_0:q8_0 q4_0:q4_0; do $D/sweep-kld q5km $Q5M $kv; $D/sweep-kld q5kxl $Q5XL $kv; done
+$D/sweep-kld q6k $Q6 q8_0:q4_0
+echo "SWEEP_ALL_DONE $(date +%T)"

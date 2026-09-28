@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""agent-report [project dir] [--last N] : how the agent loop is doing, from the ledger and the session files.
+
+  per task      sessions, hours, how sessions ended (on their own / handed over by the harness), rejected done claims,
+                research use, status now
+  recent        one line per session: minutes, context at the first code edit and at the peak, thinking tokens,
+                16k thinking-cap hits, tool errors, commits, outcome
+  summary       medians over the recent sessions + tool error rate by context depth (the numbers used to judge
+                harness changes before/after; the harness id column shows which configuration each session ran)
+"""
+import collections, glob, json, os, re, statistics as st, sys
+
+args = sys.argv[1:]
+last = 20
+if "--last" in args:
+    i = args.index("--last"); last = int(args[i + 1]); del args[i:i + 2]
+proj = os.path.abspath(args[0] if args else ".")
+LEDGER = os.path.join(proj, ".agent/iterations.jsonl")
+MEM = re.compile(r"(PROGRESS|DECISIONS|CODEMAP|AGENTS)\.md|codemap/|tasks/")
+CAP = 16000
+
+
+def load_ledger():
+    rows = []
+    for line in open(LEDGER):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return [r for r in rows if "iter" in r and r.get("iter")]
+
+
+def session(it):
+    """-> dict of per-session measurements from the session file (None if missing)."""
+    f = os.path.join(proj, f".agent/sessions/iter-{it:04d}.jsonl")
+    if not os.path.exists(f) or os.path.getsize(f) == 0:
+        return None
+    out = dict(first_edit=None, peak=0, think=0, caps=0, errs=0, calls=0, depth=[])
+    names, ctx = {}, 0
+    for line in open(f):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") not in ("message", "message_end"):
+            continue
+        m = e.get("message") or {}
+        if m.get("role") == "assistant":
+            u = m.get("usage") or {}
+            ctx = u.get("totalTokens") or ctx
+            out["peak"] = max(out["peak"], ctx)
+            r = u.get("reasoning") or 0
+            out["think"] += r
+            out["caps"] += r >= CAP
+            for c in m.get("content") or []:
+                if c.get("type") != "toolCall":
+                    continue
+                a = c.get("arguments") or {}
+                names[c.get("id")] = ctx
+                out["calls"] += 1
+                if c.get("name") in ("edit", "write") and not MEM.search(str(a.get("path") or "")) and out["first_edit"] is None:
+                    out["first_edit"] = ctx
+        elif m.get("role") in ("toolResult", "tool") and m.get("toolCallId") in names:
+            text = "".join(x.get("text") or "" for x in m.get("content") or [] if isinstance(x, dict))
+            blocked = "[harness]" in text
+            if m.get("isError") and not blocked:
+                out["errs"] += 1
+            out["depth"].append((names[m["toolCallId"]], bool(m.get("isError")) and not blocked, blocked))
+    return out
+
+
+def med(v):
+    v = [x for x in v if x is not None]
+    return st.median(v) if v else None
+
+
+def k(n):
+    return "-" if n is None else f"{n / 1000:.0f}k"
+
+
+def main():
+    led = load_ledger()
+    if not led:
+        print("no ledger yet"); return
+    tasks = collections.OrderedDict()
+    for r in led:
+        t = tasks.setdefault(r["task"], dict(n=0, secs=0, handed=0, rejected=0, web=0))
+        t["n"] += 1; t["secs"] += r.get("agent_secs") or 0
+        t["handed"] += bool(r.get("wrapup")); t["rejected"] += r.get("verify") == "rejected"
+        t["web"] += (r.get("web_searches") or 0) + (r.get("web_fetches") or 0)
+    print(f"== tasks ({len(tasks)}, {len(led)} sessions)")
+    print(f"  {'task':40s} {'sess':>4s} {'hours':>5s} {'handed over':>11s} {'rejected':>8s} {'web':>4s}  status")
+    for name, t in list(tasks.items())[-15:]:
+        f = os.path.join(proj, name)
+        status = open(f).readline().split(":", 1)[-1].strip() if os.path.exists(f) else "(file gone)"
+        print(f"  {name.replace('tasks/', '')[:40]:40s} {t['n']:4d} {t['secs'] / 3600:5.1f} {t['handed']:11d} {t['rejected']:8d} {t['web']:4d}  {status}")
+
+    recent = led[-last:]
+    print(f"\n== last {len(recent)} sessions")
+    print(f"  {'iter':>4s} {'task':22s} {'min':>4s} {'1st edit':>8s} {'peak':>5s} {'think':>6s} {'caps':>4s} {'errs':>4s} {'commits':>7s}  outcome  harness")
+    S = []
+    for r in recent:
+        s = session(r["iter"])
+        S.append((r, s))
+        end = r.get("verify") or r.get("status_after") or ""
+        how = {"steered": "handed over", "aborted": "cut off"}.get(r.get("wrapup"), "own stop")
+        if s is None:
+            print(f"  {r['iter']:4d} {r['task'].replace('tasks/', '')[:22]:22s} {(r.get('agent_secs') or 0) / 60:4.0f}  (no session file)")
+            continue
+        print(f"  {r['iter']:4d} {r['task'].replace('tasks/', '')[:22]:22s} {(r.get('agent_secs') or 0) / 60:4.0f} {k(s['first_edit']):>8s} "
+              f"{k(s['peak']):>5s} {k(s['think']):>6s} {s['caps']:4d} {s['errs']:4d} {r.get('agent_commits', 0):7d}  "
+              f"{end[:8]:8s} {how:11s} {r.get('harness_id', '')[:6]}")
+
+    ss = [s for _, s in S if s]
+    rr = [r for r, s in S if s]
+    print(f"\n== summary of those {len(ss)} sessions")
+    print(f"  median minutes {med([(r.get('agent_secs') or 0) / 60 for r in rr]):.1f} | context at first code edit {k(med([s['first_edit'] for s in ss]))} "
+          f"| peak {k(med([s['peak'] for s in ss]))} | thinking {k(med([s['think'] for s in ss]))} per session")
+    print(f"  ended on their own {sum(not r.get('wrapup') for r in rr)}/{len(rr)} | 16k thinking-cap hits {sum(s['caps'] for s in ss)} "
+          f"| rejected done claims {sum(r.get('verify') == 'rejected' for r in rr)} | research calls "
+          f"{sum((r.get('web_searches') or 0) + (r.get('web_fetches') or 0) for r in rr)}")
+    buckets = [(0, 40), (40, 70), (70, 100), (100, 120), (120, 151)]
+    line = []
+    for a, b in buckets:
+        pts = [(e, bl) for s in ss for d, e, bl in s["depth"] if a * 1000 <= d < b * 1000]
+        n = sum(1 for e, bl in pts if not bl)
+        if n:
+            line.append(f"{a}-{b}k {100 * sum(e for e, _ in pts) / n:.1f}% of {n}")
+    print("  tool error rate by context depth: " + " | ".join(line))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[Unit]
+Description=SSH tunnel: localhost:8080 -> the model server (127.0.0.1:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<tunnel-user>
+ExecStart=/usr/bin/ssh -N -T \
+  -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes \
+  -i /var/lib/<tunnel-user>/.ssh/id_ed25519 \
+  -L 127.0.0.1:8080:127.0.0.1:8080 <ai-box-tunnel-account>@<ai-box-address>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

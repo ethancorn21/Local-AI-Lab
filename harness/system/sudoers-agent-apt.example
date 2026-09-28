@@ -1,0 +1,2 @@
+# The agent may install system packages (user decision 2026-09-27). Root-equivalent: package scripts run as root.
+<agent-user> ALL=(root) NOPASSWD: /usr/bin/apt-get

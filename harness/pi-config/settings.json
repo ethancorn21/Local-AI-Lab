@@ -1,0 +1,11 @@
+{
+  "quietStartup": true,
+  "defaultProvider": "llamacpp",
+  "defaultModel": "qwen3.8-27b",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 8000,
+    "keepRecentTokens": 20000
+  },
+  "theme": "dark"
+}

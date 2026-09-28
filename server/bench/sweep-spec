@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# sweep-spec <label> <model.gguf> <k:v> <ctx> <none|mtp|ngram> : real llama-server, production sampling + thinking (xhigh),
+# a short and a ~45k-token coding request, 2 reps each -> generation tok/s and draft acceptance from the server timings
+set -u
+B=/opt/llm/llama.cpp/build/bin; D=/opt/llm/sweep; OUT=$D/results; MD=/opt/llm/openjev-lab/models/qwen27b/unsloth
+LABEL=$1; M=$2; k=${3%:*}; v=${3#*:}; CTX=$4; SPEC=$5
+extra=()
+[ "$SPEC" = mtp ] && extra=(--spec-type draft-mtp -md $MD/MTP/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 -ctkd $k -ctvd $v)
+[ "$SPEC" = ngram ] && extra=(--spec-type ngram-mod)
+$B/llama-server -m "$M" --host 127.0.0.1 --port 8099 -c $CTX -ctk $k -ctv $v -ub 512 -ngl 99 --fit off -fa on -np 1 \
+  --jinja --reasoning-budget 16384 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 "${extra[@]}" > $OUT/spec-$LABEL-$SPEC.server.log 2>&1 &
+pid=$!
+for i in $(seq 1 90); do curl -s -m 1 127.0.0.1:8099/health | grep -q '"ok"' && break; kill -0 $pid 2>/dev/null || { echo "SPEC_FAIL $LABEL $SPEC server died"; exit 1; }; sleep 1; done
+SHORT='Write a JavaScript ES module implementing a binary min-heap priority queue with push, pop, peek, size and decreaseKey(id, newPriority) (O(log n) via an id->index map), with JSDoc, then node:test unit tests covering every method.'
+head -c 160000 $D/eval.txt > /tmp/spec-long.txt
+printf '\n\nTask: using the codebase above, add an exported function lineOfFireBlocked(floor, from, to, rng) to src/sim/pathfind.js for the upcoming COVER tile (blocks a bullet with 70%% chance unless the shooter stands adjacent to it). Write the complete function and its node:test tests.' >> /tmp/spec-long.txt
+for kind in short long; do for rep in 1 2; do
+  if [ $kind = short ]; then base=$(jq -n --arg p "$SHORT" '{messages:[{role:"user",content:$p}]}'); else base=$(jq -n --rawfile p /tmp/spec-long.txt '{messages:[{role:"user",content:$p}]}'); fi
+  body=$(printf '%s' "$base" | jq --argjson s $rep '. + {max_tokens:1500, seed:$s, chat_template_kwargs:{enable_thinking:true, preserve_thinking:true, reasoning_effort:"xhigh"}}')
+  printf '%s' "$body" > /tmp/spec-body.json   # the long body exceeds the kernel's per-argument limit: send it from a file
+  r=$(curl -s -m 900 127.0.0.1:8099/v1/chat/completions -H 'Content-Type: application/json' --data-binary @/tmp/spec-body.json)
+  jq -c --arg l "$LABEL" --arg kv "$k/$v" --arg sp "$SPEC" --arg kind $kind --argjson rep $rep --argjson ctx $CTX \
+    '{label:$l, kv:$kv, spec:$sp, ctx:$ctx, prompt:$kind, rep:$rep, prompt_n:.timings.prompt_n, pp_ts:(.timings.prompt_per_second|.*10|round/10),
+      gen_n:.timings.predicted_n, tg_ts:(.timings.predicted_per_second|.*10|round/10), draft_n:(.timings.draft_n // 0),
+      accepted:(.timings.draft_n_accepted // 0)}' <<<"$r" | tee -a $OUT/spec.jsonl
+done; done
+kill $pid; wait $pid 2>/dev/null; sleep 3

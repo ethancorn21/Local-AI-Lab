@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# sweep-fit <label> <model.gguf> <k:v> <mtp|none> : largest all-GPU context llama-server loads with (production flags)
+set -u
+B=/opt/llm/llama.cpp/build/bin; OUT=/opt/llm/sweep/results; mkdir -p $OUT
+MD=/opt/llm/openjev-lab/models/qwen27b/unsloth
+LABEL=$1; M=$2; k=${3%:*}; v=${3#*:}; SPEC=$4
+extra=(); [ "$SPEC" = mtp ] && extra=(--spec-type draft-mtp -md $MD/MTP/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 -ctkd $k -ctvd $v)
+for c in 262144 229376 196608 163840 131072 114688 98304 81920 65536 49152 32768; do
+  $B/llama-server -m "$M" --host 127.0.0.1 --port 8099 -c $c -ctk $k -ctv $v -ub 512 -ngl 99 --fit off -fa on -np 1 \
+    --mmproj $MD/mmproj-F16.gguf --no-mmproj-offload --jinja "${extra[@]}" > /tmp/fit.log 2>&1 &
+  pid=$!; ok=0
+  for i in $(seq 1 60); do
+    curl -s -m 1 127.0.0.1:8099/health 2>/dev/null | grep -q '"ok"' && { ok=1; break; }
+    kill -0 $pid 2>/dev/null || break; sleep 1
+  done
+  mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 2
+  if [ $ok = 1 ]; then echo "{\"label\":\"$LABEL\",\"kv\":\"$k/$v\",\"spec\":\"$SPEC\",\"max_ctx\":$c,\"vram_mib\":$mem}" >> $OUT/fit.jsonl; echo "FIT $LABEL $k/$v $SPEC ctx=$c vram=${mem}MiB"; exit 0; fi
+done
+echo "{\"label\":\"$LABEL\",\"kv\":\"$k/$v\",\"spec\":\"$SPEC\",\"max_ctx\":0}" >> $OUT/fit.jsonl; echo "NOFIT $LABEL $k/$v $SPEC"

@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec node "$(dirname "$(realpath "$0")")/game-shot.mjs" "$@"

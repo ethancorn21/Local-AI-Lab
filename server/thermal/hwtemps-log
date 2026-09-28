@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# hwtemps-log: sample CPU and GPU temperatures every 15 s into /var/log/hwtemps.csv (the history that answers "how have
+# temps been"). Safety stop: if the hottest CPU core stays >= CPU_LIMIT or the GPU >= GPU_LIMIT for ~1 minute, stop the
+# vLLM container (drops the GPU load at once; the agent loop's iteration fails and the driver saves its work).
+# Hardware limits for reference: the i9-14900KF throttles at 100 C; the 3090 Ti targets 83 C and slows down at 94 C.
+LOG=/var/log/hwtemps.csv; CPU_LIMIT=95; GPU_LIMIT=88; hot=0; stopped=0
+[ -f $LOG ] || echo "time,cpu_pkg_c,cpu_max_core_c,gpu_c,gpu_w,gpu_fan_pct,gpu_util_pct" > $LOG
+HW=$(for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name)" = coretemp ] && echo $h; done | head -1)
+while true; do
+  pk=$(( $(cat $HW/temp1_input) / 1000 )); mx=0
+  for f in $HW/temp*_input; do v=$(( $(cat $f) / 1000 )); [ $v -gt $mx ] && mx=$v; done
+  g=$(nvidia-smi --query-gpu=temperature.gpu,power.draw,fan.speed,utilization.gpu --format=csv,noheader,nounits | head -1 | tr -d " ")
+  echo "$(date +%FT%T),$pk,$mx,$g" >> $LOG
+  gt=${g%%,*}
+  if [ "$mx" -ge $CPU_LIMIT ] || [ "${gt:-0}" -ge $GPU_LIMIT ]; then hot=$((hot + 1)); else hot=0; fi
+  if [ $hot -ge 4 ] && [ $stopped = 0 ]; then
+    stopped=1
+    logger -t hwtemps "OVERHEAT cpu_max=${mx}C gpu=${gt}C for ~1 min - stopping the vLLM container"
+    docker stop hyperqwen-single-1 > /dev/null 2>&1
+  fi
+  sleep 15
+done

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# engine sweep: HyperQwen (vLLM) in the config currently running on :18020
+L=$1
+/opt/llm/sweep/engine-bench.py --url http://127.0.0.1:18020/v1 --model qwen3.8-27b --label $L --effort kwargs --reps 3
+curl -s 127.0.0.1:18020/metrics | grep -E "^vllm:spec_decode_num_(accepted|draft)_tokens_total" | sed "s/^/METRIC $L /"
+/opt/llm/sweep/engine-ppl.py --url http://127.0.0.1:18020/v1 --model qwen3.8-27b --label $L
+echo ENGINE_RUN_DONE $L

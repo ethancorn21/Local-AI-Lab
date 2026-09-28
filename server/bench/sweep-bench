@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# sweep-bench <model.gguf> <label> <k:v>... : llama-bench prefill + decode at depth 0/32k/64k per KV cache type pair
+set -u
+B=/opt/llm/llama.cpp/build/bin; OUT=/opt/llm/sweep/results; mkdir -p $OUT
+M=$1; LABEL=$2; shift 2
+for kv in "$@"; do
+  k=${kv%:*}; v=${kv#*:}; f=$OUT/bench-$LABEL-$k-$v
+  $B/llama-bench -m "$M" -ngl 99 -fa on -ctk $k -ctv $v -p 2048 -n 128 -d 0,32768,65536 -r 2 -o jsonl > $f.jsonl 2> $f.err
+  echo "done $LABEL $k/$v rc=$? gpu_mem_peak_na $(date +%T)"
+done

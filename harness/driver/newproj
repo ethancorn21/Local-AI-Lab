@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# newproj <name> : create ~/projects/<name> with the agent memory scaffolding and a git repo.
+set -euo pipefail
+[ $# -eq 1 ] || { echo "usage: newproj <name>" >&2; exit 1; }
+P="$HOME/projects/$1"
+[ -e "$P" ] && { echo "$P already exists" >&2; exit 1; }
+mkdir -p "$P"
+cp -r "$HOME/.agent-kit/template/." "$P/"
+cd "$P"
+git init -q -b agent/work
+git add -A
+git commit -q -m "scaffold: agent memory files and task queue"
+echo "Created $P (branch agent/work). Add a seed task tasks/001-name.md (goal + your acceptance criteria; the agent splits it), then run: agent-loop $P"

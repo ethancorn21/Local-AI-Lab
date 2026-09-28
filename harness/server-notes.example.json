@@ -1,0 +1,10 @@
+{
+  "engine": "vllm (HyperQwen recipe)",
+  "image": "ghcr.io/syv-ai/hyperqwen:sha-d1c8a48 (functionally = reviewed source 1cf8665)",
+  "config": "single-user D: SPEC=mtp CTX=long PREFIX_CACHE=1 VISION=1 (tower offloaded to host RAM), images per request <= 8",
+  "model": "Qwen3.8-27B-W4A16-AutoRound-fast (4-bit AutoRound + requantized heads)",
+  "context": 150000,
+  "gpu": "RTX 3090 Ti 24GB (sm_86), 350 W cap; CPU i9-14900KF 125 W cap",
+  "fallback": "llama.cpp dc9879cf6 (sm_86+120) llama-server.service, disabled",
+  "changed": "2026-09-27"
+}

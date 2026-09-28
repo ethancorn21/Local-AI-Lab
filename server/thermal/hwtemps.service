@@ -1,0 +1,11 @@
+[Unit]
+Description=CPU/GPU temperature log (/var/log/hwtemps.csv) with an overheat safety stop for the vLLM container
+After=docker.service
+
+[Service]
+ExecStart=/usr/local/sbin/hwtemps-log
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

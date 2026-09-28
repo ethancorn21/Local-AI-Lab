@@ -1,0 +1,13 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ca13db5..3cee3e5 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -63,7 +63,7 @@ x-qwen: &qwen
+ x-serve: &serve
+   <<: *qwen
+   ports:
+-    - "${PORT:-18020}:${PORT:-18020}"
++    - "127.0.0.1:${PORT:-18020}:${PORT:-18020}"
+   depends_on:
+     prepare:
+       condition: service_completed_successfully

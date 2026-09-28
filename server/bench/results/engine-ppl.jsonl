@@ -1,0 +1,2 @@
+{"label": "hyperqwen-D-mtp-150k", "protocol": "llama", "ppl": 2.292458, "scored_tokens": 24576}
+{"label": "hyperqwen-D-mtp-150k", "protocol": "ninfer", "ppl": 2.208366, "scored_tokens": 54839}
