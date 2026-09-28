@@ -19,10 +19,10 @@ ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
 STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
 LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
-# Where hand-over notes live. progress: PROGRESS.md, a snapshot rewritten every session (default). task: the "## Hand-over"
+# Where hand-over notes live. progress: PROGRESS.md, a snapshot rewritten every session. task (default): the "## Hand-over"
 # section of the task being worked on (a subtask also reads its parent's); PROGRESS.md becomes a driver-generated
 # overview, and anything the agent still writes there is moved into its task's hand-over (counted in the ledger).
-HANDOVER_MODE=${HANDOVER_MODE:-progress}
+HANDOVER_MODE=${HANDOVER_MODE:-task}   # default since 2026-09-28 (A/B: as reliable as PROGRESS.md, and merges cleanly for two agents)
 export WRAPUP_HANDOVER=$HANDOVER_MODE   # the hand-over extension words its message for the mode
 VIEWER=${VIEWER:-tui}            # tui: Pi's own TUI in tmux window $AGENT_TMUX; json: headless (pi-live viewer)
 AGENT_TMUX=${AGENT_TMUX:-main:agent}
@@ -359,13 +359,16 @@ for i in $(seq "$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 )
     # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
     # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
     sess=${AGENT_TMUX%%:*}; win=${AGENT_TMUX#*:}; sdir=".agent/sessions/iter-$n4.d"
+    # the done-signal is per project: two loops on the same iteration number must not wake each other (a shared
+    # "agent-done-N" ended both agents' sessions whenever either finished)
+    chan="agent-done-$(printf '%s' "$P" | cksum | cut -d' ' -f1)-$i"
     printf '%s' "$PROMPT" > .agent/prompt.txt; rm -f .agent/rc
     tmux has-session -t "$sess" 2>/dev/null || tmux new-session -d -s "$sess"
     tmux list-windows -t "$sess" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "$sess" -n "$win"
     tmux set-option -w -t "$AGENT_TMUX" remain-on-exit on   # keep the last screen up between iterations
-    tmux respawn-window -k -t "$AGENT_TMUX" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S agent-done-$i"
+    tmux respawn-window -k -t "$AGENT_TMUX" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"
     tmux display -p -t "$AGENT_TMUX" '#{pane_pid}' > .agent/pi.pid
-    timeout $((ITER_TIMEOUT + 120)) tmux wait-for "agent-done-$i"   # bounded: a killed window cannot hang the loop
+    timeout $((ITER_TIMEOUT + 120)) tmux wait-for "$chan"   # bounded: a killed window cannot hang the loop
     rc=$(cat .agent/rc 2>/dev/null || echo 1)
     f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
     if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi

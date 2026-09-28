@@ -151,7 +151,23 @@ Oh My Pi v18.3.3 (a Pi fork with hash-anchored edits and language-server tools) 
 
 Oh My Pi finished the task but ~70% slower: a larger built-in prompt, more reading before acting, more thinking, and more sessions hitting the context limit. Its hash-anchored edits did not reduce edit failures for this model. Decision: stay on Pi (one run, but the gap is far outside the run-to-run noise).
 
-## Planned: two agents on one project (when the second 3090 Ti arrives)
+## Measured: two agents on one GPU (2026-09-28)
+
+Two agents ran the same replay (task 025) at the same time on the one RTX 3090 Ti, production settings, task-file notes, while the server's metrics were sampled every 30 s.
+
+| | One agent (4 earlier runs) | Two agents at once |
+|---|---|---|
+| Time to finish 025 | 1.00-1.17 h each | ~2.0 h each (2 tasks in 2.07 h) |
+| Throughput | 1x | **~1.06x** |
+| Combined output while both generate | ~80-100 tok/s | 91 tok/s |
+| Context-memory preemptions | - | 243 in 2 h; a request waiting in 26% of samples |
+
+- **Speculative decoding (MTP) already uses the GPU's spare capacity**, so a second concurrent agent adds almost nothing (HyperQwen's batch mode only beats MTP from ~8 concurrent requests up), and the 200k-token context pool (already 8-bit) is too small for two agents at production limits.
+- An earlier probe (78 -> 192 tok/s with a second request) was unrepresentative: short, thinking-off generation with no memory pressure.
+- **Conclusion: one agent per GPU.** More agents need more cards; two per card is not worth it with this model and config.
+- The first attempt at this test exposed a driver bug that would also have broken the two-agent design: the TUI done-signal (`tmux wait-for agent-done-N`) was shared between loops on the same iteration number, so when either agent finished, both sessions ended. Fixed: the signal is per project.
+
+## Planned: two agents on one project (when a second 24 GB GPU arrives)
 
 - One model copy per card (ports 8080 and 8081), 4-bit, MTP, 150k window each. First a ~30 minute A/B: two separate servers with two agents, one split server with two agents, one split server with one agent.
 - Each agent works in its own git worktree and branch; `main` is where finished work comes together, and each session starts by merging the latest `main`.
