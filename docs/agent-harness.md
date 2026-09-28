@@ -131,6 +131,8 @@ Run 1 (2026-09-28) was stopped and discarded after arm A's sessions on 025b star
 
 ## Do-later list
 
+- When the second 3090 Ti arrives: rerun the quantization comparison as a **capability** test. The 2026-09-27 sweep measured only how closely each quant's predictions match 8-bit (KL divergence, perplexity) and speed; those are proxies. With 48 GB the 8-bit model fits entirely on GPU, so run the same agentic tasks with hidden tests under Q4, Q6 and Q8 and compare task success, sessions per task, rejected claims and tool errors.
+
 - Kickoff flow for new projects: from a one-line idea the agent writes the design doc and proposes the task queue; the operator approves the acceptance criteria.
 - Harness bake-off on replayed tasks with hidden tests: Pi vs Oh My Pi (hash-anchored edits, language-server tools), possibly others.
 - `sim_view` tool: run the game simulation for N ticks from a seed and return an image (map, paths, entities), so the agent can see emergent bugs. The model has vision; the agent almost never uses it.
