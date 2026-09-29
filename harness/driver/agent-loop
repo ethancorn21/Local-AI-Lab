@@ -426,11 +426,16 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     # "agent-done-N" ended both agents' sessions whenever either finished)
     chan="agent-done-$(printf '%s' "$P" | cksum | cut -d' ' -f1)-$i"
     printf '%s' "$PROMPT" > .agent/prompt.txt; rm -f .agent/rc
-    tmux has-session -t "$sess" 2>/dev/null || tmux new-session -d -s "$sess"
-    tmux list-windows -t "$sess" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "$sess" -n "$win"
-    tmux set-option -w -t "$AGENT_TMUX" remain-on-exit on   # keep the last screen up between iterations
-    tmux respawn-window -k -t "$AGENT_TMUX" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"
-    tmux display -p -t "$AGENT_TMUX" '#{pane_pid}' > .agent/pi.pid
+    # Targets are explicit: "=name" is an exact session match and "name:" a session. Run from inside tmux, a bare
+    # "-t name" is first read as a window of the CURRENT session, prefix-matched ("tt" hit a window "tt-loop"), and the
+    # agent window was never created while the loop waited ITER_TIMEOUT for a session that had not started.
+    tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -n "$win"
+    tmux list-windows -t "=$sess:" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "=$sess:" -n "$win"
+    tmux set-option -w -t "=$sess:$win" remain-on-exit on   # keep the last screen up between iterations
+    if ! tmux respawn-window -k -t "=$sess:$win" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"; then
+      log "ERROR: could not start the agent in tmux window $AGENT_TMUX - stopping (nothing ran this iteration)"; exit 1
+    fi
+    tmux display -p -t "=$sess:$win" '#{pane_pid}' > .agent/pi.pid
     timeout $((ITER_TIMEOUT + 120)) tmux wait-for "$chan"   # bounded: a killed window cannot hang the loop
     rc=$(cat .agent/rc 2>/dev/null || echo 1)
     f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
