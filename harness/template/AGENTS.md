@@ -77,8 +77,8 @@ The ONLY memory you have is these files and git history. If you do not write it 
 - Some things only the human can do: hardware, accounts, credentials or API keys, anything outside this VM, a decision
   the acceptance criteria do not settle. For those, call `ask_human`. They get a ping and answer later, often hours
   later. Anything you can find out or do yourself (code, docs, `web_search`, `sudo apt-get`) is not a reason to ask.
-- After a blocking request the loop waits for the answer, and the next session after it is pointed at it: write in
-  your task's `## Hand-over` that you are waiting on it, commit, and end the session.
+- A blocking request makes only its task wait: the loop works on other tasks meanwhile and comes back to it once the
+  human answers. After filing one, write in your task's `## Hand-over` that it is waiting, commit, and end the session.
 
 ## Context limit
 

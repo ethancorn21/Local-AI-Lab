@@ -15,8 +15,9 @@
 # loop start) as the definition of done and reports new tasks, changed criteria and `## Proposed changes` to the log.
 # CODEMAP.md is regenerated from the code by `codemap-gen` before every iteration.
 # To stop cleanly between iterations (e.g. to change the harness): touch .agent/PAUSE; remove it before restarting.
-# Requests to the human (the agent's ask_human tool, .agent/asks/): an open blocking one holds the loop until the human
-# answers with agent-talk; the doorbell pings them when the wait starts and every ASK_REMIND_HOURS after.
+# Requests to the human (the agent's ask_human tool, .agent/asks/): a blocking one makes its task wait while the loop
+# works on other tasks; answered, that task runs next. With nothing else to do the loop waits (never exits) and the
+# doorbell pings the human when the wait starts and every ASK_REMIND_HOURS after.
 set -uo pipefail
 DRIVER_FILE=$(realpath "${BASH_SOURCE[0]}")
 P=$(realpath "${1:?usage: agent-loop <project dir>}")
@@ -220,6 +221,7 @@ pending_subtasks() {
 has_subtasks() { compgen -G "tasks/$1[a-z]*-*.md" > /dev/null; }
 workable() {  # workable <file> in-progress|open
   local s; s=$(status_of "$1")
+  grep -qxF -- "$1" <<<"${WAITING:-}" && return 1   # waits for the human's answer to a request
   [ "$(pending_subtasks "$(task_id "$1")")" -eq 0 ] || return 1
   if [ "$2" = in-progress ]; then [ "$s" = in-progress ]; else [ "$s" = open ] || [ "$s" = split ]; fi
 }
@@ -269,9 +271,11 @@ wait_for_server() {
   done
   log "model server back after $(( ($(date +%s) - t0) / 60 )) min"
 }
-# Requests to the human (.agent/asks/<n>.md, filed by the ask_human tool, answered with agent-talk). An open blocking
-# request holds the whole loop rather than skipping to other tasks: the queue is usually a chain, and a later task
-# started early builds on an unanswered question. Nothing about the request leaves the VM; the doorbell only rings.
+# Requests to the human (.agent/asks/<n>.md, filed by the ask_human tool, answered with agent-talk). A blocking request
+# makes only its own task wait: the loop works on other tasks meanwhile and comes back to that one first once the
+# human has answered. Tasks the agent sets to blocked while a request is open are recorded as waiting on it
+# (<n>.waiters) and resume with it. Only when nothing else can be worked on does the loop wait; it never exits with a
+# request open, and a message typed in agent-watch also ends the wait. Nothing about a request leaves the VM.
 ask_field() { sed -n "s/^$2: //p" "$1" | head -1; }
 asks_with() {  # asks_with <status> [blocking] : request files with that status (and blocking: yes)
   local f
@@ -282,19 +286,39 @@ asks_with() {  # asks_with <status> [blocking] : request files with that status 
   done
   return 0
 }
-wait_for_answers() {
-  local open t0 last now
-  open=$(asks_with open blocking); [ -z "$open" ] && return 0
-  log "waiting for the human: open request(s) $(echo $open) - no sessions until answered (agent-talk); $(ring-doorbell)"
+waiting_tasks() { local a; for a in $(asks_with open blocking); do ask_field "$a" task; done | sort -u; }
+inbox_pending() { compgen -G ".agent/inbox/[0-9]*.md" > /dev/null; }
+# The task of the first answered request, set runnable again (with its waiters) so it goes next; prints its file.
+answered_first() {
+  local a t w
+  for a in $(asks_with answered); do
+    t=$(ask_field "$a" task)
+    if [ -f "$t" ] && { [ "$(status_of "$t")" = blocked ] || [ "$(status_of "$t")" = done ]; }; then
+      sed -i '1s/.*/Status: in-progress/' "$t"; git add "$t" && git commit -q -m "[driver] $t resumed: the human answered $a"
+      log "$t resumed: the human answered $a" >&2
+    fi
+    for w in $(cat "${a%.md}.waiters" 2>/dev/null); do
+      [ -f "$w" ] && [ "$(status_of "$w")" = blocked ] || continue
+      sed -i '1s/.*/Status: in-progress/' "$w"; git add "$w" && git commit -q -m "[driver] $w resumed: the human answered $a"
+      log "$w resumed: the human answered $a (it was waiting on it)" >&2
+    done
+    [ -f "$t" ] && workable "$t" in-progress && { echo "$t"; return; }
+  done
+}
+# Nothing to work on while requests are open: wait for a new answer, or a message when a task could take it.
+wait_for_human() {
+  local t0 last now a0
+  a0=$(asks_with answered)
+  log "nothing to work on until the human answers: open request(s) $(echo $(asks_with open)) - waiting (agent-talk to answer); $(ring-doorbell)"
   t0=$(date +%s); last=$t0
-  while [ -n "$(asks_with open blocking)" ]; do
+  while [ "$(asks_with answered)" = "$a0" ] && [ -n "$(asks_with open)" ] && ! { [ -n "$WAITING" ] && inbox_pending; }; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
-    sleep 60; now=$(date +%s)
+    sleep 30; now=$(date +%s)
     if [ $((now - last)) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
       log "still waiting for the human after $(( (now - t0) / 3600 )) h; $(ring-doorbell)"; last=$now
     fi
   done
-  log "request(s) answered after $(( ($(date +%s) - t0) / 60 )) min"
+  log "the human answered or wrote after $(( ($(date +%s) - t0) / 60 )) min"
 }
 # agent-talk holds the loop with .agent/TALK while the human talks with an agent in this project.
 wait_for_talk() {
@@ -465,20 +489,21 @@ start=$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 ))
 stop_reason="reached MAX_ITERS ($MAX_ITERS sessions this run)"
 for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
-  wait_for_answers
   wait_for_talk
-  # A task set to blocked while its request was open is picked up again once the human has answered.
-  for a in $(asks_with answered); do
-    t=$(ask_field "$a" task)
-    if [ -f "$t" ] && [ "$(status_of "$t")" = blocked ]; then
-      sed -i '1s/.*/Status: in-progress/' "$t"; git add "$t" && git commit -q -m "[driver] $t unblocked: the human answered $a"
-      log "$t unblocked: the human answered $a"
-    fi
-  done
   wait_for_server
   goal_changed
-  task=$(next_task)
-  [ -z "$task" ] && task=$(goal_check_next)
+  # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
+  # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
+  # mean wait; otherwise the goal check, then stop.
+  while :; do
+    WAITING=$(waiting_tasks)
+    task=$(answered_first)
+    [ -z "$task" ] && task=$(next_task)
+    [ -n "$task" ] && break
+    if [ -n "$WAITING" ] && { inbox_pending || [ -n "$(asks_with answered)" ]; }; then task=$(head -1 <<<"$WAITING"); break; fi
+    if [ -n "$(asks_with open)" ]; then wait_for_human; continue; fi
+    task=$(goal_check_next); break
+  done
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   before=$(agent_commits)
   harness_stamp
@@ -512,7 +537,9 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   db=$(stat -c %s DECISIONS.md 2>/dev/null || echo 0)
   [ "$db" -gt 46080 ] && PROMPT="$PROMPT DECISIONS.md is $((db / 1024)) KB, more than one read returns: read it to the end (continue with the offset the read tool gives you). Your task's newest entries are at the bottom."
   # Answers to requests reach exactly one session: this one is pointed at them, then they are closed.
-  answered=$(asks_with answered)
+  answered=$(for a in $(asks_with answered); do t=$(ask_field "$a" task); { [ "$t" = "$task" ] || [ ! -f "$t" ]; } && echo "$a"; done)
+  others=$(grep -vxF -- "$task" <<<"$WAITING" | grep .)
+  [ -n "$others" ] && PROMPT="$PROMPT These tasks wait for the human's answer to a request; do not work on them now: $(echo $others)."
   if [ -n "$answered" ]; then
     PROMPT="$PROMPT The human answered request(s) sent to them: $(echo $answered). Read them to the end (the answer and any outcome are at the bottom) before you plan your step."
     for a in $answered; do sed -i 's/^status: answered$/status: closed/' "$a"; done
@@ -602,6 +629,9 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   else no_progress=$((no_progress + 1)); log "no agent commit ($no_progress/$NO_PROGRESS_LIMIT)"; fi
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
+  if [ "$status_after" = blocked ]; then   # blocked while a request is open: it resumes when that is answered
+    for a in $(asks_with open); do grep -qxF -- "$task" "${a%.md}.waiters" 2>/dev/null || echo "$task" >> "${a%.md}.waiters"; done
+  fi
   if [ "$task" = tasks/999-goal-check.md ] && [ "$VERIFY" = accepted ] && [ -f .agent/goal-check ]; then
     gc_start=$(sed -n 's/^start=//p' .agent/goal-check)
     sed -i "s/^added=.*/added=$(( $(ls tasks/[0-9]*.md | grep -vc '/999-') - gc_start ))/" .agent/goal-check

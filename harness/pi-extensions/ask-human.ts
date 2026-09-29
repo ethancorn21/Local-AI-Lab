@@ -7,8 +7,8 @@
  *  - The human gets a content-free Telegram ping through `ring-doorbell` (the AI box sends a fixed text; this VM can
  *    ring the bell but not choose the words) and answers with `agent-talk` on this VM: a live conversation with a
  *    fresh agent in the project, or a short typed reply.
- *  - blocking (default): the driver starts no session until the request is answered, and points the first session
- *    after the answer at it (agent-loop, "Requests to the human").
+ *  - blocking (default): this task waits for the answer; the loop works on other tasks meanwhile and comes back to this
+ *    one first once the human has answered (agent-loop, "Requests to the human").
  * Markers "[ask] ..." go to PI_LOOP_MARKERS (or stderr) for the loop ledger.
  * Env: RING_DOORBELL (default ~/bin/ring-doorbell); PI_LOOP_TASK and PI_LOOP_ITER come from the driver.
  */
@@ -62,8 +62,8 @@ export default function (pi: ExtensionAPI) {
 					"you will know it is done. Include exact commands, paths, versions and error messages.",
 			}),
 			blocking: Type.Optional(Type.Boolean({
-				description: "true (default): the loop waits for the answer before any new session starts. false: work " +
-					"continues; the answer is passed to a later session.",
+				description: "true (default): this task waits for the answer; the loop works on other tasks meanwhile and " +
+					"comes back to this one when the human answers. false: this task can continue; the answer is passed on later.",
 			})),
 		}),
 		async execute(_id, params: any) {
@@ -91,9 +91,11 @@ export default function (pi: ExtensionAPI) {
 				: `The ping did not go out (${r.out}); the request is filed, and the loop pings again while it waits.`;
 			const note = cut ? ` Your request was cut at ${MAX_CHARS} characters.` : "";
 			return text(blocking
-				? `Filed as ${rel}. ${pinged}${note} No new session starts until the human answers, which can take hours, so ` +
-					`do not wait or poll for it. Keep the task's status as it is. Write in your task's ## Hand-over that you ` +
-					`are waiting on request ${n} and what to do with the answer, commit, and end the session.`
+				? `Filed as ${rel}. ${pinged}${note} This task now waits for the answer, which can take hours: do not wait or ` +
+					`poll for it. The loop moves on to other tasks meanwhile and brings you back to this one once the human has ` +
+					`answered. Keep this task's status as it is. Write in its ## Hand-over that it is waiting on request ${n} and ` +
+					`what to do with the answer, commit, and end the session. If another task also cannot go on without this ` +
+					`answer, set that task to Status: blocked; it resumes when the answer arrives.`
 				: `Filed as ${rel}. ${pinged}${note} Carry on with work that does not depend on it; a later session is ` +
 					`pointed at the answer.`,
 				{ n, blocking, rang: r.ok });
