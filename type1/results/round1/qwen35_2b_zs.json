@@ -1,0 +1,56 @@
+{
+ "method": "qwen35_2b_zs",
+ "time": "2026-09-29T18:52:26Z",
+ "model_id": "Qwen/Qwen3.5-2B",
+ "zero_shot": true,
+ "max_len": 4096,
+ "server": false,
+ "peak_vram_gb": 5.71,
+ "results": {
+  "test_core": {
+   "n": 4241,
+   "n_malicious": 2141,
+   "auroc": 0.5714274150065793,
+   "ap": 0.2700420576164615,
+   "brier": 0.18917302023395582,
+   "ece": 0.19200477452245998,
+   "recall@fpr0.01": 0.021172618552124087,
+   "val_thr@fpr0.01": {
+    "threshold": 0.5420667157064936,
+    "test_recall": 0.021092150170648465,
+    "test_fpr": 0.0070607597965512
+   },
+   "family_recall@val_fpr0.01": {
+    "escalation": 0.0078,
+    "exfil": 0.0233,
+    "scan": 0.0162,
+    "vpn": 0.0,
+    "webshell": 0.0583
+   },
+   "source_fpr@val_fpr0.01": {
+    "audit": 0.0,
+    "auth": 0.01476,
+    "dns": 0.00869,
+    "ids": 0.0089,
+    "vpn": 0.0,
+    "web_access": 0.0,
+    "web_error": 0.0
+   },
+   "recall@fpr0.001": 0.0016644006030503992,
+   "val_thr@fpr0.001": {
+    "threshold": 0.600894798503221,
+    "test_recall": 0.0001902568513739745,
+    "test_fpr": 0.00018728153989918094
+   },
+   "tactic_acc_on_malicious": 0.46847267631947687,
+   "tactic_acc_per_class": {
+    "Discovery": 0.5117,
+    "Execution": 0.0,
+    "Exfiltration": 0.9651,
+    "Initial Access": 0.0407,
+    "Privilege Escalation": 0.0
+   },
+   "ms_per_window_batched_2q": 130.87263463287002
+  }
+ }
+}

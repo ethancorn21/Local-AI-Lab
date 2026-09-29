@@ -1,0 +1,13 @@
+# round 1 on data v2 (sim-internet remapped), all on test_core; most informative first
+qwen35_0.8b_zs	$PY m_decoder_zs.py qwen35_0.8b_zs Qwen/Qwen3.5-0.8B --max-len 4096 --batch 8
+qwen35_2b_zs	$PY m_decoder_zs.py qwen35_2b_zs Qwen/Qwen3.5-2B --max-len 4096 --batch 8
+qwen35_4b_zs	$PY m_decoder_zs.py qwen35_4b_zs Qwen/Qwen3.5-4B --max-len 4096 --batch 4
+qwen35_9b_zs	$PY m_decoder_zs.py qwen35_9b_zs Qwen/Qwen3.5-9B --max-len 4096 --batch 2
+qwen3emb_0.6b_lr	$PY m_embed.py qwen3emb_0.6b_lr Qwen/Qwen3-Embedding-0.6B --max-len 2048 --batch 16
+secbert2_ft	$PY m_seqcls.py secbert2_ft cisco-ai/SecureBERT2.0-base --lr 3e-5 --max-len 2048 --batch 16 --micro 4 --no-full
+qwen35_0.8b_lora	$PY m_seqcls.py qwen35_0.8b_lora Qwen/Qwen3.5-0.8B --lora --lr 2e-4 --max-len 2048 --batch 16 --micro 4 --no-full
+laya_ft	$PY m_laya.py ft laya_ft --no-full
+modernbert_large_ft	$PY m_seqcls.py modernbert_large_ft answerdotai/ModernBERT-large --lr 2e-5 --max-len 2048 --batch 16 --micro 2 --no-full
+qwen35_2b_lora	$PY m_seqcls.py qwen35_2b_lora Qwen/Qwen3.5-2B --lora --lr 2e-4 --max-len 2048 --batch 16 --micro 2 --no-full
+laya_zs_en512	$PY m_laya.py zs laya_zs_en512 --max-len 512 --no-full
+laya_zs_multi1024	$PY m_laya.py zs laya_zs_multi1024 --subfolder multilingual --max-len 1024 --no-full

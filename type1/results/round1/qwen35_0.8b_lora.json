@@ -1,0 +1,68 @@
+{
+ "method": "qwen35_0.8b_lora",
+ "time": "2026-09-29T21:51:01Z",
+ "model_id": "Qwen/Qwen3.5-0.8B",
+ "lora": true,
+ "max_len": 2048,
+ "lr": 0.0002,
+ "epochs": 1.0,
+ "train_windows": 18052,
+ "exclude_family": null,
+ "best_val_loss": 0.3117380142211914,
+ "temperature": 1.3873248613881473,
+ "train_seconds": 5267.944545050996,
+ "ms_per_window_bs1": 41.288833156158944,
+ "peak_vram_gb": 4.45,
+ "truncated_frac": 0.0155,
+ "tokens_p50_p95": [
+  793,
+  1865
+ ],
+ "results": {
+  "test_core": {
+   "n": 4241,
+   "n_malicious": 2141,
+   "auroc": 0.9968818207294244,
+   "ap": 0.9914321134941604,
+   "brier": 0.06838478707322031,
+   "ece": 0.11843923541394358,
+   "recall@fpr0.01": 0.9721169658795565,
+   "val_thr@fpr0.01": {
+    "threshold": 0.7722042202949524,
+    "test_recall": 0.9845339770803853,
+    "test_fpr": 0.020082302131599335
+   },
+   "family_recall@val_fpr0.01": {
+    "escalation": 0.0349,
+    "exfil": 0.9934,
+    "scan": 0.9029,
+    "vpn": 0.0059,
+    "webshell": 0.5858
+   },
+   "source_fpr@val_fpr0.01": {
+    "audit": 0.0,
+    "auth": 0.0,
+    "dns": 0.04667,
+    "ids": 0.01333,
+    "vpn": 0.0,
+    "web_access": 0.0,
+    "web_error": 0.0
+   },
+   "recall@fpr0.001": 0.8515907766586197,
+   "val_thr@fpr0.001": {
+    "threshold": 0.8767322301864624,
+    "test_recall": 0.9765939676461611,
+    "test_fpr": 0.010616155835141371
+   },
+   "tactic_acc_on_malicious": 0.7426436244745446,
+   "tactic_acc_per_class": {
+    "Discovery": 0.7928,
+    "Execution": 0.8926,
+    "Exfiltration": 0.9983,
+    "Initial Access": 0.1163,
+    "Privilege Escalation": 0.2326
+   },
+   "ms_per_window_batched": 34.441678274461836
+  }
+ }
+}

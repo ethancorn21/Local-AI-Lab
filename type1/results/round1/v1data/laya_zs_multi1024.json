@@ -1,0 +1,56 @@
+{
+ "method": "laya_zs_multi1024",
+ "time": "2026-09-29T17:57:47Z",
+ "model": "convaiinnovations/laya/multilingual",
+ "zero_shot": true,
+ "ms_per_window_bs1": 17.11808181255492,
+ "peak_vram_gb": 2.34,
+ "max_len": 1024,
+ "results": {
+  "test_core": {
+   "n": 4241,
+   "n_malicious": 2141,
+   "auroc": 0.8158411458341466,
+   "ap": 0.43314361673134283,
+   "brier": 0.5343173707139977,
+   "ece": 0.5854635786929596,
+   "recall@fpr0.01": 0.0,
+   "val_thr@fpr0.01": {
+    "threshold": Infinity,
+    "test_recall": 0.0,
+    "test_fpr": 0.0
+   },
+   "family_recall@val_fpr0.01": {
+    "escalation": 0.0,
+    "exfil": 0.0,
+    "scan": 0.0,
+    "vpn": 0.0,
+    "webshell": 0.0
+   },
+   "source_fpr@val_fpr0.01": {
+    "audit": 0.0,
+    "auth": 0.0,
+    "dns": 0.0,
+    "ids": 0.0,
+    "vpn": 0.0,
+    "web_access": 0.0,
+    "web_error": 0.0
+   },
+   "recall@fpr0.001": 0.0,
+   "val_thr@fpr0.001": {
+    "threshold": Infinity,
+    "test_recall": 0.0,
+    "test_fpr": 0.0
+   },
+   "tactic_acc_on_malicious": 0.0831387202241943,
+   "tactic_acc_per_class": {
+    "Discovery": 0.1295,
+    "Execution": 0.0403,
+    "Exfiltration": 0.0465,
+    "Initial Access": 0.0,
+    "Privilege Escalation": 0.1279
+   },
+   "ms_per_window_batched": 16.094794022872364
+  }
+ }
+}

@@ -1,0 +1,1 @@
+qwen35_0.8b_lora	$PY m_seqcls.py qwen35_0.8b_lora Qwen/Qwen3.5-0.8B --lora --lr 2e-4 --epochs 1 --max-len 2048 --batch 16 --micro 4 --no-full

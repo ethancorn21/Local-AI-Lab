@@ -1,0 +1,68 @@
+{
+ "method": "secbert2_ft",
+ "time": "2026-09-29T18:23:20Z",
+ "model_id": "cisco-ai/SecureBERT2.0-base",
+ "lora": false,
+ "max_len": 1024,
+ "lr": 5e-05,
+ "epochs": 2,
+ "train_windows": 18052,
+ "exclude_family": null,
+ "best_val_loss": 0.38123053312301636,
+ "temperature": 1.0812175588773856,
+ "train_seconds": 1464.6835680389995,
+ "ms_per_window_bs1": 20.258451437598524,
+ "peak_vram_gb": 2.0,
+ "truncated_frac": 0.2165,
+ "tokens_p50_p95": [
+  743,
+  1781
+ ],
+ "results": {
+  "test_core": {
+   "n": 4241,
+   "n_malicious": 2141,
+   "auroc": 0.9804508348456897,
+   "ap": 0.9439559939637409,
+   "brier": 0.1515236102930559,
+   "ece": 0.2256259719032714,
+   "recall@fpr0.01": 0.7878246714207756,
+   "val_thr@fpr0.01": {
+    "threshold": 0.8737390637397766,
+    "test_recall": 0.7931917274804147,
+    "test_fpr": 0.011354999617374843
+   },
+   "family_recall@val_fpr0.01": {
+    "escalation": 0.0039,
+    "exfil": 0.5017,
+    "scan": 0.797,
+    "vpn": 0.0178,
+    "webshell": 0.5663
+   },
+   "source_fpr@val_fpr0.01": {
+    "audit": 0.0,
+    "auth": 0.0,
+    "dns": 0.0,
+    "ids": 0.02447,
+    "vpn": 0.0,
+    "web_access": 0.0,
+    "web_error": 0.0
+   },
+   "recall@fpr0.001": 0.722131857154749,
+   "val_thr@fpr0.001": {
+    "threshold": 0.9067369103431702,
+    "test_recall": 0.7562811583747238,
+    "test_fpr": 0.004130778043998659
+   },
+   "tactic_acc_on_malicious": 0.7174217655301262,
+   "tactic_acc_per_class": {
+    "Discovery": 0.7398,
+    "Execution": 0.953,
+    "Exfiltration": 0.9967,
+    "Initial Access": 0.0,
+    "Privilege Escalation": 0.2016
+   },
+   "ms_per_window_batched": 6.595772094082228
+  }
+ }
+}
