@@ -3,7 +3,11 @@
 # Each iteration: pick task -> pi (reads AGENTS.md + memory files) -> one step -> memory + commit -> exit.
 # The driver is plain bash (no model): it picks tasks, verifies "done" claims, and stops runaway loops.
 # Guards (env overrides): MAX_ITERS, ITER_TIMEOUT (seconds), NO_PROGRESS_LIMIT (iterations without an agent commit).
-# Test command: TEST_CMD env, else `npm test` if package.json exists, else `python3 -m pytest -q`.
+# Test command: TEST_CMD env, else `npm test` if package.json exists, else `python3 -m pytest -q` (re-checked before
+# every test run: planning may create package.json).
+# A project can start as a folder with only a GOAL.md: the driver sets it up and writes a planning task (000); when the
+# queue runs dry it runs a goal check (999) that adds tasks for whatever GOAL.md asks that is missing; an edited
+# GOAL.md reopens the planning task with the change.
 # Every iteration appends one JSON line to .agent/iterations.jsonl: the harness configuration it ran under + its outcome.
 # DECISIONS.md entries of done tasks are moved to DECISIONS-archive.md by `decisions-archive` (one index line per task).
 # Tasks: the agent owns how work is split (subtasks tasks/<id><letter>-*.md, worked before their parent, which comes
@@ -20,7 +24,8 @@ MAX_ITERS=${MAX_ITERS:-200}
 ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
 STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
-ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}   # doorbell reminder interval while a blocking request to the human is open
+ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}
+GOAL_CHECKS=${GOAL_CHECKS:-3}   # goal-check rounds per GOAL.md version before the loop stops for the human   # doorbell reminder interval while a blocking request to the human is open
 LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
 # Where hand-over notes live. progress: PROGRESS.md, a snapshot rewritten every session. task (default): the "## Hand-over"
 # section of the task being worked on (a subtask also reads its parent's); PROGRESS.md becomes a driver-generated
@@ -52,9 +57,104 @@ flock -n 9 || { echo "another agent-loop is running on $P" >&2; exit 1; }
 # command line merely mentions pi, including the check itself).
 while [ -f .agent/pi.pid ] && kill -0 "$(cat .agent/pi.pid)" 2>/dev/null; do log "waiting for running agent session (pid $(cat .agent/pi.pid))"; sleep 30; done
 
-if [ -z "${TEST_CMD:-}" ]; then
-  if [ -f package.json ]; then TEST_CMD="npm test --silent"; else TEST_CMD="python3 -m pytest -q"; fi
+USER_TEST_CMD=${TEST_CMD:-}
+pick_test_cmd() {
+  if [ -n "$USER_TEST_CMD" ]; then TEST_CMD=$USER_TEST_CMD
+  elif [ -f package.json ]; then TEST_CMD="npm test --silent"; else TEST_CMD="python3 -m pytest -q"; fi
+}
+pick_test_cmd
+
+# ---- Projects that start from GOAL.md ----------------------------------------------------------------------------
+# The human writes GOAL.md in their own words; the agent owns the plan (PLAN.md) and the task queue. Task-audit
+# registers 000 and 999 as the human's (the driver writes them), so their acceptance boxes stay fixed.
+plan_task() { cat <<'EOF'
+Status: open
+# 000: Plan the project from GOAL.md
+
+## Goal
+GOAL.md says, in the human's own words, what this project should be. Turn it into a plan and a task queue that the following sessions build from, one task at a time. You own the plan: choose the approach and the tech, and split the work the way you think best. GOAL.md is the human's: never edit it.
+
+## Acceptance criteria
+- [ ] PLAN.md describes what will be built, the architecture (the main parts and how they fit together), the tech choices with the reason for each, the assumptions you made where GOAL.md is silent, and what is out of scope
+- [ ] PLAN.md maps every point of GOAL.md to the task number(s) that deliver it
+- [ ] Task files tasks/001-<name>.md onward exist in build order, each with a Goal and testable Acceptance criteria and small enough for a few sessions; the first ones produce something that runs
+- [ ] The project's test command works (`npm test` when there is a package.json, otherwise `python3 -m pytest -q`), even if there are only a few tests so far
+
+## Notes
+- Task file format: tasks/README.md. Every task file starts with the line `Status: open`.
+- Research what you need (web_search, web_fetch) before settling on a stack you are unsure of; say why in PLAN.md.
+- A question only the human can answer (an account, hardware, a preference that changes the plan): ask_human. Prefer a stated assumption in PLAN.md and a non-blocking question over waiting.
+- This task is the plan only: create PLAN.md, the task files and the test setup, not the product.
+EOF
+}
+goal_check_task() { cat <<'EOF'
+Status: open
+# 999: Check the project against GOAL.md
+
+## Goal
+The task queue is empty. Check the project against GOAL.md point by point, the way the human would when trying it: run it, run the tests, read the code where needed. Whatever GOAL.md asks for that is missing, broken or only partly there becomes a new task, so the loop can finish the job. GOAL.md is the human's: never edit it.
+
+## Acceptance criteria
+- [ ] GOAL-CHECK.md lists every point of GOAL.md with its state (met, partly, not met) and the evidence checked in this session (a command and its result, a test, a file)
+- [ ] Every point not fully met has a new task file with testable acceptance criteria, numbered after the highest task below 999, and PLAN.md is updated to match
+
+## Notes
+- If everything is met, say so in GOAL-CHECK.md and add no tasks: the loop then stops.
+EOF
+}
+if [ ! -f AGENTS.md ]; then cp -rn "$HOME/.agent-kit/template/." . && log "project set up from the template"; fi
+[ -d .git ] || git init -q -b agent/work
+if [ -f GOAL.md ] && ! compgen -G "tasks/[0-9]*.md" > /dev/null; then
+  plan_task > tasks/000-plan.md; cp GOAL.md .agent/goal.last
+  git add -A && git commit -q -m "[driver] project set up from GOAL.md: planning task 000"
+  log "no tasks yet: tasks/000-plan.md asks the agent to plan from GOAL.md"
 fi
+# GOAL.md edited since the last plan: reopen the planning task with the change (before the hand-over section, which
+# stays last).
+goal_changed() {
+  [ -f GOAL.md ] && [ -f .agent/goal.last ] && [ -f tasks/000-plan.md ] || return 0
+  cmp -s GOAL.md .agent/goal.last && return 0
+  diff -u .agent/goal.last GOAL.md | tail -n +3 > .agent/goal.diff
+  python3 - tasks/000-plan.md .agent/goal.diff "$(date '+%F %H:%M')" <<'PY'
+import re, sys
+path, diff, when = sys.argv[1], open(sys.argv[2]).read(), sys.argv[3]
+t = open(path).read()
+t = re.sub(r"^Status:.*", "Status: in-progress", t, count=1)
+t = re.sub(r"(?m)^- \[x\]", "- [ ]", t)
+note = (f"## GOAL.md changed ({when})\nThe human changed GOAL.md. Update PLAN.md and the task queue to match: add tasks, "
+        "change your own tasks, or set tasks that no longer fit to `Status: dropped`; keep finished work that still "
+        "fits. Then check and tick the boxes above again. The change:\n```diff\n" + diff.rstrip("\n") + "\n```\n\n")
+m = re.search(r"(?m)^## Hand-over\s*$", t)
+t = t[:m.start()] + note + t[m.start():] if m else t.rstrip("\n") + "\n\n" + note
+open(path, "w").write(t)
+PY
+  cp GOAL.md .agent/goal.last
+  git add -A && git commit -q -m "[driver] GOAL.md changed: planning task reopened"
+  log "GOAL.md changed: tasks/000-plan.md reopened to re-plan"
+}
+# The queue ran dry: before stopping, a goal check (999) compares the project with GOAL.md and adds tasks for what is
+# missing. The loop stops after a check that added nothing, or after GOAL_CHECKS rounds for the same GOAL.md.
+# Prints the task to run next, or nothing (log lines go to stderr: the caller captures stdout).
+goal_check_next() {
+  local gc=tasks/999-goal-check.md sha n sha_="" rounds=0 start=0 added=-1
+  [ -f GOAL.md ] || return 0
+  sha=$(sha256sum < GOAL.md | cut -c1-16); n=$(ls tasks/[0-9]*.md 2>/dev/null | grep -vc '/999-')   # 999 itself not counted
+  [ -f .agent/goal-check ] && . .agent/goal-check
+  [ "$sha_" = "$sha" ] || { rounds=0; added=-1; }
+  if [ -f "$gc" ] && [ "$(status_of "$gc")" = done ] && [ "$sha_" = "$sha" ] && [ "$added" -eq 0 ]; then
+    log "goal check: nothing missing from GOAL.md (see GOAL-CHECK.md)" >&2; return 0
+  fi
+  if [ "$rounds" -ge "$GOAL_CHECKS" ]; then
+    log "goal check: $rounds rounds for this GOAL.md still found gaps - stopping for the human (see GOAL-CHECK.md)" >&2; return 0
+  fi
+  rounds=$((rounds + 1))
+  if [ -f "$gc" ]; then sed -i -e '1s/.*/Status: open/' -e 's/^- \[x\]/- [ ]/' "$gc"; else goal_check_task > "$gc"; fi
+  printf 'sha_=%s\nrounds=%s\nstart=%s\nadded=-1\n' "$sha" "$rounds" "$n" > .agent/goal-check
+  task-audit init > /dev/null 2>&1   # a new 999 is registered as the human's, like 000
+  git add -A && git commit -q -m "[driver] queue empty: goal check round $rounds"
+  log "queue empty: goal check round $rounds against GOAL.md" >&2
+  echo "$gc"
+}
 
 # Harness stamp. Each iteration records exactly which configuration produced it, so a change to AGENTS.md, the driver,
 # Pi or the server can be attributed later. Every config file is kept once under its sha256 in .agent/harness/, so the
@@ -235,6 +335,7 @@ task_baseline() {  # task_baseline <task file> : record the failing tests at the
   if [ -n "$(git status --porcelain DECISIONS.md)" ]; then git add DECISIONS.md && git commit -q -m "[driver] flaky test logged (baseline run)"; fi
 }
 run_tests() {
+  pick_test_cmd
   local out1 out2 rc
   TEST_OUT=""
   out1=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); rc=$?
@@ -311,6 +412,11 @@ verify_done() {
   [ -n "$u" ] && reasons+="- Acceptance criteria not ticked (verify each one, then tick it):"$'\n'"$(sed 's/^/    /' <<<"$u")"$'\n'
   gone=$(task-audit missing "$f")
   [ -n "$gone" ] && reasons+="- Acceptance criteria missing: they are the human's and define done. Restore them; if one is wrong, say so under \`## Proposed changes\` in the task file:"$'\n'"$(sed 's/^/    - [ ] /' <<<"$gone")"$'\n'
+  if [ "$f" = tasks/000-plan.md ]; then
+    [ -f PLAN.md ] || reasons+="- PLAN.md does not exist."$'\n'
+    ls tasks/[0-9]*.md 2>/dev/null | grep -qv -e '/000' -e '/999-' || reasons+="- There are no task files besides the planning task."$'\n'
+  fi
+  [ "$f" = tasks/999-goal-check.md ] && [ ! -f GOAL-CHECK.md ] && reasons+="- GOAL-CHECK.md does not exist."$'\n'
   if run_tests; then
     : > "$BASELINE"
   elif [ "$(task-audit owner "$f")" = agent ]; then
@@ -370,7 +476,9 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     fi
   done
   wait_for_server
+  goal_changed
   task=$(next_task)
+  [ -z "$task" ] && task=$(goal_check_next)
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   before=$(agent_commits)
   harness_stamp
@@ -494,6 +602,10 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   else no_progress=$((no_progress + 1)); log "no agent commit ($no_progress/$NO_PROGRESS_LIMIT)"; fi
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
+  if [ "$task" = tasks/999-goal-check.md ] && [ "$VERIFY" = accepted ] && [ -f .agent/goal-check ]; then
+    gc_start=$(sed -n 's/^start=//p' .agent/goal-check)
+    sed -i "s/^added=.*/added=$(( $(ls tasks/[0-9]*.md | grep -vc '/999-') - gc_start ))/" .agent/goal-check
+  fi
   task_scan
   # AGENTS.md is harness config, not agent memory: flag (don't revert) an agent that edits its own instructions.
   md_changed=false

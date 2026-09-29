@@ -64,6 +64,15 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 - A browser screenshot tool for the game.
 - `ask_human`: a request to the human for what only a person can do (hardware, accounts or credentials, anything outside the VM, a decision the acceptance criteria do not settle). See below.
 
+### Starting from GOAL.md
+
+A project can be a folder with nothing but a `GOAL.md`. The driver copies in the template files and creates the git repository, then writes task 000: turn `GOAL.md` into `PLAN.md` (approach, architecture, tech choices with reasons, assumptions, out of scope, and which task delivers each point of the goal) and a task queue with testable acceptance criteria. The driver accepts the plan only if `PLAN.md` and at least one task exist and the test command works. From then on the agent owns the plan and its tasks; `GOAL.md` stays the human's.
+
+- **Goal changed:** when `GOAL.md` differs from the version last planned against, the driver reopens task 000 with the diff (before the next session starts), so the agent updates the plan and the queue first.
+- **Goal check:** an empty queue does not end the loop. Task 999 checks the project against `GOAL.md` point by point, with evidence, into `GOAL-CHECK.md`, and adds tasks for anything missing. The loop stops after a check that adds nothing, or after `GOAL_CHECKS` (3) rounds for the same goal.
+- **Test command** is re-checked before every test run (planning may add a `package.json`).
+- 000 and 999 are written by the driver and registered as the human's, so their acceptance boxes cannot be changed by the agent.
+
 ### The human talking to the agent
 
 What the human types in `agent-watch` goes to `.agent/inbox/`. During a session the `human-messages` extension delivers each message as a Pi steering message: the model gets it after its current turn, when the response being generated and its tool calls have finished (measured: a message sent 8 s into a long thought arrived 143 s later, after ~11k thinking tokens and one tool call; the model then followed it). Esc asks for a stop instead: a headless Pi cannot take a message after an abort (sending one throws), so the extension aborts the session and leaves the message for the driver, which opens the next session's prompt with it, as it does for anything typed while no session runs. The ledger records `human_messages` and `human_interrupt` per session.
@@ -211,7 +220,7 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 | Watch it live, and talk to it | `agent-watch <project>`: Claude Code-style view (edits as diffs, code highlighted, thinking dim, Ctrl-T hides it). Type a message and press Enter: the agent gets it after its current step. Esc with a message typed: stop the session now; the next one starts with the message. Ctrl-C leaves the view; the loop keeps going. `AGENT_WATCH_BG=dark` for a dark terminal |
 | Stop it | `agent-stop <project>` (after the current session) or `agent-stop <project> --now` |
 | See how it is doing | `agent-report <project>` (per task and per session, with the harness version) |
-| New project | `newproj <name>`, add one seed task `tasks/001-<name>.md` with a goal and acceptance criteria, then `agent-loop` |
+| New project | Make a folder in the projects directory, put a `GOAL.md` in it (what you want, in your own words), `agent-start <name>`. The agent plans it (`PLAN.md`, tasks), builds it, and checks the result against `GOAL.md` before the loop stops. Edit `GOAL.md` any time: the next session re-plans |
 | Veto a task the agent added | Set its first line to `Status: dropped` |
 | Change a criterion the agent proposed changing | Edit the task file yourself (only the human changes the human's criteria) |
 | Answer the agent's requests (after a "help i need your attention" ping) | `agent-talk` (all projects) or `agent-talk <project>`: talk live with an agent about it, or type a short reply |

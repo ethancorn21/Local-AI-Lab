@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # agent-start <project> : start a project's loop in the background. No tmux: it keeps running after you log out.
-# <project> is a name under ~/projects or a path. Watch it with `agent-watch <project>` (Ctrl-C leaves the view, the
-# loop keeps going); stop it with `agent-stop <project>`. Output goes to <project>/.agent/loop.out, the loop's own log
-# to .agent/loop.log.
+# <project> is a name under ~/projects or a path. A new project is just a folder with a GOAL.md (what you want, in
+# your own words): the loop sets it up, the agent plans it (PLAN.md + tasks) and builds it. Watch it with
+# `agent-watch <project>` (Ctrl-C leaves the view, the loop keeps going); stop it with `agent-stop <project>`.
+# Output goes to <project>/.agent/loop.out, the loop's own log to .agent/loop.log.
 set -uo pipefail
 export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
 arg=${1:?usage: agent-start <project name or dir>}
 if [ -d "$arg" ]; then P=$(realpath "$arg"); else P="$HOME/projects/$arg"; fi
-[ -d "$P/tasks" ] || { echo "No project at $P (expected a tasks/ folder)."; exit 1; }
+[ -d "$P" ] || { echo "No folder $P. Create it and put a GOAL.md in it (what you want built, in your own words)."; exit 1; }
 mkdir -p "$P/.agent"
 if ! flock -n "$P/.agent/loop.lock" true; then echo "Already running. Watch it: agent-watch $arg"; exit 0; fi
-# The driver reads a task's status from its first line; a queue with nothing workable stops at once.
-open=$(for f in "$P"/tasks/[0-9]*.md; do [ -f "$f" ] && head -1 "$f"; done | grep -ciE '^status:[[:space:]]*(open|in-progress|split)')
-if [ "${open:-0}" -eq 0 ]; then
-  echo "Nothing to work on: no task file in $P/tasks/ whose first line is 'Status: open'."; exit 1
+# With a GOAL.md the loop always has work (planning, the tasks, or checking the result against the goal). Without
+# one it needs a task whose first line says it is open.
+if [ ! -f "$P/GOAL.md" ]; then
+  open=$(for f in "$P"/tasks/[0-9]*.md; do [ -f "$f" ] && head -1 "$f"; done | grep -ciE '^status:[[:space:]]*(open|in-progress|split)')
+  if [ "${open:-0}" -eq 0 ]; then
+    echo "Nothing to work on: put a GOAL.md in $P (what you want built, in your own words)."; exit 1
+  fi
 fi
 rm -f "$P/.agent/PAUSE"
 VIEWER=json setsid nohup agent-loop "$P" >> "$P/.agent/loop.out" 2>&1 < /dev/null &
