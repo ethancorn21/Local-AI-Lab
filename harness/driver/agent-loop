@@ -11,6 +11,8 @@
 # loop start) as the definition of done and reports new tasks, changed criteria and `## Proposed changes` to the log.
 # CODEMAP.md is regenerated from the code by `codemap-gen` before every iteration.
 # To stop cleanly between iterations (e.g. to change the harness): touch .agent/PAUSE; remove it before restarting.
+# Requests to the human (the agent's ask_human tool, .agent/asks/): an open blocking one holds the loop until the human
+# answers with agent-talk; the doorbell pings them when the wait starts and every ASK_REMIND_HOURS after.
 set -uo pipefail
 DRIVER_FILE=$(realpath "${BASH_SOURCE[0]}")
 P=$(realpath "${1:?usage: agent-loop <project dir>}")
@@ -18,6 +20,7 @@ MAX_ITERS=${MAX_ITERS:-200}
 ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
 STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
+ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}   # doorbell reminder interval while a blocking request to the human is open
 LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
 # Where hand-over notes live. progress: PROGRESS.md, a snapshot rewritten every session. task (default): the "## Hand-over"
 # section of the task being worked on (a subtask also reads its parent's); PROGRESS.md becomes a driver-generated
@@ -165,6 +168,45 @@ wait_for_server() {
     sleep "$d"; d=$(( d < 300 ? d * 2 : 600 ))
   done
   log "model server back after $(( ($(date +%s) - t0) / 60 )) min"
+}
+# Requests to the human (.agent/asks/<n>.md, filed by the ask_human tool, answered with agent-talk). An open blocking
+# request holds the whole loop rather than skipping to other tasks: the queue is usually a chain, and a later task
+# started early builds on an unanswered question. Nothing about the request leaves the VM; the doorbell only rings.
+ask_field() { sed -n "s/^$2: //p" "$1" | head -1; }
+asks_with() {  # asks_with <status> [blocking] : request files with that status (and blocking: yes)
+  local f
+  for f in .agent/asks/[0-9]*.md; do
+    [ -f "$f" ] && [ "$(ask_field "$f" status)" = "$1" ] || continue
+    [ -n "${2:-}" ] && [ "$(ask_field "$f" blocking)" != yes ] && continue
+    echo "$f"
+  done
+  return 0
+}
+wait_for_answers() {
+  local open t0 last now
+  open=$(asks_with open blocking); [ -z "$open" ] && return 0
+  log "waiting for the human: open request(s) $(echo $open) - no sessions until answered (agent-talk); $(ring-doorbell)"
+  t0=$(date +%s); last=$t0
+  while [ -n "$(asks_with open blocking)" ]; do
+    [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
+    sleep 60; now=$(date +%s)
+    if [ $((now - last)) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
+      log "still waiting for the human after $(( (now - t0) / 3600 )) h; $(ring-doorbell)"; last=$now
+    fi
+  done
+  log "request(s) answered after $(( ($(date +%s) - t0) / 60 )) min"
+}
+# agent-talk holds the loop with .agent/TALK while the human talks with an agent in this project.
+wait_for_talk() {
+  [ -f .agent/TALK ] || return 0
+  log "the human is talking with an agent in this project (agent-talk) - waiting"
+  while [ -f .agent/TALK ]; do
+    [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for a talk to end - stopping"; exit 0; }
+    if [ $(( $(date +%s) - $(stat -c %Y .agent/TALK) )) -gt 43200 ]; then
+      log "WARNING: .agent/TALK is over 12 h old (agent-talk did not clean up) - removed"; rm -f .agent/TALK; break
+    fi
+    sleep 30
+  done
 }
 # Driver notes in DECISIONS.md stay short (every agent reads that file): a list goes in as its first 8 lines plus a
 # pointer; the whole list is kept in .agent/reports/<name>.txt for the agent to read when it needs it.
@@ -317,6 +359,16 @@ start=$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 ))
 stop_reason="reached MAX_ITERS ($MAX_ITERS sessions this run)"
 for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
+  wait_for_answers
+  wait_for_talk
+  # A task set to blocked while its request was open is picked up again once the human has answered.
+  for a in $(asks_with answered); do
+    t=$(ask_field "$a" task)
+    if [ -f "$t" ] && [ "$(status_of "$t")" = blocked ]; then
+      sed -i '1s/.*/Status: in-progress/' "$t"; git add "$t" && git commit -q -m "[driver] $t unblocked: the human answered $a"
+      log "$t unblocked: the human answered $a"
+    fi
+  done
   wait_for_server
   task=$(next_task)
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
@@ -351,6 +403,13 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   # iterations 143, 144 and 146 read only the first 50 KB of a 60+ KB file and never saw them.
   db=$(stat -c %s DECISIONS.md 2>/dev/null || echo 0)
   [ "$db" -gt 46080 ] && PROMPT="$PROMPT DECISIONS.md is $((db / 1024)) KB, more than one read returns: read it to the end (continue with the offset the read tool gives you). Your task's newest entries are at the bottom."
+  # Answers to requests reach exactly one session: this one is pointed at them, then they are closed.
+  answered=$(asks_with answered)
+  if [ -n "$answered" ]; then
+    PROMPT="$PROMPT The human answered request(s) sent to them: $(echo $answered). Read them to the end (the answer and any outcome are at the bottom) before you plan your step."
+    for a in $answered; do sed -i 's/^status: answered$/status: closed/' "$a"; done
+    log "iteration $i is pointed at answered request(s): $(echo $answered)"
+  fi
   t0=$(date -Iseconds); s0=$(date +%s); md0=$(sha256sum < AGENTS.md 2>/dev/null); VERIFY="" FLAKY=false
   arc0=$({ sha256sum < DECISIONS-archive.md; } 2>/dev/null)
   # Memory files every agent reads at start: sizes go in the ledger; past Pi's 50 KB single-read limit is a warning.
@@ -385,7 +444,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     wait $!
     rc=$?
   else
-    timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
+    PI_LOOP_ITER=$i PI_LOOP_TASK="$task" \
+      timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
     echo $! > .agent/pi.pid
     wait $!
@@ -435,13 +495,14 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   [ -n "$serr" ] && log "WARNING: session $i ended with a model-server error: $serr"
   searches=$(grep -c '^\[research\] search' "$err" 2>/dev/null); searches=${searches:-0}
   fetches=$(grep -c '^\[research\] fetch' "$err" 2>/dev/null); fetches=${fetches:-0}
+  asks=$(grep -c '^\[ask\] filed' "$err" 2>/dev/null); asks=${asks:-0}
   jq -n -c --argjson iter "$i" --arg task "$task" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \
       --argjson rc "$rc" --argjson agent_commits "$(( $(agent_commits) - before ))" --argjson leftovers "$leftovers" \
       --argjson code_leftovers "$code_leftovers" \
       --arg status_after "$status_after" --arg verify "$VERIFY" --argjson flaky "$FLAKY" \
       --argjson md_changed "$md_changed" --argjson wrapup "$wrapup" \
       --argjson mem_bytes "${mem_bytes:-null}" --argjson arc_changed "$arc_changed" \
-      --argjson compactions_cancelled "$cancelled" --argjson web_searches "$searches" --argjson web_fetches "$fetches" \
+      --argjson compactions_cancelled "$cancelled" --argjson web_searches "$searches" --argjson web_fetches "$fetches" --argjson asks_filed "$asks" \
       --arg handover_mode "$HANDOVER_MODE" --argjson handover_in_task "$ho_changed" --argjson handover_guard "$HANDOVER_GUARD" \
       --arg session_error "$serr" \
       --arg harness_id "$HARNESS_ID" --argjson harness "$HARNESS" '
@@ -449,7 +510,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
      agent_commits: $agent_commits, driver_saved_leftovers: $leftovers, code_files_saved: $code_leftovers, status_after: $status_after,
      verify: (if $verify == "" then null else $verify end), flaky_tests: $flaky, agents_md_changed: $md_changed,
      archive_edited: $arc_changed, memory_bytes: $mem_bytes, wrapup: $wrapup, compactions_cancelled: $compactions_cancelled,
-     web_searches: $web_searches, web_fetches: $web_fetches, handover_mode: $handover_mode,
+     web_searches: $web_searches, web_fetches: $web_fetches, asks_filed: $asks_filed, handover_mode: $handover_mode,
      handover_in_task: $handover_in_task, handover_guard: $handover_guard,
      session_error: (if $session_error == "" then null else $session_error end), harness_id: $harness_id, harness: $harness}' >> "$LEDGER"
   # A task that keeps running without finishing is flagged for the humans (the split nudge in the prompt starts at 5).

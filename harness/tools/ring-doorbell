@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# ring-doorbell: have the AI box send the human the fixed Telegram ping ("help i need your attention").
+# The key behind `Host doorbell` in ~/.ssh/config can only run the doorbell there (a forced command): nothing about the
+# project or the request leaves this VM, and nothing sent from here can change the message. Prints the doorbell's
+# one-line result; the doorbell rate-limits, so ringing often is harmless.
+exec ssh -n -T -o ConnectTimeout=10 doorbell 2>&1

@@ -1,0 +1,4 @@
+# /var/lib/<doorbell-account>/.ssh/authorized_keys on the AI box (owner <doorbell-account>, mode 600).
+# The only key of an account whose password is locked. from= pins it to the harness VM; restrict turns off PTYs and
+# every kind of forwarding; command= makes the doorbell the only thing it can run, whatever the client asks for.
+from="<harness-vm-address>",restrict,command="/usr/local/bin/doorbell" ssh-ed25519 <public key> doorbell@<harness-vm>

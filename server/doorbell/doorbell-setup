@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# doorbell-setup: store the Telegram bot token and your chat id for /usr/local/bin/doorbell, then ring once as a test.
+# Run it yourself in your own terminal (ssh -t <ai box> sudo doorbell-setup): the token is read with echo off, so it
+# never appears on screen, in shell history or in an AI transcript.
+# Create the bot first: in Telegram, message @BotFather, send /newbot, pick a name; it replies with the token.
+# The bot only ever sends; nothing reads what others send it, so a stranger who finds it gets no answer.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
+read -rsp "Bot token from @BotFather (typing is hidden): " TOKEN; echo
+api() { local m=$1; shift; printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$TOKEN" "$m" | curl -sS -m 20 -K - "$@"; }
+me=$(api getMe) || true
+jq -e .ok <<<"$me" >/dev/null 2>&1 || { echo "Telegram rejected that token."; exit 1; }
+echo "Bot: @$(jq -r .result.username <<<"$me")"
+echo "Open that bot in Telegram, send it any message (e.g. /start), then press Enter here."
+read -r _
+upd=$(api getUpdates)
+last=$(jq -c '[.result[] | .message // empty | select(.chat.type == "private")] | last // empty' <<<"$upd")
+[ -n "$last" ] || { echo "No message to the bot found yet. Send it one and run this again."; exit 1; }
+chat=$(jq -r .chat.id <<<"$last")
+read -rp "Latest message came from $(jq -r '"\(.from.first_name // "") @\(.from.username // "-")"' <<<"$last"). Is that you? [y/N] " ok
+[[ $ok =~ ^[yY] ]] || { echo "Not saved."; exit 1; }
+install -d -m 750 -o root -g doorbell /etc/doorbell
+( umask 027; printf 'BOT_TOKEN=%s\nCHAT_ID=%s\n' "$TOKEN" "$chat" > /etc/doorbell/telegram.env )
+chown root:doorbell /etc/doorbell/telegram.env; chmod 640 /etc/doorbell/telegram.env
+# acknowledge the updates read above so they are not kept on Telegram's side
+api getUpdates --data "offset=$(( $(jq '[.result[].update_id] | max' <<<"$upd") + 1 ))" >/dev/null || true
+rm -f /var/lib/doorbell/rings
+echo "Saved. Test ring:"
+sudo -u doorbell /usr/local/bin/doorbell

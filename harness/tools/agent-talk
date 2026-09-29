@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# agent-talk [project dir] : answer the agents' requests to you (.agent/asks/<n>.md, filed with the ask_human tool).
+# Without an argument it looks for open requests in every project under ~/projects. It shows each open request, then:
+#   t  talk: a live Pi session in the project with a fresh agent that reads the request first. Discuss it, let it
+#      check things with you and record the outcome; when you leave, mark the request answered (optional one-line note).
+#   r  reply: type a short answer ("done, the drive is attached") and the request is marked answered.
+#   s  skip for now.
+# While you talk, .agent/TALK holds that project's loop (it starts no new session); a session already running is
+# waited for first. An answered request releases the loop, and its next session is pointed at the answer.
+# The request text comes from the agent, possibly shaped by a web page it read: treat it as untrusted and read any
+# command in it before you run it. Terminal control characters are stripped before it is shown.
+set -uo pipefail
+export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH" PI_SKIP_VERSION_CHECK=1
+TALK_FILE=""
+trap '[ -n "$TALK_FILE" ] && rm -f "$TALK_FILE"' EXIT
+trap 'exit 130' HUP INT TERM
+
+field() { sed -n "s/^$2: //p" "$1" | head -1; }
+show() { perl -CSD -pe 's/[\x{0}-\x{8}\x{B}-\x{1F}\x{7F}-\x{9F}\x{202A}-\x{202E}\x{2066}-\x{2069}]//g' "$1"; }
+open_asks() { local f; for f in "$1"/.agent/asks/[0-9]*.md; do [ -f "$f" ] && [ "$(field "$f" status)" = open ] && echo "$f"; done; return 0; }
+resolve() {  # resolve <request file> <how> <note>
+  { printf '\n## Answer (%s, %s)\n' "$(date '+%F %H:%M')" "$2"; [ -n "$3" ] && printf '%s\n' "$3"; } >> "$1"
+  sed -i 's/^status: open$/status: answered/' "$1"
+  echo "Marked answered: the loop continues, and its next session reads your answer."
+}
+talk() {  # talk <project> <request file>
+  local P=$1 a=$2 rel sdir ok note
+  rel=${a#"$P"/}
+  if [ ! -e "$P/.agent/TALK" ]; then TALK_FILE="$P/.agent/TALK"; touch "$TALK_FILE"; fi
+  while [ -f "$P/.agent/pi.pid" ] && kill -0 "$(cat "$P/.agent/pi.pid" 2>/dev/null)" 2>/dev/null; do
+    echo "An agent session is still running in this project; waiting for it to end (no new one starts)..."; sleep 20
+  done
+  sdir="$P/.agent/talks/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$sdir"
+  ( cd "$P" && pi --thinking "${TALK_THINKING:-xhigh}" --session-dir "$sdir" \
+      "The human who runs this lab is here, in this session, to talk with you about a request an earlier agent session sent them: $rel. Read it, the task file it names (with its ## Hand-over) and whatever else you need, then talk it through with them: they may have done what was asked, need more detail, or want to do it another way. You can run commands to check things together. Once you agree on the outcome, append it under a '## Outcome' heading at the end of $rel and to the task's ## Hand-over, commit, and tell them the talk can end." )
+  read -rp "Mark $rel answered? [Y/n] " ok || ok=n
+  if [[ ! $ok =~ ^[nN] ]]; then
+    read -rep "One-line note for the next agent (optional): " note || note=""
+    resolve "$a" "talk $(basename "$sdir")" "$note"
+  else echo "Left open: the loop keeps waiting."; fi
+  [ -n "$TALK_FILE" ] && rm -f "$TALK_FILE"; TALK_FILE=""
+}
+
+if [ $# -ge 1 ]; then projects=("$(realpath "$1")"); else projects=("$HOME"/projects/*); fi
+found=0
+for P in "${projects[@]}"; do
+  [ -d "$P/.agent/asks" ] || continue
+  for a in $(open_asks "$P"); do
+    found=1
+    printf '\n===== %s: %s =====\n' "$(basename "$P")" "${a#"$P"/}"
+    show "$a"
+    echo
+    read -rp "[t]alk with an agent about it, [r]eply with a note, [s]kip? " c || exit 0
+    case $c in
+      t|T) talk "$P" "$a" ;;
+      r|R) read -rep "Your answer: " note || note=""
+           if [ -n "$note" ]; then resolve "$a" reply "$note"; else echo "Nothing typed; left open."; fi ;;
+      *) echo "Left open." ;;
+    esac
+  done
+done
+[ "$found" = 1 ] || echo "No open requests."

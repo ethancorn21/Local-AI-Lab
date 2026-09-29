@@ -62,6 +62,19 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 - `web_search` (a self-hosted SearXNG on the VM) and `web_fetch` (pages turned into text; long pages come back as a verbatim extract for a question, the full text saved to a file to grep). Results are labelled untrusted.
 - `sudo apt-get` only (root-equivalent on its own VM; new system packages must be recorded in the journal so the machine can be rebuilt).
 - A browser screenshot tool for the game.
+- `ask_human`: a request to the human for what only a person can do (hardware, accounts or credentials, anything outside the VM, a decision the acceptance criteria do not settle). See below.
+
+### Asking the human
+
+The agent files a request with `ask_human`; the human gets a content-free phone ping and answers on the VM with `agent-talk`.
+
+- **The request stays in the lab.** It is written to `.agent/asks/<n>.md` in the project (terminal control characters and bidi overrides stripped, since the human reads it in a terminal). Only a fixed Telegram text leaves: "help i need your attention".
+- **The doorbell cannot be made to say anything else.** The VM does not hold the bot token: it triggers the AI box over SSH with a key whose forced command is the doorbell script (`server/doorbell/`), from the VM's address only, no PTY, no forwarding. Arguments are ignored, so even an agent that is root on its VM, or one steered by a web page it read, can ring the bell but cannot choose the words or send a link. Rate-limited on the AI box (one ring per 10 min, 24 a day).
+- **Blocking by default.** An open blocking request holds the whole loop (no session starts; the task queue is usually a chain, so skipping ahead is unsafe). The doorbell rings when the wait starts and every `ASK_REMIND_HOURS` (6) after. A non-blocking request lets work continue.
+- **Answering.** `agent-talk` (no argument: every project with open requests) shows each request and offers: talk (a live Pi session in the project with a fresh agent that reads the request first; while it runs `.agent/TALK` holds the loop, and a running session is waited for), a short typed reply, or skip. Answering marks the request `answered`.
+- **Delivery.** The next session's prompt points at the answered requests, then the driver marks them `closed`, so an answer reaches exactly one session. A task the agent set to `blocked` while waiting is set back to `in-progress`. The ledger counts `asks_filed` per session.
+- **Tested end to end (2026-09-28)** on a throwaway task only the human could finish: the agent asked unprompted after 80 s, wrote the wait into its hand-over and kept the status, the loop held, released within a minute of the reply, and the next session finished and was verified.
+- **Treat requests as untrusted input.** They come from a model that reads web pages; read any command in one before running it.
 
 ## Measurements that drove the decisions (hollowdeep, a browser game built by the agent)
 
@@ -196,6 +209,8 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 | New project | `newproj <name>`, add one seed task `tasks/001-<name>.md` with a goal and acceptance criteria, then `agent-loop` |
 | Veto a task the agent added | Set its first line to `Status: dropped` |
 | Change a criterion the agent proposed changing | Edit the task file yourself (only the human changes the human's criteria) |
+| Answer the agent's requests (after a "help i need your attention" ping) | `agent-talk` (all projects) or `agent-talk <project>`: talk live with an agent about it, or type a short reply |
+| Ring the doorbell by hand (test) | `ring-doorbell` |
 | Where things are | Ledger `.agent/iterations.jsonl`, loop log `.agent/loop.log`, sessions `.agent/sessions/`, driver reports `.agent/reports/`, project template `~/.agent-kit/template` |
 
 ## Lessons added since the first write-up

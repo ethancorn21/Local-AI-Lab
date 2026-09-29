@@ -1,0 +1,37 @@
+#!/bin/sh
+# doorbell: send the lab's human one fixed Telegram message, "help i need your attention".
+# It is the forced command of the doorbell account's only SSH key, which the agents' VM uses: the caller cannot pass
+# text (arguments and SSH_ORIGINAL_COMMAND are ignored), so an agent can ring the bell but never choose the words, and
+# nothing about its work leaves the lab. The bot token lives here, out of the agents' reach (they are root-equivalent
+# on their own VM).
+# Rate limits: one ring per MIN_GAP seconds (a ring inside the gap still succeeds: the bell is already ringing) and at
+# most MAX_PER_DAY in 24 hours. Credentials: /etc/doorbell/telegram.env (BOT_TOKEN, CHAT_ID), written by doorbell-setup.
+set -u
+CONF=/etc/doorbell/telegram.env
+STATE=/var/lib/doorbell/rings
+MIN_GAP=600
+MAX_PER_DAY=24
+TEXT="help i need your attention"
+
+exec 9>>/var/lib/doorbell/lock
+flock -w 30 9 || { echo "doorbell: busy"; exit 1; }
+token=$(sed -n 's/^BOT_TOKEN=//p' "$CONF" 2>/dev/null)
+chat=$(sed -n 's/^CHAT_ID=//p' "$CONF" 2>/dev/null)
+if [ -z "$token" ] || [ -z "$chat" ]; then
+  logger -t doorbell "ring refused: not configured"; echo "doorbell: not configured (run doorbell-setup on the AI box)"; exit 2
+fi
+now=$(date +%s)
+last=$(tail -n 1 "$STATE" 2>/dev/null); last=${last:-0}
+if [ $((now - last)) -lt "$MIN_GAP" ]; then echo "doorbell: rang $(( (now - last) / 60 )) min ago, not again yet"; exit 0; fi
+if [ "$(awk -v t=$((now - 86400)) '$1 > t' "$STATE" 2>/dev/null | wc -l)" -ge "$MAX_PER_DAY" ]; then
+  logger -t doorbell "ring refused: daily limit"; echo "doorbell: daily limit reached"; exit 3
+fi
+# The token goes to curl on stdin, not on its command line (every user on this box can read command lines in ps).
+code=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" |
+  curl -sS -m 20 -o /dev/null -w '%{http_code}' -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$TEXT")
+if [ "$code" = 200 ]; then
+  echo "$now" >> "$STATE"; tail -n 200 "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  logger -t doorbell "rang"; echo "doorbell: rang"
+else
+  logger -t doorbell "ring failed: HTTP $code"; echo "doorbell: Telegram error (HTTP $code)"; exit 1
+fi

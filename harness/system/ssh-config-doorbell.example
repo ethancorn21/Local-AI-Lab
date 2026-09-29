@@ -1,0 +1,10 @@
+# ~/.ssh/config of the agent user on the harness VM: `ssh doorbell` rings (see harness/tools/ring-doorbell).
+# The key only runs the doorbell on the AI box (forced command); it cannot open a shell, forward ports or send text.
+# The AI box's host key goes in ~/.ssh/known_hosts first (copy the line the model tunnel already verified).
+Host doorbell
+  HostName <ai-box-address>
+  User <doorbell-account>
+  IdentityFile ~/.ssh/doorbell_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
