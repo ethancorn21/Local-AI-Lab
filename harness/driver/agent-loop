@@ -410,6 +410,22 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     for a in $answered; do sed -i 's/^status: answered$/status: closed/' "$a"; done
     log "iteration $i is pointed at answered request(s): $(echo $answered)"
   fi
+  # Messages the human typed in agent-watch that no session took (sent between sessions, or with Esc, which stops the
+  # running session) open this one's prompt; during a session the human-messages extension delivers them.
+  msgs=""; nmsg=0
+  for m in .agent/inbox/[0-9]*.md; do
+    [ -f "$m" ] || continue
+    msgs="$msgs
+---
+$(cat "$m")"; nmsg=$((nmsg + 1))
+    mkdir -p .agent/inbox/delivered && mv "$m" .agent/inbox/delivered/
+  done
+  if [ "$nmsg" -gt 0 ]; then
+    PROMPT="$PROMPT
+The human sent you $nmsg message(s) while no session could take them. Read them before you plan your step; where they conflict with your task file or notes, the human's message wins (record the change in your hand-over):$msgs
+---"
+    log "iteration $i starts with $nmsg message(s) from the human"
+  fi
   t0=$(date -Iseconds); s0=$(date +%s); md0=$(sha256sum < AGENTS.md 2>/dev/null); VERIFY="" FLAKY=false
   arc0=$({ sha256sum < DECISIONS-archive.md; } 2>/dev/null)
   # Memory files every agent reads at start: sizes go in the ledger; past Pi's 50 KB single-read limit is a warning.
@@ -501,6 +517,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   searches=$(grep -c '^\[research\] search' "$err" 2>/dev/null); searches=${searches:-0}
   fetches=$(grep -c '^\[research\] fetch' "$err" 2>/dev/null); fetches=${fetches:-0}
   asks=$(grep -c '^\[ask\] filed' "$err" 2>/dev/null); asks=${asks:-0}
+  steered=$(grep -c '^\[human\] delivered' "$err" 2>/dev/null); steered=${steered:-0}
+  interrupted=false; grep -q '^\[human\] interrupt' "$err" 2>/dev/null && interrupted=true
   jq -n -c --argjson iter "$i" --arg task "$task" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \
       --argjson rc "$rc" --argjson agent_commits "$(( $(agent_commits) - before ))" --argjson leftovers "$leftovers" \
       --argjson code_leftovers "$code_leftovers" \
@@ -508,6 +526,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
       --argjson md_changed "$md_changed" --argjson wrapup "$wrapup" \
       --argjson mem_bytes "${mem_bytes:-null}" --argjson arc_changed "$arc_changed" \
       --argjson compactions_cancelled "$cancelled" --argjson web_searches "$searches" --argjson web_fetches "$fetches" --argjson asks_filed "$asks" \
+      --argjson human_messages "$(( nmsg + steered ))" --argjson human_interrupt "$interrupted" \
       --arg handover_mode "$HANDOVER_MODE" --argjson handover_in_task "$ho_changed" --argjson handover_guard "$HANDOVER_GUARD" \
       --arg session_error "$serr" \
       --arg harness_id "$HARNESS_ID" --argjson harness "$HARNESS" '
@@ -515,7 +534,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
      agent_commits: $agent_commits, driver_saved_leftovers: $leftovers, code_files_saved: $code_leftovers, status_after: $status_after,
      verify: (if $verify == "" then null else $verify end), flaky_tests: $flaky, agents_md_changed: $md_changed,
      archive_edited: $arc_changed, memory_bytes: $mem_bytes, wrapup: $wrapup, compactions_cancelled: $compactions_cancelled,
-     web_searches: $web_searches, web_fetches: $web_fetches, asks_filed: $asks_filed, handover_mode: $handover_mode,
+     web_searches: $web_searches, web_fetches: $web_fetches, asks_filed: $asks_filed, human_messages: $human_messages, human_interrupt: $human_interrupt, handover_mode: $handover_mode,
      handover_in_task: $handover_in_task, handover_guard: $handover_guard,
      session_error: (if $session_error == "" then null else $session_error end), harness_id: $harness_id, harness: $harness}' >> "$LEDGER"
   # A task that keeps running without finishing is flagged for the humans (the split nudge in the prompt starts at 5).

@@ -64,6 +64,10 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 - A browser screenshot tool for the game.
 - `ask_human`: a request to the human for what only a person can do (hardware, accounts or credentials, anything outside the VM, a decision the acceptance criteria do not settle). See below.
 
+### The human talking to the agent
+
+What the human types in `agent-watch` goes to `.agent/inbox/`. During a session the `human-messages` extension delivers each message as a Pi steering message: the model gets it after its current turn, when the response being generated and its tool calls have finished (measured: a message sent 8 s into a long thought arrived 143 s later, after ~11k thinking tokens and one tool call; the model then followed it). Esc asks for a stop instead: a headless Pi cannot take a message after an abort (sending one throws), so the extension aborts the session and leaves the message for the driver, which opens the next session's prompt with it, as it does for anything typed while no session runs. The ledger records `human_messages` and `human_interrupt` per session.
+
 ### Asking the human
 
 The agent files a request with `ask_human`; the human gets a content-free phone ping and answers on the VM with `agent-talk`.
@@ -204,7 +208,7 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 | Task | How |
 |---|---|
 | Start or resume the loop | `agent-start <project>` (name or path): runs in the background, no tmux, survives logout; refuses when no task's first line is `Status: open` |
-| Watch it live | `agent-watch <project>` (Ctrl-C leaves the view; the loop keeps going) |
+| Watch it live, and talk to it | `agent-watch <project>`: Claude Code-style view (edits as diffs, code highlighted, thinking dim, Ctrl-T hides it). Type a message and press Enter: the agent gets it after its current step. Esc with a message typed: stop the session now; the next one starts with the message. Ctrl-C leaves the view; the loop keeps going. `AGENT_WATCH_BG=dark` for a dark terminal |
 | Stop it | `agent-stop <project>` (after the current session) or `agent-stop <project> --now` |
 | See how it is doing | `agent-report <project>` (per task and per session, with the harness version) |
 | New project | `newproj <name>`, add one seed task `tasks/001-<name>.md` with a goal and acceptance criteria, then `agent-loop` |

@@ -1,57 +1,167 @@
 #!/usr/bin/env python3
-"""Claude Code-style live view of Pi's --mode json event stream.
+"""agent-watch's viewer: a Claude Code-style live view of a Pi agent loop, from Pi's --mode json event stream.
 
-Streams thinking (dim), answers (normal) and tool calls (cyan) into the terminal, with a status bar pinned to the
-bottom row: iteration/task, context used vs window, generation and prompt-processing speed. Speed and context come
-from llama-server's /slots endpoint (through the tunnel), so they are the model server's own numbers.
-Usage: pi-live                       read events from stdin
-       pi-live --follow <project>    follow the newest .agent/sessions/iter-*.jsonl, switching as iterations start
-Env: LLM_URL (default http://127.0.0.1:8080), PI_LIVE_LABEL (e.g. "iter 3 | tasks/001-parser.md").
-Ctrl-C only stops this viewer; the agent loop keeps running.
+Shows the agent's thinking (dim; Ctrl-T hides it), its answers (light markdown, code blocks highlighted) and each tool
+call the way Claude Code does: edits as coloured diffs with line numbers, written files with syntax highlighting,
+command output trimmed to its first lines. The bottom row is a status bar: context used, generation speed and session
+time, from the model server's own metrics.
+
+Talking to the agent (--follow on a terminal): type on the input line above the status bar.
+  Enter  sends the message. Pi hands it to the model after its current turn: the response being generated and its
+         tool calls finish first, which can take a few minutes when it is deep in thought.
+  Esc    with a message typed: stops the running session now; the loop's next session starts with your message.
+  Ctrl-T shows / hides thinking.  Ctrl-U clears the input.  Ctrl-C closes the viewer (the loop keeps running).
+Messages go through <project>/.agent/inbox/: the human-messages Pi extension delivers them during a session, the
+driver puts any left over into the next session's prompt.
+
+Usage: pi-live --follow <project>    follow the newest .agent/sessions/iter-*.jsonl, switching as sessions start
+       pi-live                       read events from stdin (view only)
+Env: LLM_URL (default http://127.0.0.1:8080); AGENT_WATCH_BG light|dark: the terminal's background, for the syntax
+and diff colours (default light); AGENT_WATCH_COLOR=1 forces colours when stdout is not a terminal.
 """
+import codecs
 import glob
-import re
 import json
 import os
+import re
+import select
 import shutil
 import sys
+import termios
 import threading
 import time
+import tty
 import urllib.request
 
+try:
+    from pygments import highlight
+    from pygments.formatters import Terminal256Formatter
+    from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
+    from pygments.util import ClassNotFound
+except ImportError:
+    highlight = None
+
 BASE = os.environ.get("LLM_URL", "http://127.0.0.1:8080")
-URL = BASE + "/slots"
-LABEL = os.environ.get("PI_LIVE_LABEL", "")
+BG = os.environ.get("AGENT_WATCH_BG", "light")
 TTY = sys.stdout.isatty()
-DIM, CYAN, RED, YEL, BOLD, RST = ("\033[2m", "\033[36m", "\033[31m", "\033[33m", "\033[1m", "\033[0m") if TTY else ("",) * 6
+COLOR = TTY or os.environ.get("AGENT_WATCH_COLOR") == "1"
+
+
+def sgr(*codes):
+    return f"\033[{';'.join(map(str, codes))}m" if COLOR else ""
+
+
+RST, BOLD, DIM, ITAL = sgr(0), sgr(1), sgr(2), sgr(3)
+RED, GREEN, YEL, CYAN, GREY = sgr(31), sgr(32), sgr(33), sgr(36), sgr(90)
+ADD_BG, DEL_BG = (sgr(48, 5, 22), sgr(48, 5, 52)) if BG == "dark" else (sgr(48, 5, 194), sgr(48, 5, 224))
+DOT, ELBOW = "⏺", "⎿"
+FORMATTER = Terminal256Formatter(style="monokai" if BG == "dark" else "xcode") if highlight else None
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+DIFF_LINES, WRITE_LINES, OUTPUT_LINES = 40, 12, 6
+
 lock = threading.Lock()
-state = {"mode": None}          # which stream is being printed: thinking / text
-ITER_START = [time.time()]   # reset when --follow switches to a new iteration
+ui = {"rows": 0, "cols": 80, "input": "", "thinking": True, "label": "", "t0": time.time(), "status": "",
+      "composing": None, "project": None}
+INTERACTIVE = False
+
+
+TAIL = ["\n\n"]   # last two visible characters written, so blocks get exactly one blank line between them
 
 
 def out(s):
     with lock:
         sys.stdout.write(s)
         sys.stdout.flush()
+        plain = ANSI.sub("", s)
+        if plain:
+            TAIL[0] = (TAIL[0] + plain)[-2:]
 
 
-def setup_region():
-    if not TTY:
-        return 0
-    rows = shutil.get_terminal_size().lines
-    sys.stdout.write(f"\033[1;{rows - 1}r\033[{rows - 1};1H")   # scroll region = all but the last row
-    sys.stdout.flush()
-    return rows
+def gap():
+    """Start a new block: exactly one blank line after whatever came before."""
+    t = TAIL[0]
+    out("" if t == "\n\n" else "\n" if t.endswith("\n") else "\n\n")
+
+
+def visible(s):
+    return len(ANSI.sub("", s))
+
+
+def clip(plain, n):
+    return plain if len(plain) <= n else plain[: max(0, n - 1)] + "…"
 
 
 def k(n):
     return f"{n / 1000:.1f}k"
 
 
+# ---------------------------------------------------------------- syntax highlighting
+
+LEXERS = {}
+
+
+def lexer(path=None, lang=None):
+    if not (highlight and COLOR):
+        return None
+    key = path or f"lang:{lang}"
+    if key not in LEXERS:
+        try:
+            lx = get_lexer_for_filename(path, stripnl=False) if path else get_lexer_by_name(lang or "text", stripnl=False)
+        except (ClassNotFound, TypeError):
+            lx = None
+        LEXERS[key] = lx
+    return LEXERS[key]
+
+
+def hl(line, lx, bg=""):
+    """One line of code with syntax colours; with bg, the background survives the formatter's resets."""
+    if not lx:
+        return bg + line
+    return bg + highlight(line, lx, FORMATTER).rstrip("\n")   # the 256-colour formatter only resets the foreground
+
+
+# ---------------------------------------------------------------- bottom rows: input line + status bar
+
+def setup_region():
+    if not TTY:
+        return
+    size = shutil.get_terminal_size()
+    ui["rows"], ui["cols"] = size.lines, size.columns
+    bottom = ui["rows"] - (2 if INTERACTIVE else 1)
+    sys.stdout.write(f"\033[1;{bottom}r\033[{bottom};1H")
+    sys.stdout.flush()
+
+
+def draw_bottom():
+    if not TTY:
+        return
+    rows, cols = ui["rows"], ui["cols"]
+    s = ""
+    if INTERACTIVE:
+        if ui["input"]:
+            shown = ui["input"].replace("\n", "⏎")
+            room = cols - 5
+            if len(shown) > room:
+                shown = "…" + shown[-(room - 1):]
+            line = f"{BOLD}›{RST} {shown}\033[7m \033[0m"
+        else:
+            hint = (f"› message the agent: type, Enter sends (read after its current step) · Esc stops the session "
+                    f"and sends now · Ctrl-T thinking {'on' if ui['thinking'] else 'off'} · Ctrl-C quits")
+            line = GREY + clip(hint, cols - 1) + RST
+        s += f"\033[{rows - 1};1H\033[2K{line}"
+    bar = ui["status"]
+    if visible(bar) > cols - 2:
+        bar = clip(ANSI.sub("", bar), cols - 2)
+    s += f"\033[{rows};1H\033[2K\033[7m\033[1m {bar} \033[K\033[0m"
+    with lock:
+        sys.stdout.write("\0337" + s + "\0338")
+        sys.stdout.flush()
+
+
 VLLM_LAST = [None]   # (time, generation_tokens_total) for the vLLM rate
 
 
-def vllm_status():
+def vllm_phase():
     """vLLM has no /slots: read its Prometheus /metrics (generated-token counter, running requests, KV pool use)."""
     try:
         text = urllib.request.urlopen(BASE + "/metrics", timeout=2).read().decode()
@@ -67,65 +177,370 @@ def vllm_status():
     running = vals.get("vllm:num_requests_running", 0) > 0
     rate = (gen - last[1]) / (now - last[0]) if last and now > last[0] else 0.0
     phase = f"gen {rate:5.1f} tok/s" if running and rate > 0 else ("reading prompt" if running else "idle")
-    return f"vLLM | {phase} | KV pool {100 * vals.get('vllm:kv_cache_usage_perc', 0):.0f}%"
+    return f"{phase} | KV pool {100 * vals.get('vllm:kv_cache_usage_perc', 0):.0f}%"
+
+
+def llama_phase(state):
+    """llama-server's /slots: context used and speed of the running request."""
+    s = json.load(urllib.request.urlopen(BASE + "/slots", timeout=2))[0]
+    dec = ((s.get("next_token") or [{}])[0]).get("n_decoded", 0)
+    used, n_ctx, task_id = s.get("n_prompt_tokens", 0), s.get("n_ctx", 1), s.get("id_task")
+    now, last = time.time(), state.get("last")
+    if not s.get("is_processing"):
+        phase = "idle"
+    elif dec == 0:
+        done = s.get("n_prompt_tokens_processed", 0) + s.get("n_prompt_tokens_cache", 0)
+        phase = f"reading prompt {min(100, 100 * done / max(used, 1)):3.0f}%"
+    elif last and last[2] == task_id and dec > last[1]:
+        state.setdefault("rates", []).append((dec - last[1]) / (now - last[0]))
+        del state["rates"][:-3]
+        phase = f"gen {sum(state['rates']) / len(state['rates']):5.1f} tok/s"
+    else:
+        phase = "generating"
+    state["last"] = (now, dec, task_id)
+    return f"ctx {k(used)}/{k(n_ctx)} ({100 * used / n_ctx:.0f}%) | {phase}"
 
 
 def status_loop():
-    last = None
-    rates = []
-    rows = setup_region()
+    state = {}
+    setup_region()
     while True:
-        time.sleep(1)
         try:
-            s = json.load(urllib.request.urlopen(URL, timeout=2))[0]
+            phase = llama_phase(state)
         except Exception:
-            line = vllm_status()
-        else:
-            # n_prompt_tokens is the slot's total token count and already includes generated tokens; a request is
-            # identified by id_task. Speed = growth of n_decoded within one request.
-            dec = ((s.get("next_token") or [{}])[0]).get("n_decoded", 0)
-            used, n_ctx, task_id = s.get("n_prompt_tokens", 0), s.get("n_ctx", 1), s.get("id_task")
-            now = time.time()
-            if not s.get("is_processing"):
-                phase = "idle"
-            elif dec == 0:
-                done = s.get("n_prompt_tokens_processed", 0) + s.get("n_prompt_tokens_cache", 0)
-                phase = f"reading prompt {min(100, 100 * done / max(used, 1)):3.0f}%"
-            elif last and last[2] == task_id and dec > last[1]:
-                rates.append((dec - last[1]) / (now - last[0]))
-                del rates[:-3]
-                phase = f"gen {sum(rates) / len(rates):5.1f} tok/s"
+            phase = vllm_phase()
+        if ui["composing"]:
+            name, chars = ui["composing"]
+            phase += f" | writing a {name} call ({k(chars)} chars)"
+        mins, secs = divmod(int(time.time() - ui["t0"]), 60)
+        ui["status"] = f"{ui['label']} | {phase} | session {mins}m{secs:02d}s"
+        size = shutil.get_terminal_size()
+        if (size.lines, size.columns) != (ui["rows"], ui["cols"]):
+            setup_region()
+        draw_bottom()
+        time.sleep(1)
+
+
+# ---------------------------------------------------------------- talking to the agent
+
+def session_running():
+    try:
+        pid = int(open(os.path.join(ui["project"], ".agent/pi.pid")).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def send(msg, now):
+    d = os.path.join(ui["project"], ".agent", "inbox")
+    os.makedirs(d, exist_ok=True)
+    name = f"{int(time.time() * 1000)}{'.now' if now else ''}.md"
+    tmp = os.path.join(d, "." + name + ".tmp")
+    with open(tmp, "w") as fh:
+        fh.write(msg + "\n")
+    os.rename(tmp, os.path.join(d, name))
+    if now:
+        note = "stopping this session; the next one starts with your message" if session_running() \
+            else "no session is running: the next one starts with your message"
+    else:
+        note = "queued: the agent reads it after its current step" if session_running() \
+            else "no session is running: the next one starts with your message"
+    R.interject(f"{YEL}{BOLD}» you:{RST}{YEL} {msg}{RST}\n  {GREY}{note}{RST}")
+
+
+def input_loop(fd):
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf, paste = b"", False
+
+    def add(b):
+        ui["input"] += dec.decode(b).replace("\r", "\n")
+
+    while True:
+        try:
+            data = os.read(fd, 1024)
+        except OSError:
+            return
+        if not data:
+            return
+        buf += data
+        while buf:
+            if paste:
+                end = buf.find(b"\033[201~")
+                if end < 0:
+                    add(buf)
+                    buf = b""
+                else:
+                    add(buf[:end])
+                    buf, paste = buf[end + 6:], False
+                continue
+            if buf.startswith(b"\033[200~"):
+                buf, paste = buf[6:], True
+                continue
+            c = buf[0]
+            if c == 0x1B:
+                if len(buf) == 1:
+                    if select.select([fd], [], [], 0.05)[0]:
+                        buf += os.read(fd, 1024)
+                        continue
+                    buf = b""
+                    msg = ui["input"].strip()
+                    if msg:
+                        ui["input"] = ""
+                        send(msg, now=True)
+                    continue
+                m = re.match(rb"\033(\[[0-9;?]*[ -/]*[@-~]|O.|.)", buf, re.S)   # arrow keys etc.: ignored
+                buf = buf[m.end():] if m else buf[1:]
+                continue
+            buf = buf[1:]
+            if c in (0x0D, 0x0A):
+                msg = ui["input"].strip()
+                ui["input"] = ""
+                if msg:
+                    send(msg, now=False)
+            elif c in (0x7F, 0x08):
+                ui["input"] = ui["input"][:-1]
+            elif c == 0x15:
+                ui["input"] = ""
+            elif c == 0x14:
+                ui["thinking"] = not ui["thinking"]
+                R.interject(f"{GREY}(thinking {'shown' if ui['thinking'] else 'hidden'}){RST}")
+            elif c >= 0x20:
+                j = 0
+                while j < len(buf) and buf[j] >= 0x20 and buf[j] != 0x7F:
+                    j += 1
+                add(bytes([c]) + buf[:j])
+                buf = buf[j:]
+        draw_bottom()
+
+
+# ---------------------------------------------------------------- rendering Pi's events
+
+def md(line, fence):
+    """Assistant text, one line: code fences highlighted, headers and **bold** bold, `code` cyan."""
+    stripped = line.strip()
+    if stripped.startswith("```"):
+        return GREY + line + RST, (None if fence else (stripped[3:].strip() or "text"))
+    if fence:
+        return hl(line, lexer(lang=fence)) + RST, fence
+    if stripped.startswith("#"):
+        return BOLD + stripped.lstrip("#").strip() + RST, None
+    line = re.sub(r"\*\*(.+?)\*\*", lambda m: BOLD + m.group(1) + RST, line)
+    line = re.sub(r"`([^`]+)`", lambda m: CYAN + m.group(1) + RST, line)
+    return line, None
+
+
+def tool_header(name, args):
+    a = args or {}
+    first = lambda s: str(s or "").strip().splitlines()[0] if str(s or "").strip() else ""
+    if name == "bash":
+        cmd = str(a.get("command", ""))
+        more = " …" if "\n" in cmd.strip() else ""
+        return f"{BOLD}Bash{RST}({first(cmd)}{more})"
+    if name == "edit":
+        return f"{BOLD}Update{RST}({a.get('path')})"
+    if name == "write":
+        return f"{BOLD}Write{RST}({a.get('path')})"
+    if name == "read":
+        rng = ""
+        if a.get("offset") or a.get("limit"):
+            start = int(a.get("offset") or 1)
+            rng = f", lines {start}-{start + int(a['limit']) - 1}" if a.get("limit") else f", from line {start}"
+        return f"{BOLD}Read{RST}({a.get('path')}{rng})"
+    if name == "web_search":
+        return f"{BOLD}Web Search{RST}(\"{a.get('query')}\")"
+    if name == "web_fetch":
+        return f"{BOLD}Fetch{RST}({a.get('url')})" + (f" {GREY}asking: {a['question']}{RST}" if a.get("question") else "")
+    if name == "ask_human":
+        return f"{YEL}{BOLD}Ask the human{RST}{YEL} ({'blocking' if a.get('blocking') is not False else 'non-blocking'}){RST}"
+    return f"{BOLD}{name}{RST}({clip(json.dumps(a), 120)})"
+
+
+def result_text(e):
+    content = (e.get("result") or {}).get("content") or []
+    return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+
+
+def elbow(lines, colour=GREY):
+    """Claude Code's result block: first line after ⎿, the rest indented under it."""
+    return "".join(f"  {ELBOW}  " + colour + l + RST + "\n" if i == 0 else "     " + colour + l + RST + "\n"
+                   for i, l in enumerate(lines))
+
+
+def render_diff(path, diff):
+    lx = lexer(path=path)
+    rows, shown = diff.split("\n"), []
+    for line in rows[:DIFF_LINES]:
+        m = re.match(r"^([ +-])(\s*\d*)\s(.*)$", line)
+        if not m:
+            shown.append(f"      {GREY}{line}{RST}")
+            continue
+        sign, num, code = m.group(1), m.group(2).strip(), m.group(3)
+        bg = ADD_BG if sign == "+" else DEL_BG if sign == "-" else ""
+        body = hl(code, lx, bg) if bg else DIM + code + RST
+        shown.append(f"      {GREY}{num:>4}{RST} {bg}{sign} {body}\033[K{RST}" if COLOR else f"      {num:>4} {sign} {code}")
+    if len(rows) > DIFF_LINES:
+        shown.append(f"      {GREY}… +{len(rows) - DIFF_LINES} lines{RST}")
+    return "\n".join(shown) + "\n"
+
+
+def render_result(name, args, e):
+    a, text = args or {}, result_text(e)
+    if e.get("isError"):
+        return elbow([f"Error: {l}" for l in (text.strip().splitlines() or ["(no message)"])[:4]], RED)
+    if name == "edit":
+        diff = ((e.get("result") or {}).get("details") or {}).get("diff") or ""
+        adds = sum(1 for l in diff.split("\n") if l.startswith("+"))
+        rems = sum(1 for l in diff.split("\n") if l.startswith("-"))
+        head = elbow([f"Updated {a.get('path')} with {adds} addition{'s' * (adds != 1)} and "
+                      f"{rems} removal{'s' * (rems != 1)}"], "")
+        return head + (render_diff(a.get("path"), diff) if diff else "")
+    if name == "write":
+        lines = str(a.get("content", "")).rstrip("\n").split("\n")
+        lx = lexer(path=a.get("path"))
+        body = "".join(f"      {GREY}{i + 1:>4}{RST} {hl(l, lx)}{RST}\n" for i, l in enumerate(lines[:WRITE_LINES]))
+        more = f"      {GREY}… +{len(lines) - WRITE_LINES} lines{RST}\n" if len(lines) > WRITE_LINES else ""
+        return elbow([f"Wrote {len(lines)} lines to {a.get('path')}"], "") + body + more
+    if name == "read":
+        n = len(text.rstrip("\n").split("\n")) if text.strip() else 0
+        return elbow([f"Read {n} lines"])
+    if name == "web_search":
+        n = len(re.findall(r"^\d+\. ", text, re.M))
+        return elbow([f"{n} result{'s' * (n != 1)}"])
+    if name == "web_fetch":
+        return elbow([clip((text.split("\n")[1:2] or [""])[0], 150)])
+    lines = text.rstrip("\n").split("\n") if text.strip() else ["(no output)"]
+    shown = lines[:OUTPUT_LINES] + ([f"… +{len(lines) - OUTPUT_LINES} lines"] if len(lines) > OUTPUT_LINES else [])
+    return elbow(shown)
+
+
+class Renderer:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.mode = None          # thinking / thinking-hidden / text / None
+        self.text, self.fence, self.first_line = "", None, True
+        self.t_think, self.user_msgs, self.tools, self.last_header = 0.0, 0, {}, None
+
+    def interject(self, s):
+        """A line from the viewer itself (the human's message, a toggle) in the middle of the stream."""
+        self.end_stream()
+        out(s + "\n")
+
+    def end_stream(self):
+        if self.mode == "text" and self.text:
+            self.flush_text(final=True)
+        if self.mode in ("thinking", "thinking-hidden"):
+            out(RST + ("" if TAIL[0].endswith("\n") else "\n"))
+        elif self.mode == "text":
+            out(RST)
+        self.mode = None
+
+    def flush_text(self, final=False):
+        while "\n" in self.text or (final and self.text):
+            line, _, rest = self.text.partition("\n")
+            self.text = rest
+            if self.first_line and not line.strip():   # leading blank lines of an answer
+                continue
+            if self.first_line:
+                gap()
+                self.last_header = None
+            shown, self.fence = md(line, self.fence)
+            prefix = f"{DOT} " if self.first_line else "  "
+            self.first_line = False
+            out(prefix + shown + RST + "\n")
+
+    def event(self, e):
+        t = e.get("type")
+        if t == "message_update":
+            d = e.get("assistantMessageEvent") or {}
+            dt = d.get("type")
+            if dt == "thinking_start":
+                self.end_stream()
+                self.t_think = time.time()
+                self.last_header = None
+                gap()
+                if ui["thinking"]:
+                    self.mode = "thinking"
+                    out(f"{GREY}{ITAL}✻ ")
+                else:
+                    self.mode = "thinking-hidden"
+                    out(f"{GREY}✻ Thinking…")
+            elif dt == "thinking_delta" and self.mode == "thinking":
+                out(GREY + ITAL + d.get("delta", ""))
+            elif dt == "thinking_end":
+                if self.mode == "thinking-hidden":
+                    out(f" {int(time.time() - self.t_think)}s{RST}\n")
+                    self.mode = None
+                else:
+                    self.end_stream()
+            elif dt == "text_start":
+                self.end_stream()
+                self.mode, self.text, self.first_line, self.fence = "text", "", True, None
+            elif dt == "text_delta":
+                if self.mode != "text":
+                    self.end_stream()
+                    self.mode, self.text, self.first_line, self.fence = "text", "", True, None
+                self.text += d.get("delta", "")
+                self.flush_text()
+            elif dt == "text_end":
+                self.flush_text(final=True)
+                self.mode = None
+            elif dt == "toolcall_start":
+                ui["composing"] = ["tool", 0]
+            elif dt == "toolcall_delta" and ui["composing"]:
+                ui["composing"][1] += len(d.get("delta", ""))
+                part = d.get("partial") or {}
+                calls = [c for c in (part.get("content") or []) if isinstance(c, dict) and c.get("type") == "toolCall"]
+                if calls and calls[-1].get("name"):
+                    ui["composing"][0] = calls[-1]["name"]
+            elif dt == "toolcall_end":
+                ui["composing"] = None
+        elif t == "message_end" and (e.get("message") or {}).get("role") == "user":
+            self.end_stream()
+            msg = e["message"]
+            text = "".join(c.get("text", "") for c in (msg.get("content") or []) if isinstance(c, dict)).strip()
+            self.user_msgs += 1
+            if self.user_msgs == 1:   # the loop's prompt for this session
+                head, sep, extra = text.partition("The human sent you")
+                out(f"{GREY}❯ {clip(head.strip().replace(chr(10), ' '), 200)}{RST}\n")
+                if sep:
+                    out(f"{YEL}{BOLD}» from you:{RST}{YEL} {sep}{extra}{RST}\n")
+            elif text.startswith("[harness]"):
+                out(f"{YEL}⚑ {clip(text.splitlines()[0], 200)}{RST}\n")
             else:
-                phase = "generating"
-            last = (now, dec, task_id)
-            pct = 100 * used / n_ctx
-            colour = "\033[41m" if pct >= 75 else "\033[43m\033[30m" if pct >= 50 else ""
-            mins, secs = divmod(int(now - ITER_START[0]), 60)
-            bar = "\033[0m\033[7m\033[1m"   # reverse video + bold, re-applied after each coloured segment
-            line = (f"{LABEL} | {colour}ctx {k(used)}/{k(n_ctx)} ({pct:.0f}%){bar} | {phase} | "
-                    f"iter {mins}m{secs:02d}s")
-        if TTY:
-            cols = shutil.get_terminal_size().columns
-            visible = len(re.sub(r"\033\[[0-9;]*m", "", line))
-            if visible > cols - 2:   # never wrap the bar: trim the label (task path) first, then hard-cut
-                line = line.replace(LABEL, LABEL[: max(0, len(LABEL) - (visible - cols + 3))], 1)
-            if shutil.get_terminal_size().lines != rows:
-                rows = setup_region()
-            with lock:
-                sys.stdout.write(f"\0337\033[{rows};1H\033[2K\033[7m\033[1m {line} \033[K\033[0m\0338")
-                sys.stdout.flush()
+                out(f"{BOLD}❯ {text}{RST}\n")
+        elif t == "tool_execution_start":
+            self.end_stream()
+            ui["composing"] = None
+            self.tools[e.get("toolCallId")] = (e.get("toolName"), e.get("args") or {})
+            gap()
+            out(f"{CYAN}{DOT}{RST} {tool_header(e.get('toolName'), e.get('args'))}\n")
+            self.last_header = e.get("toolCallId")
+            if e.get("toolName") == "ask_human":
+                req = str((e.get("args") or {}).get("request", "")).splitlines()
+                out("".join(f"  {YEL}│ {l}{RST}\n" for l in req[:12]))
+        elif t == "tool_execution_end":
+            name, args = self.tools.pop(e.get("toolCallId"), (e.get("toolName"), {}))
+            if self.last_header != e.get("toolCallId"):   # tools ran in parallel: say which one this result is
+                gap()
+                out(f"{GREY}{DOT}{RST} {GREY}{ANSI.sub('', tool_header(name, args))}{RST}\n")
+            out(render_result(name, args, e))
+            self.last_header = None
+        elif t in ("compaction_start", "auto_retry_start"):
+            self.end_stream()
+            out(f"{YEL}[{t}] {e.get('reason') or e.get('errorMessage') or ''}{RST}\n")
+        elif t == "agent_end":
+            self.end_stream()
 
 
-def switch(mode, header=""):
-    if state["mode"] != mode:
-        out(RST + "\n" + header)
-        state["mode"] = mode
+R = Renderer()
 
 
 def follow(project):
-    """Yield event lines from the newest iteration file, replaying it from the start, then switch when a newer one
-    appears. Sets the status label from the loop log."""
-    global LABEL
+    """Yield event lines from the newest session file, replaying it from the start, then switch when a newer one
+    appears. The status label comes from the loop log."""
     current, fh = None, None
     while True:
         files = sorted(glob.glob(os.path.join(project, ".agent/sessions/iter-*.jsonl")))
@@ -137,12 +552,14 @@ def follow(project):
             try:
                 for l in open(os.path.join(project, ".agent/loop.log")):
                     if f"iteration {n}:" in l:
-                        task = l.rsplit(": ", 1)[-1].strip()
+                        task = l.split(f"iteration {n}: ", 1)[-1].split(" (harness")[0].strip()
             except OSError:
                 pass
-            LABEL = f"iter {n} | {task}"
-            ITER_START[0] = os.path.getmtime(os.path.join(project, ".agent/loop.log"))
-            out(f"{RST}\n{BOLD}===== iteration {n}: {task} ====={RST}\n")
+            ui["label"] = f"session {n} | {task}"
+            ui["t0"] = os.path.getmtime(os.path.join(project, ".agent/loop.log"))
+            R.end_stream()
+            R.reset()
+            out(f"\n{BOLD}── session {n} · {task} ──{RST}\n")
         line = fh.readline() if fh else ""
         if line:
             yield line
@@ -151,41 +568,32 @@ def follow(project):
 
 
 def main():
+    global INTERACTIVE
     source = sys.stdin
+    old = None
     if len(sys.argv) == 3 and sys.argv[1] == "--follow":
-        source = follow(sys.argv[2])
-    threading.Thread(target=status_loop, daemon=True).start()
-    for line in source:
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        t = e.get("type")
-        if t == "message_update":
-            d = e.get("assistantMessageEvent") or {}
-            if d.get("type") == "thinking_delta":
-                switch("thinking", f"{DIM}* thinking: ")
-                out(DIM + d.get("delta", ""))
-            elif d.get("type") == "text_delta":
-                switch("text", "")
-                out(RST + d.get("delta", ""))
-        elif t == "tool_execution_start":
-            args = e.get("args") or {}
-            detail = args.get("command") or args.get("path") or args.get("file_path") or json.dumps(args)[:150]
-            first = str(detail).splitlines()[0][:150] if detail else ""
-            state["mode"] = None
-            out(f"{RST}\n{CYAN}{BOLD}> {e.get('toolName')}{RST}{CYAN} {first}{RST}")
-        elif t == "tool_execution_end" and e.get("isError"):
-            res = (e.get("result") or {}).get("content") or [{}]
-            out(f"\n{RED}  ! failed: {str(res[0].get('text', ''))[:200]}{RST}")
-        elif t in ("compaction_start", "auto_retry_start"):
-            state["mode"] = None
-            out(f"\n{YEL}[{t}] {e.get('reason') or e.get('errorMessage') or ''}{RST}")
-        elif t == "agent_end":
-            state["mode"] = None
-            out(RST + "\n")
+        ui["project"] = os.path.realpath(sys.argv[2])
+        source = follow(ui["project"])
+        INTERACTIVE = TTY and sys.stdin.isatty()
+    if INTERACTIVE:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        out("\033[?2004h")   # bracketed paste: a pasted newline does not send the message
+        threading.Thread(target=input_loop, args=(fd,), daemon=True).start()
     if TTY:
-        out("\033[r")   # restore full-screen scrolling
+        threading.Thread(target=status_loop, daemon=True).start()
+    try:
+        for line in source:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            R.event(e)
+    finally:
+        if old:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+            out("\033[?2004l")
 
 
 if __name__ == "__main__":
