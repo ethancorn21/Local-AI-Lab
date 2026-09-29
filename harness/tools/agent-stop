@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# agent-stop <project> [--now] : stop a loop started with agent-start.
+# Default: the loop stops after the current agent session ends (its work is committed and noted). --now: stop the loop
+# and the running session immediately; the next agent-start saves any uncommitted work first.
+set -uo pipefail
+arg=${1:?usage: agent-stop <project name or dir> [--now]}
+if [ -d "$arg" ]; then P=$(realpath "$arg"); else P="$HOME/projects/$arg"; fi
+[ -d "$P/.agent" ] || { echo "No project at $P."; exit 1; }
+if flock -n "$P/.agent/loop.lock" true; then echo "Not running."; rm -f "$P/.agent/loop.pid"; exit 0; fi
+if [ "${2:-}" = --now ]; then
+  pid=$(cat "$P/.agent/loop.pid" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -- "-$pid" 2>/dev/null || kill "$pid"   # the loop's process group
+    # the agent session runs under `timeout`, which puts it in a process group of its own: stop that group too
+    spid=$(cat "$P/.agent/pi.pid" 2>/dev/null)
+    if [ -n "$spid" ]; then kill -- "-$spid" 2>/dev/null || kill "$spid" 2>/dev/null; fi
+    echo "Stopped."
+  else
+    echo "Running, but not started by agent-start (no pid file): use the default stop instead."; exit 1
+  fi
+else
+  touch "$P/.agent/PAUSE"
+  echo "Will stop after the current session ends (agent-start removes the stop request)."
+fi

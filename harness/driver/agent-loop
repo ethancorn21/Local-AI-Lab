@@ -27,7 +27,7 @@ LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
 # overview, and anything the agent still writes there is moved into its task's hand-over (counted in the ledger).
 HANDOVER_MODE=${HANDOVER_MODE:-task}   # default since 2026-09-28 (A/B: as reliable as PROGRESS.md, and merges cleanly for two agents)
 export WRAPUP_HANDOVER=$HANDOVER_MODE   # the hand-over extension words its message for the mode
-VIEWER=${VIEWER:-tui}            # tui: Pi's own TUI in tmux window $AGENT_TMUX; json: headless (pi-live viewer)
+VIEWER=${VIEWER:-json}           # json (default): headless, watch with agent-watch; tui: Pi's own TUI in tmux window $AGENT_TMUX
 AGENT_TMUX=${AGENT_TMUX:-main:agent}
 THINKING=${THINKING:-xhigh}  # Pi level; models.json maps it to Qwen3.8's reasoning_effort
 # The agent harness: pi (default) or omp (Oh My Pi, a Pi fork). omp runs headless (print mode, JSON events) with the

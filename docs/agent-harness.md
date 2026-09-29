@@ -203,8 +203,9 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 
 | Task | How |
 |---|---|
-| Start or resume the loop | `agent-loop <project dir>` in the tmux loop window |
-| Stop cleanly between sessions | `touch <project>/.agent/PAUSE` (remove it before restarting) |
+| Start or resume the loop | `agent-start <project>` (name or path): runs in the background, no tmux, survives logout; refuses when no task's first line is `Status: open` |
+| Watch it live | `agent-watch <project>` (Ctrl-C leaves the view; the loop keeps going) |
+| Stop it | `agent-stop <project>` (after the current session) or `agent-stop <project> --now` |
 | See how it is doing | `agent-report <project>` (per task and per session, with the harness version) |
 | New project | `newproj <name>`, add one seed task `tasks/001-<name>.md` with a goal and acceptance criteria, then `agent-loop` |
 | Veto a task the agent added | Set its first line to `Status: dropped` |

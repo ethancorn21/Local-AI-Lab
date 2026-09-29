@@ -1,3 +1,6 @@
 #!/usr/bin/env bash
-# agent-watch [project dir] : live Claude Code-style view of a running agent-loop. Safe to Ctrl-C / close anytime.
-exec "$(dirname "$(realpath "$0")")/pi-live" --follow "$(realpath "${1:-.}")"
+# agent-watch <project> : live view of a running loop (the agent's thinking, tool calls and output as they happen).
+# <project> is a name under ~/projects or a path. Safe to Ctrl-C or close at any time: the loop keeps running.
+arg=${1:-.}
+if [ -d "$arg" ]; then P=$(realpath "$arg"); else P="$HOME/projects/$arg"; fi
+exec "$(dirname "$(realpath "$0")")/pi-live" --follow "$P"
