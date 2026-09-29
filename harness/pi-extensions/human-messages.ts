@@ -6,12 +6,14 @@
  *  - <ms>.now.md asks to stop now. A headless Pi cannot take a message after an abort (measured: sendUserMessage
  *    throws once the run is aborted), so the session is aborted and every waiting message is left in the inbox for the
  *    driver, which opens the next session's prompt with them.
+ *  - A stop request only stops the session it was sent to: one older than this session (left by an older driver that
+ *    does not put messages into the prompt) is delivered as a normal message, or every new session would abort.
  *  - Messages are only delivered while a run is active; anything that arrives between runs waits for the driver.
  * Markers "[human] ..." go to PI_LOOP_MARKERS (or stderr) for the loop ledger.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const mark = (msg: string) => {
@@ -33,6 +35,7 @@ export default function (pi: ExtensionAPI) {
 	let ctxRef: any = null;
 	let running = false;
 	let stopping = false;
+	const started = Date.now();
 	pi.on("session_start", async (_e: any, ctx: any) => { ctxRef = ctx ?? ctxRef; });
 	pi.on("agent_start", async (_e: any, ctx: any) => { ctxRef = ctx ?? ctxRef; running = true; });
 	pi.on("turn_start", async (_e: any, ctx: any) => { ctxRef = ctx ?? ctxRef; running = true; });
@@ -47,7 +50,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (!files.length) return;
-		if (files.some((f) => f.endsWith(".now.md"))) {
+		const fresh = (f: string) => { try { return statSync(join(inbox, f)).mtimeMs >= started; } catch { return false; } };
+		if (files.some((f) => f.endsWith(".now.md") && fresh(f))) {
 			stopping = true;
 			mark(`interrupt waiting=${files.length}`);
 			ctxRef?.abort();
