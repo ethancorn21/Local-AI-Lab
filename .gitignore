@@ -6,3 +6,6 @@ __pycache__/
 node_modules/
 .env
 *.local
+
+# effort A/B v2: answer keys and hidden tests stay unpublished until the runs are finished (the agent can search the web)
+analysis/ab-effort2/hidden/
