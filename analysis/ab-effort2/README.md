@@ -2,7 +2,8 @@
 
 Does `THINKING=xhigh` buy anything over `medium` for how the lab actually uses the local model: reading a spec
 critically, writing code worth keeping, and carrying a project through many sessions of the loop? v1
-(`../ab-effort/`) measured one function with one grader; see `docs/agent-harness.md` for why that was not enough.
+(`../ab-effort/`) measured one function with one grader. The full write-up (why, design, build log, operating
+commands, results) is `docs/effort-ab.md`.
 
 ## What is measured
 

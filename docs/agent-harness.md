@@ -240,7 +240,8 @@ overlap with other work shows up. Requests to the human are answered by an auto-
 the assumption down"); the doorbell is faked so no messages go out. The judge is headless `claude -p` with its own
 system prompt, no tools and no user settings, and sees anonymous packets with effort labels scrubbed. Answer keys,
 hidden checks and the project GOAL.md stay unpublished (`analysis/ab-effort2/hidden/`, gitignored) until the runs are
-finished, because the agent can search the web. Results will be added here.
+finished, because the agent can search the web. The full process (round-1 audit, design, build log, GPU hand-over,
+operating commands) and, later, the results: [effort-ab.md](effort-ab.md).
 
 ## Planned: two agents on one project (when a second 24 GB GPU arrives)
 
