@@ -24,6 +24,7 @@ P=$(realpath "${1:?usage: agent-loop <project dir>}")
 MAX_ITERS=${MAX_ITERS:-200}
 ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
+STALL_KILL=${STALL_KILL:-900}   # a session whose output has not grown for this many seconds is stopped (watchdog)
 STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
 ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}
 GOAL_CHECKS=${GOAL_CHECKS:-3}   # goal-check rounds per GOAL.md version before the loop stops for the human   # doorbell reminder interval while a blocking request to the human is open
@@ -366,6 +367,13 @@ run_tests() {
   [ $rc -eq 0 ] && return 0
   # pytest exits 5 when it collects no tests: a project with no tests yet is not a failing one
   [ $rc -eq 5 ] && [[ $TEST_CMD == *pytest* ]] && return 0
+  if [ $rc -eq 124 ]; then   # a hang, not a flake: a rerun would only burn another 900 s
+    TEST_OUT=$out1
+    mkdir -p .agent/reports; printf '%s\n' "$out1" > .agent/reports/last-test-output.txt
+    TEST_REPORT="    The test suite did not finish within 900 s: a test hangs. Run \`$TEST_CMD\` with a \`timeout\` (pytest: -x -v) to find it."$'\n'"$(tail -4 <<<"$out1" | sed 's/^/    /')"$'\n'"    (output up to the timeout: .agent/reports/last-test-output.txt)"
+    log "test suite timed out after 900 s (a test hangs) - not rerun"
+    return 1
+  fi
   if out2=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); then
     printf '\n## %s DRIVER FLAKY: test failed once, passed on rerun (fix or de-flake it)\n%s\n' "$(date +%F)" \
       "$(failing_names "$out1")" >> DECISIONS.md
@@ -381,6 +389,80 @@ run_tests() {
 
 # A task counts as done only if every acceptance box is ticked AND the test suite passes when the driver runs it.
 # Otherwise the driver reopens it and explains why in DECISIONS.md, where the next agent will read it.
+# --- stall watchdog ---
+# A session whose output file has not grown for STALL_KILL seconds is stuck: a command that hangs (the bash-timeout
+# extension gives commands a default limit, but the agent can set a longer one), an extension that waits forever, a
+# model server that stopped answering. Stop it then instead of waiting out ITER_TIMEOUT, together with every process
+# it started (Pi runs commands detached, in their own process groups, so killing the session's group would leave a
+# hung test running). A tool call that set its own longer timeout gets that long, plus a minute.
+descendants() {  # descendants <pid> : every descendant pid, deepest first
+  local c
+  for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do descendants "$c"; echo "$c"; done
+}
+open_call_timeout() {  # open_call_timeout <session jsonl> : the timeout (s) the last unfinished tool call asked for, or 0
+  python3 - "$1" <<'PY' 2>/dev/null || echo 0
+import json, sys
+started, ended = {}, set()
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("type") == "tool_execution_start":
+        started[d.get("toolCallId")] = (d.get("args") or {}).get("timeout") or 0
+    elif d.get("type") == "tool_execution_end":
+        ended.add(d.get("toolCallId"))
+waiting = [t for k, t in started.items() if k not in ended]
+print(int(waiting[-1]) if waiting and isinstance(waiting[-1], (int, float)) else 0)
+PY
+}
+stall_watch() {  # stall_watch <session pid> <session jsonl> : runs in the background during a session
+  local last=-1 idle=0 size limit pids p
+  while kill -0 "$1" 2>/dev/null; do
+    sleep 30
+    size=$(stat -c %s "$2" 2>/dev/null || echo 0)
+    if [ "$size" != "$last" ]; then last=$size; idle=0; continue; fi
+    idle=$((idle + 30))
+    [ "$idle" -lt "$STALL_KILL" ] && continue
+    limit=$(open_call_timeout "$2")
+    [ "$limit" -gt 0 ] && [ "$idle" -lt $((limit + 60)) ] && continue
+    echo "$idle" > .agent/stalled
+    pids="$(descendants "$1") $1"
+    for p in $pids; do kill -TERM "$p" 2>/dev/null; done
+    sleep 10
+    for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+    return 0
+  done
+}
+stall_note() {  # stall_note <task file> <session jsonl> <idle seconds> : tell the next session what hung
+  python3 - "$@" <<'PY'
+import json, re, sys
+task, sess, idle = sys.argv[1], sys.argv[2], int(sys.argv[3])
+started, ended = {}, set()
+for line in open(sess, errors="replace"):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("type") == "tool_execution_start":
+        started[d.get("toolCallId")] = (d.get("toolName"), d.get("args") or {})
+    elif d.get("type") == "tool_execution_end":
+        ended.add(d.get("toolCallId"))
+waiting = [v for k, v in started.items() if k not in ended]
+if waiting:
+    name, args = waiting[-1]
+    cmd = str(args.get("command") or json.dumps(args))[:400]
+    what = (f"its `{name}` call never returned:\n\n    {cmd}\n\nThat command, or the code it runs, hangs. Run it again "
+            "with a `timeout` (for pytest add `-x -v` to see which test) and fix the hang before anything else.")
+else:
+    what = "the model produced nothing for that long (no command was running). Check the last step before repeating it."
+note = f"\n\n### Driver note: the previous session was stopped after {idle // 60} min without output\n\nThe driver stopped it because {what}\n"
+t = open(task).read()
+if not re.search(r"(?m)^## Hand-over", t):
+    t = t.rstrip("\n") + "\n\n## Hand-over\n"
+open(task, "w").write(t.rstrip("\n") + note)
+PY
+}
 reopen() {  # reopen <task file> <reasons>
   local f=$1 id; id=$(basename "$f" .md | cut -d- -f1)
   sed -i '1s/.*/Status: in-progress/' "$f"
@@ -569,6 +651,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
                 [ "$n" -gt 51200 ] && log "WARNING: $f is $((n / 1024)) KB, over Pi's 50 KB single-read limit" >&2
               done | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add')
   n4=$(printf %04d "$i")
+  rm -f .agent/stalled
   if [ "$VIEWER" = tui ]; then
     # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
     # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
@@ -596,16 +679,20 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
       --session-dir ".agent/sessions/iter-$n4.d" "${hooks[@]}" "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
-    echo $! > .agent/pi.pid
-    wait $!
+    spid=$!; echo $spid > .agent/pi.pid
+    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
+    wait $spid
     rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
   else
     PI_LOOP_ITER=$i PI_LOOP_TASK="$task" \
       timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
-    echo $! > .agent/pi.pid
-    wait $!
+    spid=$!; echo $spid > .agent/pi.pid
+    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
+    wait $spid
     rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
   fi
   rm -f .agent/pi.pid
   t1=$(date -Iseconds); s1=$(date +%s)
@@ -627,6 +714,12 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   elif [ "$code_leftovers" -gt 0 ]; then no_progress=0; log "no agent commit, but the driver saved $code_leftovers changed code file(s) - counts as progress"
   elif ! server_ok; then log "model server down during iteration $i - not counted toward the no-progress limit"
   else no_progress=$((no_progress + 1)); log "no agent commit ($no_progress/$NO_PROGRESS_LIMIT)"; fi
+  if [ -f .agent/stalled ]; then   # the watchdog stopped the session: say what hung, in the task the next session reads
+    stalled_s=$(cat .agent/stalled); rm -f .agent/stalled
+    log "STALL: iteration $i stopped by the watchdog after ${stalled_s}s without output"
+    stall_note "$task" ".agent/sessions/iter-$n4.jsonl" "$stalled_s"
+    git add "$task" && git commit -q -m "[driver] stall note for $(task_id "$task"): the previous session hung"
+  fi
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
   if [ "$status_after" = blocked ]; then   # blocked while a request is open: it resumes when that is answered

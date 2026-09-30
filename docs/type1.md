@@ -118,8 +118,10 @@ What this says so far:
    text) did *not* beat TF-IDF, the same outcome as the Windows round with Laya. Training took 88 minutes (18,052
    windows, 1 epoch) and peaked at 4.5 GB of VRAM; inference fits the 5060 Ti with room to spare, expected roughly
    twice the 3090 Ti's 41 ms per window, far more than the homelab's log volume needs.
-3. **Thresholds do not transfer exactly between networks:** the 1% threshold from the validation company gave 2% on
-   the test companies for the winner. On the homelab, the threshold should be set from its own shadow-mode data.
+3. **Thresholds do not transfer exactly between networks:** for the winner, the threshold that gave 1% false
+   positives on the validation company gave 2.0% on the test companies (recall 0.985), and the 0.1% threshold gave
+   1.06%, ten times its target (recall 0.977). TF-IDF's and SecureBERT's transferred thresholds landed at or below
+   target, at much lower recall. On the homelab, the threshold should be set from its own shadow-mode data.
 4. **Unsolved by any method: single-window escalation and VPN logins with stolen credentials.** The first has 1-3
    examples per company; the second is indistinguishable from a normal login in one window (it needs context such
    as "this account never logs in at 3 am", which is type-2 or detection-rule territory).
