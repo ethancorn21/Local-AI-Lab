@@ -99,6 +99,7 @@ one network and run on another).
 | **Qwen3.5-0.8B + LoRA (1 epoch)** | **0.997** | **0.991** | **0.972** | **0.852** | 0.985 / 2.0% | exfil 0.99, scan 0.90, webshell 0.59, escalation 0.03, vpn 0.01 | 0.743 | 0.118 | 34 / 41 |
 | TF-IDF + logistic regression (CPU) | 0.990 | 0.972 | 0.850 | 0.800 | 0.863 / 1.1% | exfil 0.77, scan 0.89, webshell 0.58, escalation 0.03, vpn 0.01 | 0.747 | 0.133 | 0.7 (CPU) |
 | SecureBERT 2.0 base, fine-tuned | 0.982 | 0.950 | 0.814 | 0.773 | 0.802 / 0.3% | exfil 0.52, scan 0.78, webshell 0.53, escalation 0, vpn 0 | 0.725 | 0.223 | 9 / 20 |
+| Qwen3.8-27B zero-shot, thinking off (type-2 reference, 800-window sample) | 0.963 | 0.880 | 0.624 | 0.108 | 0.000 / 0.0% | (its validation threshold sat above every test window) | 0.544 | 0.068 | 1,380 (shared GPU) |
 | Qwen3.5-2B zero-shot (answer logits) | 0.571 | 0.270 | 0.021 | 0.002 | | | 0.468 | 0.192 | 131 |
 | Qwen3.5-0.8B zero-shot | 0.366 | 0.156 | 0.019 | 0.000 | | | 0.022 | 0.114 | 74 |
 | Laya zero-shot, English (data v1) | 0.848 | 0.531 | 0.000 | 0.000 | | | 0.178 | 0.094 | 19 / 30 |
@@ -109,9 +110,11 @@ exfiltration 0.00 (0.77 when seen), scans 0.22 (0.89), webshell 0.56 (0.58; its 
 
 What this says so far:
 
-1. **Zero-shot does not work.** Neither the Laya checkpoints nor small Qwen3.5 models understand log windows out of
-   the box: the 0.8B model answers "no" with 86% to an obvious dirb scan. The 27B type-2 model does (reference run
-   below), which is the point of having a type 2.
+1. **Zero-shot needs a big model.** Neither the Laya checkpoints nor small Qwen3.5 models understand log windows out
+   of the box: the 0.8B model answers "no" with 86% to an obvious dirb scan. The 27B type-2 model does (AUROC 0.963,
+   best calibrated of all at ECE 0.068), but the 0.8B trained on this data beats it clearly at 1/40th of the time
+   per window. That is the case for two tiers: the small trained model screens everything, and the 27B, with
+   thinking on, looks only at what gets flagged.
 2. **Fine-tuning a small decoder beats the baseline where it matters.** At 1% false positives the LoRA-tuned 0.8B
    model finds 97% of attack windows against 85% for TF-IDF, and it catches almost all DNS-exfiltration windows at
    the transferred threshold. A fine-tuned encoder (SecureBERT 2.0, a ModernBERT-base model pretrained on security
