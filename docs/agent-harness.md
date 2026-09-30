@@ -56,6 +56,22 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 - Driver notes in DECISIONS.md stay short (first 8 failing tests plus a pointer to the full list in `.agent/reports/`).
 - A task still unfinished after 8 sessions is logged as STALLED (and every 4 sessions after).
 
+### Hangs (since 2026-09-30)
+
+A command that never returns used to cost a whole session: Pi's bash tool has no default timeout, so a hung test
+sat until the driver's 45-minute limit, and the next session ran it again (hollowdeep: 11 of 216 sessions ended on
+that limit; the effort A/B lost two sessions in a row this way). Three layers now stop that:
+
+1. **Per command** (`bash-timeout.ts`): every bash call without its own timeout gets 600 s. Pi kills the command's
+   process tree and returns the output so far with "Command timed out after 600 seconds", so the agent sees where it
+   hung and fixes it in the same session. A call can ask for longer.
+2. **Per session** (driver watchdog): a session whose output has not grown for 15 minutes (`STALL_KILL`) is stopped,
+   together with every process it started (Pi runs commands detached, in their own process groups). A running call
+   that asked for a longer timeout gets that long plus a minute. The driver writes a note into the task's hand-over
+   naming the command that hung and how to find the hang, so the next session starts there.
+3. **Driver test runs**: capped at 15 minutes, and a suite that timed out is reported as a hang instead of being
+   rerun as a possible flake.
+
 ### Tools the agent has
 
 - Read, edit, write, bash (Pi built-ins).
@@ -79,10 +95,12 @@ What the human types in `agent-watch` goes to `.agent/inbox/`. During a session 
 
 ### Asking the human
 
-The agent files a request with `ask_human`; the human gets a content-free phone ping and answers on the VM with `agent-talk`.
+The agent files a request with `ask_human`; the human reads it in the telecloak desktop app (it arrives on the phone as encrypted Telegram text) and answers there, or on the VM with `agent-talk`.
 
-- **The request stays in the lab.** It is written to `.agent/asks/<n>.md` in the project (terminal control characters and bidi overrides stripped, since the human reads it in a terminal). Only a fixed Telegram text leaves: "help i need your attention".
-- **The doorbell cannot be made to say anything else.** The VM does not hold the bot token: it triggers the AI box over SSH with a key whose forced command is the doorbell script (`server/doorbell/`), from the VM's address only, no PTY, no forwarding. Arguments are ignored, so even an agent that is root on its VM, or one steered by a web page it read, can ring the bell but cannot choose the words or send a link. Rate-limited on the AI box (one ring per 10 min, 24 a day).
+- **The request is filed in the project** as `.agent/asks/<n>.md` (terminal control characters and bidi overrides stripped, since the human may read it in a terminal), and its text goes to the human through `ring-doorbell --ask <n>`.
+- **The agent never touches crypto (telecloak).** The VM holds neither the bot token nor the key: it hands the text to the AI box over SSH with a key whose forced command is the relay (`server/doorbell/`), from the VM's address only, no PTY, no forwarding. The relay encrypts it (AES-256-GCM with a pre-shared key, a separate key per direction) and sends it; Telegram sees only `tc1.` ciphertext. Without a key on the AI box only the fixed "help i need your attention" leaves. Rate-limited on the AI box (20 messages an hour, 100 a day; a reminder ping within 10 min of the last is not re-sent).
+- **The human's side comes back the same way.** The `telecloak-pull` service on the VM long-polls the relay; the AI box accepts only messages from the human's own account that decrypt with the human-to-bot key, are at most a day old and not replays. An **answer** marks the request answered exactly as `agent-talk` does; a **message** goes to `.agent/inbox/` like typing in `agent-watch`; **start / stop / stop now / status** run `agent-start`, `agent-stop` and a short status. Each result is sent back to the app.
+- **What this gives up:** before telecloak the agent could only ring a fixed bell; now it chooses the words the human reads, so a prompt-injected agent could show a convincing malicious command. The app shows plain text only (no links, control and bidi characters stripped); the rule below matters more than before.
 - **Blocking means the task waits, not the loop** (changed 2026-09-29 after a night where the loop sat idle, then exited, while other work was possible). A blocking request makes only its own task wait: the loop works on other tasks meanwhile (the prompt lists the waiting ones) and comes back to that task first once it is answered. Tasks the agent sets to `blocked` while a request is open are recorded as waiting on it and resume with it. Only when nothing else can be worked on does the loop wait; it never exits with a request open, a message typed in `agent-watch` also ends the wait, and the doorbell rings when a wait starts and every `ASK_REMIND_HOURS` (6) after.
 - **Answering.** `agent-talk` (no argument: every project with open requests) shows each request and offers: talk (a live Pi session in the project with a fresh agent that reads the request first; while it runs `.agent/TALK` holds the loop, and a running session is waited for), a short typed reply, or skip. Answering marks the request `answered`.
 - **Delivery.** An answered request's task goes next; its session's prompt points at the answer, then the driver marks the request `closed`, so an answer reaches exactly one session. A task that was `blocked` or already `done` is set back to `in-progress` for it. The ledger counts `asks_filed` per session.
@@ -122,8 +140,10 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 | 09-28 | "Check facts by running code instead of reasoning about them" | The model spent thousands of thinking tokens on arithmetic a one-line script answers |
 | 09-28 | "Things noticed outside the task become new tasks" | Its logs show it notices problems and leaves them as "out of scope" |
 | 09-28 | Keep only the 6 newest images in each model request (`image-budget.ts`); log sessions that end on a server error | The server accepts at most 8 images per request and every earlier turn is resent: sessions that checked their work with 9+ screenshots died on HTTP 400 with no hand-over (found by the hand-over A/B) |
+| 09-30 | Default command timeout, session stall watchdog, no rerun of a timed-out test suite | A hung test cost 45 minutes per session, repeatedly (see Hangs) |
 
-**Decided against (do not re-propose):** lowering thinking effort from xhigh; lowering the 16k per-turn thinking cap (it fires in ~9% of sessions and the model recovers well); a same-model reviewer agent (it shares the model's blind spots, and done claims are already honest); RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for their own sake; locking down the VM's internet access.
+**Decided against (do not re-propose):** lowering thinking effort from xhigh (reopened by the human on 2026-09-29
+for measurement: `analysis/ab-effort/`, `analysis/ab-effort2/`); lowering the 16k per-turn thinking cap (it fires in ~9% of sessions and the model recovers well); a same-model reviewer agent (it shares the model's blind spots, and done claims are already honest); RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for their own sake; locking down the VM's internet access.
 
 ## A/B test: hand-over notes in the task file
 
@@ -193,6 +213,35 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 - **Conclusion: one agent per GPU.** More agents need more cards; two per card is not worth it with this model and config.
 - The first attempt at this test exposed a driver bug that would also have broken the two-agent design: the TUI done-signal (`tmux wait-for agent-done-N`) was shared between loops on the same iteration number, so when either agent finished, both sessions ended. Fixed: the signal is per project.
 
+## Experiment: thinking effort on the real workflow (A/B v2, running from 2026-09-30)
+
+The first effort A/B (`analysis/ab-effort/`) measured one coding task with one hidden grader, and that grader turned
+out to score a spec contradiction instead of the code: the arms that noticed the contradiction were marked as
+failures. Re-graded with the end-of-stream flush moved late enough for either reading (2026-09-30): all three xhigh
+arms and two of three medium arms produce exactly canon's windows (the third medium arm has a real windowing bug,
+279/300), and only two xhigh arms handle an event that arrives late into a short window (the spec's flush rule and its
+"exactly canon" rule disagree there, and those arms chose canon). Medium used fewer tokens (27-44k vs 47-85k), and
+one xhigh arm lost 90 minutes to a test that hung (a harness gap, fixed since). Three runs per arm decide nothing.
+It also only asked "can it write this function". The human uses the model as a multi-day project worker,
+so v2 (`analysis/ab-effort2/`) measures the parts of that job separately, at `THINKING=xhigh` vs `medium`, with
+production settings otherwise:
+
+| What | How it is measured |
+|---|---|
+| Spec reading | Six one-task probes: four specs with one planted flaw each (a contradiction, missing information, two valid readings, a wrong file/function name) and two clean controls. Two more flaws are planted in the project's GOAL.md. A blind Claude judge grades whether the agent noticed each flaw and how it handled it (asked, documented an assumption, proposed a change, silent), and whether its other concerns were legitimate. The controls give the false-alarm rate. |
+| Correctness | Hidden checks per probe and a hidden end-to-end suite for the project (fixed cases, 40 random scenarios against a reference implementation, gzip/multi-file/garbage input, output format, a 500k-line timing case). Each planted flaw is scored in its own category, and any behaviour that depends on how a flaw was resolved is removed from the core categories, so resolving a flaw one way never changes the core score (the v1 lesson). |
+| Code quality | Blind Claude judge (rubric 1-5 on correctness risk, readability, design, tests, robustness, simplicity; project runs also pairwise, both orders), mutation score of the agent's own tests (small bugs planted one at a time: how many its tests catch), ruff issues per 100 lines. |
+| Multi-step project work | A security CLI (SSH brute force / spraying / login after failures, firewall port scans; JSON-lines detections) built from a GOAL.md through the whole loop: planning, tasks, goal checks. Wall time, sessions, tokens and thinking share, rejected done claims, stalls, tasks the agent added, requests to the human. |
+
+Design details: 4 repetitions per probe per arm and 3 project runs per arm, arms alternated (ABBA) against drift;
+each run starts only after the model server has been idle for a minute, and vLLM load is sampled every 20 s so any
+overlap with other work shows up. Requests to the human are answered by an auto-responder from the run's answer key
+(the local model, thinking off, classifies which planted flaw a request is about; anything else gets "choose, write
+the assumption down"); the doorbell is faked so no messages go out. The judge is headless `claude -p` with its own
+system prompt, no tools and no user settings, and sees anonymous packets with effort labels scrubbed. Answer keys,
+hidden checks and the project GOAL.md stay unpublished (`analysis/ab-effort2/hidden/`, gitignored) until the runs are
+finished, because the agent can search the web. Results will be added here.
+
 ## Planned: two agents on one project (when a second 24 GB GPU arrives)
 
 - One model copy per card (ports 8080 and 8081), 4-bit, MTP, 150k window each. First a ~30 minute A/B: two separate servers with two agents, one split server with two agents, one split server with one agent.
@@ -223,8 +272,10 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 | New project | Make a folder in the projects directory, put a `GOAL.md` in it (what you want, in your own words), `agent-start <name>`. The agent plans it (`PLAN.md`, tasks), builds it, and checks the result against `GOAL.md` before the loop stops. Edit `GOAL.md` any time: the next session re-plans |
 | Veto a task the agent added | Set its first line to `Status: dropped` |
 | Change a criterion the agent proposed changing | Edit the task file yourself (only the human changes the human's criteria) |
-| Answer the agent's requests (after a "help i need your attention" ping) | `agent-talk` (all projects) or `agent-talk <project>`: talk live with an agent about it, or type a short reply |
-| Ring the doorbell by hand (test) | `ring-doorbell` |
+| Answer the agent's requests | In the telecloak app (lab bot chat): the request is pre-selected under "Send as", type the answer, Cmd+Enter. Or on the VM: `agent-talk` (all projects) or `agent-talk <project>`: talk live with an agent about it, or type a short reply |
+| Message, start, stop or check a project from anywhere | telecloak app, lab bot chat: pick the project, then type a message or press Start / Stop / Stop now / Status |
+| Ring the doorbell by hand (test) | `ring-doorbell` in a project folder |
+| Set up telecloak (once) | App: Add chat > the bot's @username > Generate new key > Copy key. Then `ssh -t <ai box> sudo telecloak-setup` and paste it; the app shows the test ping and the same key fingerprint |
 | Where things are | Ledger `.agent/iterations.jsonl`, loop log `.agent/loop.log`, sessions `.agent/sessions/`, driver reports `.agent/reports/`, project template `~/.agent-kit/template` |
 
 ## Lessons added since the first write-up
