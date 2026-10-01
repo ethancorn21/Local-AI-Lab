@@ -26,13 +26,43 @@ The ONLY memory you have is these files and git history. If you do not write it 
 3. **Do ONE step**: the smallest next step that moves the task forward. If the task turns out too big to finish in
    a few sessions, splitting it (see Tasks) is the step. Check facts by running code instead of reasoning about
    them (a value, what a function returns, how a float rounds, what a regex matches): `node -e`, `python3 -c` or a
-   quick test answers in seconds what working it out in your head takes minutes to guess.
+   quick test answers in seconds what working it out in your head takes minutes to guess. If the step changes
+   existing code, follow Changing existing code below.
 4. **Verify.** Run the tests (`npm test` or the project's test command). The moment an approach fails, append it to
    `DECISIONS.md`: if the session is cut short, anything not written down is lost.
 5. **Write memory.** Rewrite your task's `## Hand-over`. Append a `DECISIONS.md` entry for each choice you made and
    each thing that failed.
 6. **Commit.** `git add -A && git commit -m "<task id>: <what changed> - <why>"`.
 7. **Stop.** The next agent continues from your notes.
+
+## Writing code that stays easy to change
+
+The next agent has to change what you write. Keep it easy:
+
+- **One job per function and per file.** If you cannot name what a function does without "and", split it by job.
+  Length is the warning sign: a function over about 50 lines is almost always doing several jobs.
+- **One place for each piece of knowledge.** Before copying code or a rule, use or extract the one that exists.
+  Only merge code that would change for the same reason: two things that merely look alike stay separate.
+- **Tests check behavior, not internals.** Test what code returns or does, not its constants or private helpers,
+  so it can be reshaped without rewriting tests.
+- **Comments say why the code is the way it is.** Task history belongs in commits and `DECISIONS.md`.
+
+### Changing existing code: refactor first, then add
+
+Never bolt new code onto code that was not built for it. Refactor first when ANY of these is true:
+
+- the function you are changing is over 50 lines, or would be after your change;
+- your change adds a flag or a branch for one special case;
+- you would copy code that already exists.
+
+Then, in this order:
+
+1. **Refactor** the code your change goes into (split a function by job, extract a helper or module, rename) without
+   changing what it does. Your new feature is not part of this.
+2. **Prove nothing changed.** Run the tests: the same tests pass as before, and no assertion was edited or deleted.
+   If that code has no test, first write one for what it does now and see it pass, then refactor.
+3. **Commit the refactor alone**: `<task id>: refactor <what> - to make room for <change>`. That can be the whole step.
+4. **Add your change** to the new shape, in its own commit.
 
 ## Tasks: you decide how the work gets done
 
@@ -45,6 +75,7 @@ The ONLY memory you have is these files and git history. If you do not write it 
 - **Add** a task for work you discover: a bug, test tooling, a refactor, or a feature the project needs. Whenever
   you notice something worth fixing that is not part of your task (a misleading comment, a stale test, a file that
   has grown hard to work with), that is exactly what a new task is for: don't fix it in passing, write the task.
+  Refactoring the code your own change goes into is part of your task (see Changing existing code).
   Top-level tasks take the next free number (`tasks/034-<name>.md`); the human reviews them.
 - **Tasks you did not create belong to the human**: their goal and acceptance boxes define done. Do not edit them
   (writing their `## Hand-over` section is expected). If one is wrong or impossible, add a `## Proposed changes`
