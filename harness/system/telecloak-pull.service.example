@@ -1,0 +1,21 @@
+# /etc/systemd/system/telecloak-pull.service on the harness VM: the human's telecloak messages into the lab
+# (harness/tools/telecloak-pull). Install: copy to ~/bin of <agent-user>, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now telecloak-pull
+# KillMode=process: loops started from Telegram (agent-start) run inside this service's cgroup; a restart of the
+# service must not take them down with it.
+[Unit]
+Description=telecloak-pull: the human's Telegram messages into the agent lab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<agent-user>
+WorkingDirectory=~
+ExecStart=/home/<agent-user>/bin/telecloak-pull
+Environment=LANG=C.UTF-8
+Restart=always
+RestartSec=10
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

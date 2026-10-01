@@ -1,0 +1,40 @@
+#!/usr/bin/python3 -I
+"""telecloak-setup: give the lab's Telegram relay (the doorbell) its telecloak key, then send an encrypted test ping.
+Run it yourself in your own terminal (ssh -t <ai box> sudo telecloak-setup): the key is read with echo off, so it never
+appears on screen, in shell history or in an AI transcript.
+Get the key from the telecloak app first: Add chat > the bot's @username > Generate new key > Copy key. Both sides print the same
+fingerprint when the keys match. Needs doorbell-setup to have run (the bot token and your chat id).
+"""
+import getpass
+import grp
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/local/lib/telecloak")
+from telecloak_core import TelecloakError, fingerprint, load_psk  # noqa: E402
+
+KEY = "/etc/doorbell/telecloak.key"
+if os.geteuid() != 0:
+    sys.exit("run with sudo")
+if not os.path.exists("/etc/doorbell/telegram.env"):
+    sys.exit("Run doorbell-setup first (the bot token and your chat id).")
+key = getpass.getpass("telecloak key for the lab bot (paste it; typing is hidden): ").strip()
+try:
+    psk = load_psk(key)
+except TelecloakError as e:
+    sys.exit(f"Not saved: {e}")
+print(f"Key fingerprint: {fingerprint(psk)}  (the telecloak app shows the same one for the lab bot chat)")
+tmp = KEY + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+os.fchown(fd, 0, grp.getgrnam("doorbell").gr_gid)
+with os.fdopen(fd, "w") as f:
+    f.write(key + "\n")
+os.replace(tmp, KEY)
+try:
+    os.remove("/var/lib/doorbell/rings.json")   # so the test ping is not held back by the ring gap
+except FileNotFoundError:
+    pass
+print("Saved. Test ping (encrypted; telecloak shows it in the lab bot chat):")
+env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+sys.exit(subprocess.run(["sudo", "-u", "doorbell", "/usr/local/bin/doorbell"], env=env).returncode)

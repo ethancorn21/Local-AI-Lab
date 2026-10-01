@@ -1,37 +1,328 @@
-#!/bin/sh
-# doorbell: send the lab's human one fixed Telegram message, "help i need your attention".
-# It is the forced command of the doorbell account's only SSH key, which the agents' VM uses: the caller cannot pass
-# text (arguments and SSH_ORIGINAL_COMMAND are ignored), so an agent can ring the bell but never choose the words, and
-# nothing about its work leaves the lab. The bot token lives here, out of the agents' reach (they are root-equivalent
-# on their own VM).
-# Rate limits: one ring per MIN_GAP seconds (a ring inside the gap still succeeds: the bell is already ringing) and at
-# most MAX_PER_DAY in 24 hours. Credentials: /etc/doorbell/telegram.env (BOT_TOKEN, CHAT_ID), written by doorbell-setup.
-set -u
-CONF=/etc/doorbell/telegram.env
-STATE=/var/lib/doorbell/rings
-MIN_GAP=600
-MAX_PER_DAY=24
-TEXT="help i need your attention"
+#!/usr/bin/python3 -I
+"""doorbell: the lab's Telegram relay (telecloak). The forced command of the doorbell account's only SSH key, which the
+agents' VM uses; SSH_ORIGINAL_COMMAND picks the action:
+  send        stdin: one JSON message {"kind": ask|ring|reply|info, "project", "ask", "asks", "answered", "text"}.
+              Encrypted here and sent to the human.
+  fetch       the human's messages to the bot (sent with the telecloak app), checked and decrypted here, printed as
+              JSON lines. Each stays queued until acked, so nothing is lost if the VM drops the connection.
+  ack <id>... drop fetched messages the VM has handled
+  anything else, or nothing: ring - the fixed ping ("help i need your attention"), as before telecloak.
 
-exec 9>>/var/lib/doorbell/lock
-flock -w 30 9 || { echo "doorbell: busy"; exit 1; }
-token=$(sed -n 's/^BOT_TOKEN=//p' "$CONF" 2>/dev/null)
-chat=$(sed -n 's/^CHAT_ID=//p' "$CONF" 2>/dev/null)
-if [ -z "$token" ] || [ -z "$chat" ]; then
-  logger -t doorbell "ring refused: not configured"; echo "doorbell: not configured (run doorbell-setup on the AI box)"; exit 2
-fi
-now=$(date +%s)
-last=$(tail -n 1 "$STATE" 2>/dev/null); last=${last:-0}
-if [ $((now - last)) -lt "$MIN_GAP" ]; then echo "doorbell: rang $(( (now - last) / 60 )) min ago, not again yet"; exit 0; fi
-if [ "$(awk -v t=$((now - 86400)) '$1 > t' "$STATE" 2>/dev/null | wc -l)" -ge "$MAX_PER_DAY" ]; then
-  logger -t doorbell "ring refused: daily limit"; echo "doorbell: daily limit reached"; exit 3
-fi
-# The token goes to curl on stdin, not on its command line (every user on this box can read command lines in ps).
-code=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" |
-  curl -sS -m 20 -o /dev/null -w '%{http_code}' -K - --data-urlencode "chat_id=$chat" --data-urlencode "text=$TEXT")
-if [ "$code" = 200 ]; then
-  echo "$now" >> "$STATE"; tail -n 200 "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
-  logger -t doorbell "rang"; echo "doorbell: rang"
-else
-  logger -t doorbell "ring failed: HTTP $code"; echo "doorbell: Telegram error (HTTP $code)"; exit 1
-fi
+Why here: the bot token and the telecloak key stay on the AI box, out of the agents' reach (they are root-equivalent on
+their VM). The VM chooses what the human is told, never how it is encrypted, and only ever sees what the human sent.
+Telegram sees only ciphertext ("tc1....", see telecloak_core.py).
+- Without a key (/etc/doorbell/telecloak.key, from telecloak-setup) only the fixed ping leaves, never message text.
+- Inbound is accepted only from the human's own account (CHAT_ID) in the private chat, only if it decrypts with the
+  human-to-bot key (so the key alone is not enough, and neither is the Telegram account alone), is at most a day old,
+  was not seen before (replays), and is a well-formed answer, message or command.
+- Anything rejected is logged (syslog, tag doorbell) without its content; the human is told once per fetch.
+- Rate limits on everything sent: PER_HOUR and PER_DAY; a ring within RING_GAP of the last is not re-sent.
+Credentials: /etc/doorbell/telegram.env (BOT_TOKEN, CHAT_ID), written by doorbell-setup. State: /var/lib/doorbell.
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+import syslog
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, "/usr/local/lib/telecloak")
+from telecloak_core import Channel, Reassembler, Seen, TelecloakError, is_wire, load_psk  # noqa: E402
+
+CONF = "/etc/doorbell/telegram.env"
+KEY = "/etc/doorbell/telecloak.key"
+STATE = "/var/lib/doorbell"
+FIXED = "help i need your attention"
+RING_GAP = 600
+PER_HOUR, PER_DAY = 20, 100
+MAX_TEXT = 8000
+MAX_AGE, MAX_AHEAD = 86400, 300       # inbound: refuse older than a day or more than 5 min in the future
+POLL = 20                             # seconds a fetch waits for new messages (Telegram long polling)
+PROJECT = re.compile(r"[A-Za-z0-9._-]{1,64}")
+ASK = re.compile(r"\d{1,4}")
+MSG_ID = re.compile(r"[0-9a-f]{16}")
+COMMANDS = {"start", "stop", "stop-now", "status"}
+UNSAFE = re.compile("[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]")
+
+
+class Refused(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def log(msg):
+    syslog.openlog("doorbell")
+    syslog.syslog(msg)
+
+
+def clean(s, limit=MAX_TEXT):
+    s = UNSAFE.sub("", str(s)).strip()
+    return s if len(s) <= limit else s[:limit] + f"\n[cut at {limit} characters]"
+
+
+def conf():
+    vals = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                vals[k] = v
+    except OSError:
+        pass
+    if not vals.get("BOT_TOKEN") or not vals.get("CHAT_ID"):
+        log("refused: not configured")
+        raise Refused("not configured (run doorbell-setup on the AI box)", 2)
+    return vals["BOT_TOKEN"], int(vals["CHAT_ID"])
+
+
+def channel(token, chat):
+    """The bot's side of the telecloak conversation with the human, or None without a key."""
+    try:
+        with open(KEY) as f:
+            psk = load_psk(f.read())
+    except FileNotFoundError:
+        return None
+    except (OSError, TelecloakError) as e:
+        log(f"telecloak key unusable: {e}")
+        return None
+    return Channel(psk, int(token.split(":")[0]), chat)   # a bot's user id is the number before the ':'
+
+
+def telegram(token, method, params, timeout=30):
+    # The token is in the URL: never let the URL reach an error message or a log.
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
+                                 data=urllib.parse.urlencode(params).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.load(e)
+        except Exception:  # noqa: BLE001
+            res = {"ok": False, "description": f"HTTP {e.code}"}
+    except (urllib.error.URLError, OSError) as e:
+        raise Refused(f"Telegram unreachable ({type(e).__name__})") from None
+    if not res.get("ok"):
+        raise Refused(f"Telegram error: {str(res.get('description', '?'))[:200]}")
+    return res["result"]
+
+
+class Lock:
+    def __init__(self, name, wait=60):
+        self.path, self.wait = f"{STATE}/{name}.lock", wait
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.time() - t0 > self.wait:
+                    raise Refused("busy") from None
+                time.sleep(0.5)
+
+    def __exit__(self, *_):
+        os.close(self.fd)
+
+
+def load(name, default):
+    try:
+        with open(f"{STATE}/{name}") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(name, obj):
+    tmp = f"{STATE}/{name}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, f"{STATE}/{name}")
+
+
+# ---- outbound ---------------------------------------------------------------------------------------------------------
+
+def outbound(msg):
+    """Keep only well-formed fields of a message from the VM."""
+    if not isinstance(msg, dict) or msg.get("kind") not in {"ask", "ring", "reply", "info"}:
+        raise Refused("send: need a JSON object with kind ask, ring, reply or info")
+    body = {"kind": msg["kind"]}
+    if isinstance(msg.get("project"), str) and PROJECT.fullmatch(msg["project"]):
+        body["project"] = msg["project"]
+    if isinstance(msg.get("ask"), str) and ASK.fullmatch(msg["ask"]):
+        body["ask"] = msg["ask"]
+    for k in ("asks", "answered"):
+        if isinstance(msg.get(k), list):
+            body[k] = [a for a in msg[k] if isinstance(a, str) and ASK.fullmatch(a)][:50]
+    body["text"] = clean(msg.get("text", "")) or (FIXED if body["kind"] == "ring" else "")
+    return body
+
+
+def deliver(token, chat, body):
+    """Encrypt and send one message to the human, within the rate limits. Returns a one-line result."""
+    ch = channel(token, chat)
+    if ch is None:
+        body = {"kind": "ring"}           # no key: only the fixed ping may leave, never message text
+    now = time.time()
+    with Lock("send"):
+        rings = load("rings.json", [])
+        if body["kind"] == "ring" and rings and now - rings[-1] < RING_GAP:
+            return f"rang {int((now - rings[-1]) // 60)} min ago, not again yet"
+        sent = [t for t in load("sent.json", []) if now - t < 86400]
+        if sum(now - t < 3600 for t in sent) >= PER_HOUR or len(sent) >= PER_DAY:
+            log("refused: rate limit")
+            raise Refused(f"rate limit reached ({PER_HOUR} an hour, {PER_DAY} a day)", 3)
+        parts = [FIXED] if ch is None else ch.seal(body).parts
+        for p in parts:
+            telegram(token, "sendMessage", {"chat_id": chat, "text": p})
+        save("sent.json", sent + [now])
+        if body["kind"] == "ring":
+            save("rings.json", (rings + [now])[-200:])
+    log(f"sent kind={body['kind']} parts={len(parts)}{'' if ch else ' (no key: fixed ping, unencrypted)'}")
+    return "rang" if body["kind"] == "ring" else f"sent ({len(parts)} part{'s' if len(parts) > 1 else ''})"
+
+
+def cmd_send(token, chat):
+    raw = sys.stdin.buffer.read(64 * 1024)
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        raise Refused("send: stdin must be one JSON object") from None
+    return deliver(token, chat, outbound(msg))
+
+
+# ---- inbound ----------------------------------------------------------------------------------------------------------
+
+def inbound(body):
+    """Check a decrypted message from the human; returns the fields the VM gets, or raises Refused."""
+    kind = body.get("kind")
+    project = body.get("project")
+    out = {"kind": kind}
+    if project is not None:
+        if not isinstance(project, str) or not PROJECT.fullmatch(project):
+            raise Refused("bad project name")
+        out["project"] = project
+    if kind in ("answer", "message"):
+        if "project" not in out:
+            raise Refused("no project")
+        text = clean(body.get("text", ""))
+        if not text:
+            raise Refused("empty text")
+        out["text"] = text
+        if kind == "answer":
+            if not isinstance(body.get("ask"), str) or not ASK.fullmatch(body["ask"]):
+                raise Refused("bad request number")
+            out["ask"] = body["ask"]
+    elif kind == "command":
+        if body.get("command") not in COMMANDS:
+            raise Refused("unknown command")
+        out["command"] = body["command"]
+        if out["command"] != "status" and "project" not in out:
+            raise Refused("no project")
+    else:
+        raise Refused("unknown kind")
+    return out
+
+
+def cmd_fetch(token, chat):
+    ch = channel(token, chat)
+    if ch is None:
+        raise Refused("no telecloak key (run telecloak-setup on the AI box)", 2)
+    inbox = f"{STATE}/inbound"
+    os.makedirs(inbox, mode=0o700, exist_ok=True)
+    notice, error = None, None
+    with Lock("fetch"):
+        st = load("fetch.json", {"offset": 0, "seen": {}, "parts": {}})
+        try:
+            updates = telegram(token, "getUpdates", {"offset": st["offset"], "timeout": POLL,
+                                                     "allowed_updates": json.dumps(["message"])}, timeout=POLL + 15)
+        except Refused as e:
+            updates, error = [], str(e)
+        seen = Seen(st["seen"], keep=2 * MAX_AGE)
+        parts = Reassembler(st["parts"])
+        for u in updates:
+            st["offset"] = max(st["offset"], u["update_id"] + 1)
+            m = u.get("message") or {}
+            if not (m.get("chat", {}).get("type") == "private" and m["chat"].get("id") == chat
+                    and m.get("from", {}).get("id") == chat):
+                log(f"ignored update {u['update_id']}: not from the lab's human")
+                continue
+            try:
+                text = m.get("text", "")
+                if not is_wire(text):
+                    raise Refused("not encrypted")
+                msg = parts.add(ch.open(text))
+                if msg is None:
+                    continue              # more parts to come
+                now = time.time()
+                if not now - MAX_AGE <= msg.ts <= now + MAX_AHEAD:
+                    raise Refused("too old, or dated in the future")
+                if not seen.add(msg.msg_id):
+                    raise Refused("already received (replay)")
+                body = inbound(msg.body)
+            except (Refused, TelecloakError) as e:
+                log(f"rejected update {u['update_id']}: {e}")
+                notice = notice or str(e)
+                continue
+            body.update(id=msg.msg_id, ts=msg.ts)
+            save(f"inbound/{msg.msg_id}", body)
+            log(f"accepted {msg.msg_id} kind={body['kind']}")
+        save("fetch.json", st)
+        pending = sorted(os.listdir(inbox), key=lambda f: os.stat(f"{inbox}/{f}").st_mtime)
+        for f in pending:
+            if MSG_ID.fullmatch(f):
+                print(json.dumps(load(f"inbound/{f}", {})))
+    if notice:
+        try:
+            deliver(token, chat, {"kind": "info", "text": f"The lab ignored a message from you: {notice}. It acts "
+                                                          "only on messages sent with telecloak."})
+        except Refused:
+            pass
+    if error:
+        raise Refused(error)
+    return None
+
+
+def cmd_ack(ids):
+    n = 0
+    with Lock("fetch"):
+        for i in ids:
+            if MSG_ID.fullmatch(i):
+                try:
+                    os.remove(f"{STATE}/inbound/{i}")
+                    n += 1
+                except FileNotFoundError:
+                    pass
+    return f"acked {n}"
+
+
+def main():
+    cmd = os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
+    try:
+        token, chat = conf()
+        if cmd[:1] == ["send"]:
+            result = cmd_send(token, chat)
+        elif cmd[:1] == ["fetch"]:
+            result = cmd_fetch(token, chat)
+        elif cmd[:1] == ["ack"]:
+            result = cmd_ack(cmd[1:200])
+        else:
+            result = deliver(token, chat, {"kind": "ring", "text": FIXED})
+    except Refused as e:
+        print(f"doorbell: {e}")
+        return e.code
+    if result:
+        print(f"doorbell: {result}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

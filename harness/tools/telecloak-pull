@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""telecloak-pull: carry the human's Telegram messages (sent with the telecloak app) into the lab. Runs as a service
+under the agent account (harness/system/telecloak-pull.service.example).
+
+It loops on `ssh doorbell fetch`: the AI box long-polls Telegram, checks and decrypts each message there (this VM never
+holds the key or the bot token) and returns the accepted ones. Each is acted on, then acked (`ssh doorbell ack <id>`):
+  answer  <project> <n> <text>   answers request n, like agent-talk's typed reply: its task goes next
+  message <project> <text>       .agent/inbox/, like typing in agent-watch: the running agent gets it after its
+                                 current step, otherwise the next session starts with it
+  command start|stop|stop-now [project], status [project]
+                                 agent-start / agent-stop / agent-stop --now / a short status
+The result goes back to the human through the relay. A message id handled once is never handled again (the relay
+re-sends anything not acked). Message text is never logged.
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS = HOME / "projects"
+BIN = HOME / "bin"
+STATE = HOME / ".local" / "state" / "telecloak-pull"
+PROJECT = re.compile(r"[A-Za-z0-9._-]{1,64}")
+ASK = re.compile(r"\d{1,4}")
+os.environ["PATH"] = f"{BIN}:{HOME / '.npm-global' / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def ssh(args, stdin=None, timeout=120):
+    return subprocess.run(["ssh", "-T", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "doorbell", *args],
+                          input=stdin, capture_output=True, text=True, timeout=timeout)
+
+
+def reply(project, text, **extra):
+    body = {"kind": "reply", "text": text, **extra}
+    if project:
+        body["project"] = project
+    try:
+        r = ssh(["send"], json.dumps(body))
+        if r.returncode:
+            log(f"reply not sent: {(r.stdout or r.stderr).strip()[-200:]}")
+    except subprocess.TimeoutExpired:
+        log("reply not sent: no answer from the AI box")
+
+
+def project_dir(name):
+    if isinstance(name, str) and PROJECT.fullmatch(name) and name not in (".", ".."):
+        p = PROJECTS / name
+        if p.is_dir():
+            return p
+    return None
+
+
+def field(text, name):
+    m = re.search(rf"(?m)^{name}: (.*)$", text)
+    return m.group(1).strip() if m else ""
+
+
+def write_atomic(path: Path, text: str):
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def loop_running(p: Path):
+    try:
+        pid = int((p / ".agent" / "loop.pid").read_text())
+        return "agent-loop" in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except (OSError, ValueError):
+        return False
+
+
+def to_inbox(p: Path, text: str):
+    d = p / ".agent" / "inbox"
+    d.mkdir(parents=True, exist_ok=True)
+    ms = int(time.time() * 1000)
+    while (d / f"{ms}.md").exists():
+        ms += 1
+    write_atomic(d / f"{ms}.md", text + "\n")
+
+
+def message(name, p, text):
+    to_inbox(p, text)
+    if loop_running(p):
+        return f"Delivered to {name}: the agent gets it after its current step."
+    return f"Delivered to {name}: its loop is not running, so the next session starts with it (Start to run it)."
+
+
+def answer(name, p, n, text):
+    f = p / ".agent" / "asks" / f"{n}.md"
+    if not f.is_file():
+        return f"{name} has no request {n}; nothing changed.", []
+    content = f.read_text()
+    status = field(content, "status")
+    if status != "open":
+        to_inbox(p, f"(Answer to request {n}, which was already {status or 'closed'})\n{text}")
+        return f"Request {n} in {name} was already {status or 'closed'}: sent your answer to the agent as a message.", []
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    content = re.sub(r"(?m)^status: open$", "status: answered", content, count=1)
+    write_atomic(f, content.rstrip("\n") + f"\n\n## Answer ({stamp}, telegram)\n{text}\n")
+    return f"Request {n} in {name} answered: its task goes next.", [n]
+
+
+def open_asks(p: Path):
+    found = []
+    for f in sorted((p / ".agent" / "asks").glob("[0-9]*.md")):
+        if field(f.read_text(errors="replace"), "status") == "open":
+            found.append(f.stem)
+    return found
+
+
+def current_task(p: Path):
+    for f in sorted((p / "tasks").glob("[0-9]*.md")):
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        if lines and re.match(r"(?i)status:\s*in-progress", lines[0]):
+            title = next((l.lstrip("# ").strip() for l in lines[1:6] if l.startswith("#")), f.stem)
+            return title[:80]
+    return None
+
+
+def status_line(name, p: Path):
+    run = loop_running(p)
+    s = f"{name}: {'running' if run else 'stopped'}"
+    if run and (p / ".agent" / "PAUSE").exists():
+        s += " (stops after this session)"
+    task = current_task(p)
+    if task:
+        s += f"; task {task}"
+    asks = open_asks(p)
+    if asks:
+        s += f"; waiting on request(s) {', '.join(asks)}"
+    return s
+
+
+def status(name):
+    if name:
+        p = project_dir(name)
+        if not p:
+            return f"No project {name} on the lab VM."
+        s = status_line(name, p)
+        try:
+            last = (p / ".agent" / "loop.log").read_text(errors="replace").strip().splitlines()[-1]
+            s += f"\nlast log line: {last[:200]}"
+        except (OSError, IndexError):
+            pass
+        return s
+    lines = [status_line(p.name, p) for p in sorted(PROJECTS.iterdir()) if (p / ".agent").is_dir()]
+    return "\n".join(lines) or "No projects."
+
+
+def command(cmd, name):
+    if cmd == "status":
+        return status(name)
+    p = project_dir(name)
+    if not p:
+        return f"No project {name} on the lab VM."
+    argv = {"start": ["agent-start", name], "stop": ["agent-stop", name], "stop-now": ["agent-stop", name, "--now"]}[cmd]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        out = (r.stdout + r.stderr).strip().splitlines()
+        return f"{name}: " + (" ".join(out[:3]) if out else f"{argv[0]} exit status {r.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"{name}: {argv[0]} failed ({type(e).__name__})"
+
+
+def handle(m):
+    kind, name = m.get("kind"), m.get("project")
+    if kind == "command":
+        log(f"command {m.get('command')} {name or ''}".rstrip())
+        reply(name, command(m.get("command"), name))
+        return
+    p = project_dir(name)
+    if not p:
+        reply(name, f"No project {name} on the lab VM; nothing delivered.")
+        return
+    if kind == "answer" and ASK.fullmatch(str(m.get("ask", ""))):
+        text, answered = answer(name, p, m["ask"], m.get("text", ""))
+        log(f"answer {name} request {m['ask']}: {'answered' if answered else 'not open'}")
+        reply(name, text, answered=answered)
+    elif kind == "message":
+        log(f"message {name}")
+        reply(name, message(name, p, m.get("text", "")))
+    else:
+        log(f"ignored kind {kind}")
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    done_file = STATE / "done.json"
+    try:
+        done = json.loads(done_file.read_text())
+    except (OSError, ValueError):
+        done = {}
+    backoff, last_error = 5, None
+    log("telecloak-pull started")
+    while True:
+        t0 = time.time()
+        try:
+            r = ssh(["fetch"], timeout=90)
+        except subprocess.TimeoutExpired:
+            continue
+        msgs, notes = [], []
+        for line in r.stdout.splitlines():
+            if line.startswith("{"):
+                try:
+                    msgs.append(json.loads(line))
+                except ValueError:
+                    pass
+            elif line.strip():
+                notes.append(line.strip())
+        if r.returncode and not msgs:
+            err = (notes or [r.stderr.strip()[-200:] or f"exit status {r.returncode}"])[-1]
+            if err != last_error:
+                log(f"fetch failed: {err} (retrying, at most every minute)")
+                last_error = err
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        if last_error:
+            log("fetch working again")
+        backoff, last_error = 5, None
+        acks = []
+        for m in msgs:
+            mid = str(m.get("id", ""))
+            if not re.fullmatch(r"[0-9a-f]{16}", mid):
+                continue
+            if mid not in done:
+                try:
+                    handle(m)
+                except Exception as e:  # noqa: BLE001 - one bad message must not stop the service
+                    log(f"error handling {mid}: {type(e).__name__}: {e}")
+                    reply(m.get("project"), f"The lab could not handle your {m.get('kind')}: {type(e).__name__}.")
+                done[mid] = time.time()
+                done = {k: v for k, v in done.items() if time.time() - v < 7 * 86400}
+                write_atomic(done_file, json.dumps(done))
+            acks.append(mid)
+        if acks:
+            try:
+                ssh(["ack", *acks])
+            except subprocess.TimeoutExpired:
+                pass
+        if time.time() - t0 < 2:
+            time.sleep(2)   # the relay long-polls; a fast return means nothing to wait on, so don't spin
+
+
+if __name__ == "__main__":
+    sys.exit(main())

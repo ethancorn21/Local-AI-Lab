@@ -3,7 +3,9 @@
 # Run it yourself in your own terminal (ssh -t <ai box> sudo doorbell-setup): the token is read with echo off, so it
 # never appears on screen, in shell history or in an AI transcript.
 # Create the bot first: in Telegram, message @BotFather, send /newbot, pick a name; it replies with the token.
-# The bot only ever sends; nothing reads what others send it, so a stranger who finds it gets no answer.
+# Strangers who find the bot get no answer: the relay (doorbell) acts only on your own account's messages that decrypt
+# with the telecloak key (telecloak-setup, after this). Re-running this while telecloak-pull runs on the VM: stop that
+# service first, or it may take your test message before this script sees it.
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
 read -rsp "Bot token from @BotFather (typing is hidden): " TOKEN; echo

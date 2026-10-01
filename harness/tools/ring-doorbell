@@ -1,6 +1,62 @@
-#!/usr/bin/env bash
-# ring-doorbell: have the AI box send the human the fixed Telegram ping ("help i need your attention").
-# The key behind `Host doorbell` in ~/.ssh/config can only run the doorbell there (a forced command): nothing about the
-# project or the request leaves this VM, and nothing sent from here can change the message. Prints the doorbell's
-# one-line result; the doorbell rate-limits, so ringing often is harmless.
-exec ssh -n -T -o ConnectTimeout=10 doorbell 2>&1
+#!/usr/bin/env python3
+"""ring-doorbell: tell the human something through the AI box's Telegram relay (telecloak).
+  ring-doorbell             ping: this project is waiting for answers to its open requests (the loop, while it waits)
+  ring-doorbell --ask <n>   request <n>, its text on stdin (the ask_human tool)
+The project is the git top level of the current directory. The AI box encrypts the message with a key this VM never
+holds and sends it with a bot token this VM never holds (the key behind `Host doorbell` can only run the relay there,
+a forced command). Without a telecloak key on the AI box only the fixed ping "help i need your attention" leaves.
+Prints the relay's one-line result; the exit status is the relay's (3: rate limit). Ringing often is harmless: a ping
+within 10 minutes of the last one is not re-sent.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def project_root():
+    try:
+        return subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return os.getcwd()
+
+
+def open_asks(root):
+    found = []
+    for f in sorted((Path(root) / ".agent" / "asks").glob("[0-9]*.md")):
+        if "status: open" in f.read_text(errors="replace").splitlines()[:6]:
+            found.append(f.stem)
+    return found
+
+
+def send(body):
+    try:
+        r = subprocess.run(["ssh", "-T", "-o", "ConnectTimeout=10", "doorbell", "send"], input=json.dumps(body),
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return 1, "doorbell: no answer from the AI box"
+    lines = (r.stdout.strip() or r.stderr.strip() or f"ssh exit status {r.returncode}").splitlines()
+    return r.returncode, lines[-1][:200]
+
+
+def main():
+    args = sys.argv[1:]
+    root = project_root()
+    project = os.path.basename(root)
+    if len(args) == 2 and args[0] == "--ask" and re.fullmatch(r"\d{1,4}", args[1]):
+        body = {"kind": "ask", "project": project, "ask": args[1], "text": sys.stdin.read()}
+    elif not args:
+        body = {"kind": "ring", "project": project, "asks": open_asks(root), "text": "waiting for your answer"}
+    else:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    rc, line = send(body)
+    print(line)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
