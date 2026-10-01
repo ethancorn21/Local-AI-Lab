@@ -66,7 +66,8 @@ export default function (pi: ExtensionAPI) {
 		label: "web search",
 		description: "Search the web. Returns up to `limit` results (title, URL, snippet). Use it when the answer is " +
 			"not in the project or the installed packages: an unfamiliar API or error message, a library or browser " +
-			"behaviour, a technique. Then open the most promising official source with web_fetch.",
+			"behaviour, a technique. Then open the most promising official source (docs for the version the project " +
+			"uses) with web_fetch.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query, e.g. an exact error message or 'playwright chromium missing libs ubuntu 24.04'" }),
 			limit: Type.Optional(Type.Number({ description: "Number of results, 1-15 (default 8)" })),

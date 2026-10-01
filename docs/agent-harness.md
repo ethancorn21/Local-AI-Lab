@@ -42,7 +42,7 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 
 | File | Holds |
 |---|---|
-| `PROGRESS.md` | Snapshot of now: current task, state, exact next step (being A/B tested, see below) |
+| `PROGRESS.md` | Generated before every session: the tasks in flight and their hand-overs. The notes themselves live in each task file's `## Hand-over` (adopted after the A/B below); anything the agent writes to PROGRESS.md is moved there |
 | `DECISIONS.md` | The agent's journal: choices, failed attempts and why, blockers, PITFALLs (facts that stay true). Finished tasks' entries move verbatim to `DECISIONS-archive.md`; an index lists one line per archived task |
 | `CODEMAP.md` | Generated before every session from each file's header comment and exports, with line ranges for functions in big files. Architecture rules above the marker line are hand-written |
 | `tasks/*.md` | The queue. Subtasks are `025a-...`, `025b-...`; a task with unfinished subtasks waits for them, then comes back for its own boxes |
@@ -141,6 +141,7 @@ A very good executor and a weak engineer-in-charge. Its code is careful and corr
 | 09-28 | "Things noticed outside the task become new tasks" | Its logs show it notices problems and leaves them as "out of scope" |
 | 09-28 | Keep only the 6 newest images in each model request (`image-budget.ts`); log sessions that end on a server error | The server accepts at most 8 images per request and every earlier turn is resent: sessions that checked their work with 9+ screenshots died on HTTP 400 with no hand-over (found by the hand-over A/B) |
 | 09-30 | Default command timeout, session stall watchdog, no rerun of a timed-out test suite | A hung test cost 45 minutes per session, repeatedly (see Hangs) |
+| 09-30 | AGENTS.md trimmed (105 to 78 lines): one memory-file table that the orient and write steps point to; the context-limit, `ask_human` and web-tool sections cut to what the harness does not already say; PROGRESS.md edits allowed (the driver moves them) | Each cut rule is already delivered where it is used: the CONTEXT LIMIT message, the tool descriptions and results, the untrusted-content banner on web results, CODEMAP's line-range note. One rule per place; removes a contradiction about editing PROGRESS.md |
 
 **Decided against (do not re-propose):** lowering thinking effort from xhigh (reopened by the human on 2026-09-29
 for measurement: `analysis/ab-effort/`, `analysis/ab-effort2/`); lowering the 16k per-turn thinking cap (it fires in ~9% of sessions and the model recovers well); a same-model reviewer agent (it shares the model's blind spots, and done claims are already honest); RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for their own sake; locking down the VM's internet access.
