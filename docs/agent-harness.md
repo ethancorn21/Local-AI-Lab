@@ -214,7 +214,7 @@ Two agents ran the same replay (task 025) at the same time on the one RTX 3090 T
 - **Conclusion: one agent per GPU.** More agents need more cards; two per card is not worth it with this model and config.
 - The first attempt at this test exposed a driver bug that would also have broken the two-agent design: the TUI done-signal (`tmux wait-for agent-done-N`) was shared between loops on the same iteration number, so when either agent finished, both sessions ended. Fixed: the signal is per project.
 
-## Experiment: thinking effort on the real workflow (A/B v2, running from 2026-09-30)
+## Experiment: thinking effort on the real workflow (A/B v2, 2026-09-30 to 10-01)
 
 The first effort A/B (`analysis/ab-effort/`) measured one coding task with one hidden grader, and that grader turned
 out to score a spec contradiction instead of the code: the arms that noticed the contradiction were marked as
@@ -240,9 +240,18 @@ overlap with other work shows up. Requests to the human are answered by an auto-
 (the local model, thinking off, classifies which planted flaw a request is about; anything else gets "choose, write
 the assumption down"); the doorbell is faked so no messages go out. The judge is headless `claude -p` with its own
 system prompt, no tools and no user settings, and sees anonymous packets with effort labels scrubbed. Answer keys,
-hidden checks and the project GOAL.md stay unpublished (`analysis/ab-effort2/hidden/`, gitignored) until the runs are
-finished, because the agent can search the web. The full process (round-1 audit, design, build log, GPU hand-over,
-operating commands) and, later, the results: [effort-ab.md](effort-ab.md).
+hidden checks and the project GOAL.md stayed secret during the runs, because the agent can search the web; the
+planted flaws and answers are now in effort-ab.md's appendix (the hidden files are not published yet).
+
+**Results (54 runs, 0 GPU contention):** medium used about half the output tokens (probes 318k vs 720k, project
+0.76M vs 1.50M) and 55-60% of the wall time (project median 50 vs 96 min, same 17 sessions), so about 1.8x project
+throughput. Hidden checks: no correctness difference (the one real bug, a repeated-message line counted once, is in an
+xhigh run). Blind judge, side by side: xhigh's probe code preferred in 18 of 21 decided pairs (tests, robustness),
+medium's for simplicity; scored one at a time the two tie, so the gap is modest. xhigh noticed slightly more planted
+spec flaws (19/22 vs 17/22), raised more concerns (more of them legitimate, but also more false alarms on clean specs),
+and was the only arm to write down its choice when a spec allowed two readings. What turned a noticed flaw into the author's intended
+behaviour was asking, at either effort. On the project (3 runs each) no overall quality winner: xhigh's tests were
+stronger, medium's code simpler, and medium had more early done claims (5 vs 1, all caught by the driver). Full process and results: [effort-ab.md](effort-ab.md).
 
 ## Planned: two agents on one project (when a second 24 GB GPU arrives)
 

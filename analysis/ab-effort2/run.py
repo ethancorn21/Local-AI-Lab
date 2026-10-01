@@ -312,6 +312,17 @@ if __name__ == "__main__":
         plan()
     elif cmd == "go":
         go(sys.argv[2] if len(sys.argv) > 2 else "all")
+    elif cmd == "regrade":   # re-run the hidden check on finished runs (after a check fix); keeps the old grade as grade.v1.json
+        sched = {x["id"]: x for x in json.load(open(f"{KIT}/schedule.json"))}
+        for rid in sys.argv[2:]:
+            res = f"{KIT}/results/{rid}"
+            meta = json.load(open(f"{res}/meta.json"))
+            if os.path.exists(f"{res}/grade.json") and not os.path.exists(f"{res}/grade.v1.json"):
+                os.rename(f"{res}/grade.json", f"{res}/grade.v1.json")
+            g = grade(sched[rid], meta["dir"], res)
+            meta["grade_summary"] = {k: g.get(k) for k in ("core", "core_score", "flaw", "flaws", "categories", "error") if k in g}
+            json.dump(meta, open(f"{res}/meta.json", "w"), indent=1)
+            log(f"{rid}: regraded {json.dumps(meta['grade_summary'])[:200]}")
     elif cmd == "cltest":
         sys.exit(1 if cltest() else 0)
     elif cmd == "smoke":

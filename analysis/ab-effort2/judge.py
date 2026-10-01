@@ -48,6 +48,8 @@ def claude(prompt):
                             "--system-prompt", SYSTEM], input=prompt, capture_output=True, text=True, cwd=cwd, timeout=3600)
     try:
         d = json.loads(p.stdout)
+        if d.get("api_error_status") == 429:   # subscription limit: stop instead of failing every remaining call; rerun resumes
+            sys.exit(f"RATE_LIMITED: {d.get('result')}")
         out = json.loads(re.search(r"\{.*\}", d["result"], re.S).group(0))
         out["_meta"] = {"usage": d.get("usage"), "cost_usd_equiv": d.get("total_cost_usd"), "model": list((d.get("modelUsage") or {}).keys())}
         return out
@@ -166,6 +168,13 @@ def verify_evidence(result, packet):
 
 
 def save(path, obj):
+    """Failed calls are not saved, so a rerun retries them (errors go to hidden/judge/errors.log)."""
+    if "error" in obj:
+        os.makedirs(J, exist_ok=True)
+        with open(f"{J}/errors.log", "a") as f:
+            f.write(json.dumps({"path": path, **{k: obj[k] for k in ("error", "raw") if k in obj}})[:2000] + "\n")
+        print(f"ERROR {os.path.basename(path)}: {obj['error']}", flush=True)
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     json.dump(obj, open(path, "w"), indent=1)
 
@@ -324,19 +333,26 @@ def report():
               f"false alarms on clean controls: {sum(d['control_false_alarms'])} in {len(d['control_runs'])} runs",
               "- per flaw: " + "; ".join(f"{k.split(':', 1)[1]} {dict(Counter(v))}" for k, v in sorted(d.items()) if k.startswith("flaw:")),
               "- code rubric means: " + ", ".join(f"{k.split(':', 1)[1]} {statistics.mean(v):.2f} (n={len(v)})" for k, v in sorted(d.items()) if k.startswith("code:")), ""]
-    wins = defaultdict(Counter)
+    # Both orders of a pair are one comparison, not two independent ones: each pair's winner is the effort that won
+    # more of its two verdicts (a 1-1 split or two ties is a tie), and the sign test runs over pairs.
+    verdicts, net = defaultdict(Counter), defaultdict(lambda: defaultdict(int))
     for f in sorted(os.listdir(f"{J}/out")):
         if f.startswith("pair-"):
             p = json.load(open(f"{J}/out/{f}"))
             kind = "project" if p.get("task") == "authwatch" else "probes"
             for dim in DIMS + ("overall",):
                 v = p.get(dim)
-                wins[(kind, dim)][key[p[v]]["effort"] if v in ("A", "B") else "tie"] += 1
-    if wins:
-        L += ["## Pairwise (rep-matched, each pair judged in both orders)", "", "| scope | dimension | xhigh | medium | tie | p (sign test, ties dropped) |", "|---|---|---|---|---|---|"]
-        for (kind, dim), w in sorted(wins.items()):
-            n = w["xhigh"] + w["medium"]
-            L.append(f"| {kind} | {dim} | {w['xhigh']} | {w['medium']} | {w['tie']} | {binom_two_sided(min(w['xhigh'], w['medium']), n)} |")
+                e = key[p[v]]["effort"] if v in ("A", "B") else "tie"
+                verdicts[(kind, dim)][e] += 1
+                net[(kind, dim)][(p["task"], p["rep"])] += {"xhigh": 1, "medium": -1}.get(e, 0)
+    if verdicts:
+        L += ["## Pairwise (rep-matched, each pair judged in both orders)", "",
+              "Pair winner = the effort that won more of the pair's two verdicts; p is a two-sided sign test over pairs.", "",
+              "| scope | dimension | pairs won: xhigh | medium | tie/split | p | verdicts xhigh / medium / tie |", "|---|---|---|---|---|---|---|"]
+        for (kind, dim), w in sorted(verdicts.items()):
+            c = Counter("xhigh" if x > 0 else "medium" if x < 0 else "tie" for x in net[(kind, dim)].values())
+            L.append(f"| {kind} | {dim} | {c['xhigh']} | {c['medium']} | {c['tie']} | "
+                     f"{binom_two_sided(min(c['xhigh'], c['medium']), c['xhigh'] + c['medium'])} | {w['xhigh']} / {w['medium']} / {w['tie']} |")
         L.append("")
     if os.path.exists(f"{J}/results/summary.json"):   # flaw BEHAVIOUR comes from the hidden checks, not the judge
         rows = {r["id"]: r for r in json.load(open(f"{J}/results/summary.json"))["rows"]}
