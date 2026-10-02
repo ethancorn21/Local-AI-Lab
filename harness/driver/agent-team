@@ -68,10 +68,11 @@ EOF
 start)
   [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project (agent-team init $name)"; exit 1; }
   rm -f "$TEAM/STOP"
+  for id in $(ids); do touch "$TEAM/loops/$id.beat"; done   # each agent's claims stay its own while the loops start
   for id in $(ids); do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
   ;;
-stop)
-  for id in $(ids); do echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
+stop)   # a deliberate stop: fresh heartbeats keep each agent's claims its own (stale only after TEAM_STALE_MIN)
+  for id in $(ids); do touch "$TEAM/loops/$id.beat"; echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
   ;;
 restart)   # after a harness change: every agent finishes its current session, then all start again (new driver code)
   for id in $(ids); do agent-stop "$(wt "$id")" > /dev/null; done
@@ -81,6 +82,7 @@ restart)   # after a harness change: every agent finishes its current session, t
     [ "$n" -eq 0 ] && break; sleep 20
   done
   rm -f "$TEAM/STOP"
+  for id in $(ids); do touch "$TEAM/loops/$id.beat"; done   # each agent's claims stay its own while the loops start
   for id in $(ids); do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
   ;;
 status)

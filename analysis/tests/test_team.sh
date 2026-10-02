@@ -98,5 +98,43 @@ grep -q '"merge_conflict".*shared.txt' "$M/.agent/team/events.jsonl" && ok "tc: 
 [ -d "$M/src/left" ] && [ -d "$M/src/right" ] && ok "tc: after the conflict both tasks' work is in main" || bad "tc: work missing in main"
 grep -qs 'cannot go into main yet' "$M.a/DECISIONS.md" "$M.b/DECISIONS.md" "$M/DECISIONS.md" && ok "tc: the reopened task was told why (DECISIONS.md)" || bad "tc: no conflict reason in DECISIONS.md"
 for id in a b; do grep -h "team:" "$PR/tc.$id/.agent/loop.log" | sed "s/^/     $id /" | tail -6; done
+
+# --- scenario 3: both agents stopped mid-task and started again -> each takes back its own task, nothing is stolen
+rm -f "$FX"/*.md
+task 001-slow-left.md none "src/left/"
+task 002-slow-right.md none "src/right/"
+export STUB_SLEEP=25
+mkdir -p "$PR/tr"; echo "# Restart goal" > "$PR/tr/GOAL.md"
+agent-team init tr a b > /dev/null
+# The incident (frontpage 2026-10-02): after a restart, the agent that starts first picks the lowest open task, which
+# is the OTHER agent's (open in its checkout, its old loop gone). So: b alone plans and takes 001, then a takes 002;
+# restart with a first.
+claimed() { grep -qE "\"agent\":\"$1\",\"event\":\"claim\",\"task\":\"[^\"]*$2" "$PR/tr/.agent/team/events.jsonl" 2>/dev/null; }
+agent-start "$PR/tr.b" > /dev/null
+for _ in $(seq 1 60); do sleep 2; claimed b 001-slow && break; done
+agent-start "$PR/tr.a" > /dev/null
+for _ in $(seq 1 30); do sleep 2; claimed a 002-slow && break; done
+claimed b 001-slow && claimed a 002-slow && ok "tr: before the restart b holds 001, a holds 002" || bad "tr: set-up did not reach b=001, a=002"
+sleep 3; agent-team stop tr --now > /dev/null; sleep 3; agent-team start tr > /dev/null
+for _ in $(seq 1 100); do
+  sleep 5
+  [ -f "$PR/tr/.agent/team/STOP" ] && ! pgrep -u "$(id -u)" -f "agent-loop $PR/tr" > /dev/null && break
+done
+python3 - "$PR/tr/.agent/team/events.jsonl" <<'PY' || fail=1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+bad = 0
+def check(cond, msg):
+    global bad
+    print(("ok   " if cond else "FAIL ") + "tr: " + msg); bad += not cond
+stale = [(e["agent"], e["task"]) for e in ev if e["event"] == "stale_claim"]
+check(not stale, f"restart: no claim taken over {stale if stale else ''}")
+for t in ("001-slow-left", "002-slow-right"):
+    who = {e["agent"] for e in ev if e["event"] in ("claim", "merge") and t in e["task"]}
+    check(len(who) == 1, f"{t}: claimed and merged by one agent only ({sorted(who)})")
+check(any(e["event"] == "merge" and "001-slow" in e["task"] for e in ev) and any(e["event"] == "merge" and "002-slow" in e["task"] for e in ev),
+      "both tasks merged after the restart")
+sys.exit(1 if bad else 0)
+PY
 kill $SRV 2>/dev/null
 exit $fail

@@ -64,7 +64,7 @@ flock -n 9 || { echo "another agent-loop is running on $P" >&2; exit 1; }
 # The running session's pid is recorded in .agent/pi.pid (text matching with pgrep -f is fooled by any process whose
 # command line merely mentions pi, including the check itself).
 while [ -f .agent/pi.pid ] && kill -0 "$(cat .agent/pi.pid)" 2>/dev/null; do log "waiting for running agent session (pid $(cat .agent/pi.pid))"; sleep 30; done
-[ -n "${TEAM_DIR:-}" ] && echo $$ > "$TEAM/loops/$AGENT_ID.pid" && log "team mode: agent $AGENT_ID, main checkout $TEAM_DIR, model server $LLM_URL"
+[ -n "${TEAM_DIR:-}" ] && echo $$ > "$TEAM/loops/$AGENT_ID.pid" && team_beat && log "team mode: agent $AGENT_ID, main checkout $TEAM_DIR, model server $LLM_URL"
 
 USER_TEST_CMD=${TEST_CMD:-}
 pick_test_cmd() {
@@ -309,6 +309,7 @@ wait_for_server() {
   log "WARNING: model server unreachable at $LLM_URL - waiting, no sessions run until it answers"
   until server_ok; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the model server - stopping"; exit 0; }
+    [ -n "${TEAM_DIR:-}" ] && team_beat
     sleep "$d"; d=$(( d < 300 ? d * 2 : 600 ))
   done
   log "model server back after $(( ($(date +%s) - t0) / 60 )) min"
@@ -355,6 +356,7 @@ wait_for_human() {
   t0=$(date +%s); last=$t0
   while [ "$(asks_with answered)" = "$a0" ] && [ -n "$(asks_with open)" ] && ! { [ -n "$WAITING" ] && inbox_pending; }; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
+    [ -n "${TEAM_DIR:-}" ] && team_beat
     sleep 30; now=$(date +%s)
     if [ $((now - last)) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
       log "still waiting for the human after $(( (now - t0) / 3600 )) h; $(ring-doorbell)"; last=$now
@@ -371,6 +373,7 @@ wait_for_talk() {
     if [ $(( $(date +%s) - $(stat -c %Y .agent/TALK) )) -gt 43200 ]; then
       log "WARNING: .agent/TALK is over 12 h old (agent-talk did not clean up) - removed"; rm -f .agent/TALK; break
     fi
+    [ -n "${TEAM_DIR:-}" ] && team_beat
     sleep 30
   done
 }
@@ -462,6 +465,7 @@ stall_watch() {  # stall_watch <session pid> <session jsonl> : runs in the backg
   local last=-1 idle=0 size limit pids p
   while kill -0 "$1" 2>/dev/null; do
     sleep 30
+    [ -n "${TEAM_DIR:-}" ] && team_beat   # team mode: the session is alive, so are this agent's claims
     size=$(stat -c %s "$2" 2>/dev/null || echo 0)
     if [ "$size" != "$last" ]; then last=$size; idle=0; continue; fi
     idle=$((idle + 30))
@@ -617,7 +621,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
   wait_for_talk
   wait_for_server
-  [ -n "${TEAM_DIR:-}" ] && { team_retry_merge; team_sync || true; }
+  [ -n "${TEAM_DIR:-}" ] && { team_beat; team_retry_merge; team_sync || true; }
   goal_changed
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests

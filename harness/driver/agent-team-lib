@@ -2,7 +2,10 @@
 # Several agents build one project at once. Each works in its own git worktree on branch agent/<id>; `main`, checked
 # out in TEAM_DIR, collects finished work. Coordination state lives in TEAM_DIR/.agent/team/ (never in git):
 #   claims/<key>/owner   one top-level task (its subtasks included) belongs to one agent: "<agent> <loop pid> <epoch> <task file>"
-#   loops/<id>.pid       the agents' running loops (a claim whose loop is gone is stale and can be taken over)
+#   loops/<id>.pid       the agents' running loops
+#   loops/<id>.beat      touched by an agent's loop all the time (also during sessions and waits): a claim is stale,
+#                        and can be taken over, only when its agent's loop is not running AND its heartbeat is older
+#                        than TEAM_STALE_MIN (120). A restart or a short stop never looks like a crash.
 #   merge.lock           one merge into main at a time
 #   events.jsonl         what happened, for monitoring (agent-team status): claims, waits, merges, conflicts
 #   STOP                 written by the agent that ran the last goal check; the others stop too
@@ -19,11 +22,17 @@ tev() {  # tev <event> [task] [detail] : one line in the team's event log
 }
 claim_key() { task_id "$1" | grep -oE '^[0-9]+'; }   # 025b -> 025: a claim covers the task and all its subtasks
 owner_line() { cat "$TEAM/claims/$1/owner" 2>/dev/null; }
+team_beat() { touch "$TEAM/loops/$AGENT_ID.beat" 2>/dev/null || true; }
+agent_alive() {  # agent_alive <id> : its loop runs, or it stopped less than TEAM_STALE_MIN minutes ago (restart, stop)
+  local f=$TEAM/loops/$1.pid b=$TEAM/loops/$1.beat
+  [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0
+  [ -f "$b" ] && [ $(( $(date +%s) - $(stat -c %Y "$b") )) -lt $(( ${TEAM_STALE_MIN:-120} * 60 )) ]
+}
 claim_owner() {  # claim_owner <key> : the agent holding a live claim on it (this agent's own claims always count)
-  local a p
-  read -r a p _ <<<"$(owner_line "$1")"
+  local a
+  read -r a _ <<<"$(owner_line "$1")"
   [ -n "${a:-}" ] || return 0
-  if [ "$a" = "$AGENT_ID" ] || kill -0 "$p" 2>/dev/null; then echo "$a"; fi
+  if [ "$a" = "$AGENT_ID" ] || agent_alive "$a"; then echo "$a"; fi
 }
 claim_task() {  # claim_task <task file> : take the task (atomic); fails while another live agent holds it
   local k d o; k=$(claim_key "$1"); d=$TEAM/claims/$k
@@ -63,7 +72,7 @@ others_tasks() {  # task files (in their worktrees) that other live agents hold
   for o in "$TEAM"/claims/*/owner; do
     [ -f "$o" ] || continue
     read -r a p _ f < "$o"
-    [ "$a" != "$AGENT_ID" ] && kill -0 "$p" 2>/dev/null && [ -f "$f" ] && echo "$f"
+    [ "$a" != "$AGENT_ID" ] && agent_alive "$a" && [ -f "$f" ] && echo "$f"
   done
   return 0
 }
@@ -194,6 +203,7 @@ team_idle_decision() {
 }
 TEAM_WAIT_T0="" TEAM_WAIT_REASON=""
 team_wait() {  # one wait step (60 s) while another agent works
+  team_beat
   local r; r=$(team_idle_reason)
   if [ -z "$TEAM_WAIT_T0" ]; then
     TEAM_WAIT_T0=$(date +%s); TEAM_WAIT_REASON=$r
