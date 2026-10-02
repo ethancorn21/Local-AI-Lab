@@ -140,3 +140,32 @@ Not run yet (next GPU window, or on the 5060 Ti once installed): the winner agai
 leave-one-attack-out (does the language model generalise to an unseen attack family better than TF-IDF's 0.00?),
 Qwen3.5-2B + LoRA, ModernBERT-large and Laya fine-tuned, Qwen3-Embedding + linear head, 4B/9B zero-shot. The vLLM
 server was down for four hours for this round; runs were ordered by how much they could change the decision.
+
+## CPU speed (2026-10-02)
+
+Can the type-1 classifier run without a GPU? The saved round-2 model (Qwen3.5-0.8B + LoRA, adapter merged, float32)
+was timed on the i9-14900KF's 16 E-cores only (`taskset -c 16-31`, idle scheduling class, no GPU visible) while both
+GPU servers kept serving; their CPU threads sit on the P-cores. Script `type1/bench/m_cpu_speed.py`, result
+`type1/results/cpu_speed_qwen35_0.8b.json`; 40 windows sampled from `test_core` (tokens p50 819 / p95 2,014, close to
+the whole set's 810 / 1,869). Without a GPU the Gated DeltaNet layers run transformers' reference PyTorch path (the
+`fla` kernels are Triton, GPU-only).
+
+| E-core threads | Batch | Windows/s | Tokens/s | ms/window p50 / max |
+|---|---|---|---|---|
+| 16 | 1 | 0.43 | 342 | 2,319 / 6,469 |
+| 16 | 4 (length-sorted) | 0.37 | 298 | 2,279 / 6,843 |
+| 8 | 1 | 0.32 | 256 | 3,012 / 8,902 |
+| 4 | 1 | 0.19 | 154 | 5,055 / 14,602 |
+
+1. **Same answers as the GPU:** largest difference in p(malicious) 0.005; 40 of 40 flags agree at the validation
+   threshold.
+2. **About 55x slower than the 3090 Ti** at batch 1 (2.3 s against 41 ms per window), and about 3,000x slower than
+   TF-IDF. Batching does not help on CPU: one 800-token window already keeps every core busy, and padding adds work.
+   Going from 8 to 16 threads gains only 1.34x.
+3. **Enough on average, not in bursts:** the AIT companies produce 0.05-0.17 windows/s (181-603 per hour), so 16
+   E-cores have 2.5-8x headroom on average, but a scan or dirb burst queues up and a 2,000-token window takes about
+   6.5 s. Homelab volume is not measured yet (firewall logs can be much chattier than AIT).
+4. Peak core temperature 80 C (the script aborts at 85 C; the box's temperature guard stops every GPU server at 95 C).
+
+Not tried, ways to make CPU viable: int8 quantisation (the E-cores have AVX-VNNI), a shorter max length, an
+ONNX/OpenVINO export, or a cascade where TF-IDF screens every window and only the top few percent reach the 0.8B.

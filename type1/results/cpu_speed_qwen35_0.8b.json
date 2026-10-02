@@ -1,0 +1,82 @@
+{
+ "time": "2026-10-02T21:59:58Z",
+ "model": "qwen35_0.8b_lora_saved",
+ "dtype": "float32",
+ "cpus": [
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31
+ ],
+ "load_seconds": 4.4,
+ "sample_tokens_p50_p95": [
+  819,
+  2014
+ ],
+ "core_tokens_p50_p95": [
+  810,
+  1869
+ ],
+ "runs": [
+  {
+   "threads": 16,
+   "batch": 1,
+   "windows": 40,
+   "secs": 93.6,
+   "windows_per_s": 0.428,
+   "tokens_per_s": 341.8,
+   "ms_per_window_p50": 2319.0,
+   "ms_per_window_max": 6468.6,
+   "peak_core_c": 77.0
+  },
+  {
+   "threads": 16,
+   "batch": 4,
+   "windows": 40,
+   "secs": 107.2,
+   "windows_per_s": 0.373,
+   "tokens_per_s": 298.2,
+   "ms_per_window_p50": 2279.3,
+   "ms_per_window_max": 6843.3,
+   "peak_core_c": 77.0
+  },
+  {
+   "threads": 8,
+   "batch": 1,
+   "windows": 40,
+   "secs": 125.0,
+   "windows_per_s": 0.32,
+   "tokens_per_s": 255.8,
+   "ms_per_window_p50": 3012.4,
+   "ms_per_window_max": 8902.3,
+   "peak_core_c": 80.0
+  },
+  {
+   "threads": 4,
+   "batch": 1,
+   "windows": 40,
+   "secs": 208.2,
+   "windows_per_s": 0.192,
+   "tokens_per_s": 153.6,
+   "ms_per_window_p50": 5054.7,
+   "ms_per_window_max": 14602.1,
+   "peak_core_c": 80.0
+  }
+ ],
+ "check": {
+  "max_abs_diff_vs_gpu": 0.005,
+  "flag_agreement_vs_gpu": 1.0
+ }
+}
