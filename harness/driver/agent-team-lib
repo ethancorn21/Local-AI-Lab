@@ -104,6 +104,12 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
   if [ -n "$o" ]; then [ "$o" = "$AGENT_ID" ] || echo "held by agent $o"; return 0; fi   # own claim: subtasks, continuing work
   u=$(done_in_main "$1"); [ -n "$u" ] && { echo "already $u in main"; return 0; }
   u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }
+  # An agent with a smaller context window (TEAM_MAX_TOUCHES in its env file) leaves big tasks to the others: on
+  # frontpage the 114k agent spent whole sessions reading a 14-file task and ran out of window before writing anything.
+  if [ -n "${TEAM_MAX_TOUCHES:-}" ]; then
+    u=$(touches_of "$1" | grep -c .)
+    [ "$u" -gt "$TEAM_MAX_TOUCHES" ] && { echo "too big for this agent's window ($u files > $TEAM_MAX_TOUCHES)"; return 0; }
+  fi
   for t in $(others_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
   return 0
 }
