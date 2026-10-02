@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""sprint-progress <project dir> [--json] : how far the current sprint is.
+
+The sprint is everything planned since the planning task (000) last finished: the tasks still open at that moment,
+plus every task added since (subtasks included). The planning task and the goal check (999) are not counted, and a
+dropped task leaves the count. Without a planning task the sprint is every task.
+Team projects (a worktree with .agent/team.env, or the main checkout) count from the main checkout: done = merged
+into main; in progress = a task some agent holds a claim on.
+Used by agent-watch's status bar (pi-live) and by `agent-team status`.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+SKIP = ("000", "999")
+
+
+def status_of(text):
+    m = re.match(r"\s*Status:\s*(\S+)", text or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
+def git(d, *a):
+    return subprocess.run(["git", "-c", f"safe.directory={d}", "-C", d, *a], capture_output=True, text=True).stdout
+
+
+def task_id(name):
+    return os.path.basename(name).split("-")[0]
+
+
+def where(project):
+    """(directory to count in, team state dir or None)"""
+    env = os.path.join(project, ".agent", "team.env")
+    if os.path.exists(env):
+        m = re.search(r"^TEAM_DIR=(.+)$", open(env).read(), re.M)
+        if m:
+            main = m.group(1).strip()
+            return main, os.path.join(main, ".agent", "team")
+    if os.path.exists(os.path.join(project, ".agent", "team-main")):
+        return project, os.path.join(project, ".agent", "team")
+    return project, None
+
+
+def baseline(main):
+    """The newest commit at which the planning task became done (done there, not done in its parent)."""
+    for sha in git(main, "log", "--format=%H", "--", "tasks/000-plan.md").split():
+        if status_of(git(main, "show", f"{sha}:tasks/000-plan.md")) == "done" and \
+           status_of(git(main, "show", f"{sha}^:tasks/000-plan.md")) != "done":
+            return sha
+    return None
+
+
+def progress(project):
+    main, team = where(os.path.realpath(project))
+    now = {}
+    for f in glob.glob(os.path.join(main, "tasks", "[0-9]*.md")):
+        tid = task_id(f)
+        if tid[:3] in SKIP:
+            continue
+        with open(f, errors="replace") as fh:
+            now[tid] = status_of(fh.readline())
+    base = baseline(main)
+    if base:
+        at_base = {}
+        for path in git(main, "ls-tree", "--name-only", base, "tasks/").split():
+            tid = task_id(path)
+            if re.match(r"\d", tid) and tid[:3] not in SKIP:
+                at_base[tid] = status_of(git(main, "show", f"{base}:{path}").split("\n", 1)[0])
+        sprint = [t for t in now if t not in at_base or at_base[t] not in ("done", "dropped")]
+    else:
+        sprint = list(now)
+    sprint = sorted(t for t in sprint if now[t] != "dropped")
+    done = [t for t in sprint if now[t] == "done"]
+    held = {}
+    if team:
+        for o in glob.glob(os.path.join(team, "claims", "*", "owner")):
+            try:
+                agent = open(o).read().split()[0]
+            except (OSError, IndexError):
+                continue
+            held[os.path.basename(os.path.dirname(o))] = agent
+    working = {t: held.get(re.match(r"\d+", t).group(0)) for t in sprint
+               if t not in done and (now[t] in ("in-progress", "split") or re.match(r"\d+", t).group(0) in held)}
+    return {"tasks": sprint, "done": len(done), "total": len(sprint), "in_progress": sorted(working),
+            "by_agent": {t: a for t, a in working.items() if a}, "open": len(sprint) - len(done) - len(working),
+            "since": base[:8] if base else None}
+
+
+def position(p, tid):
+    """'4 of 6 in this sprint' for a task id (its place in build order = task-number order), or ''."""
+    return f"{p['tasks'].index(tid) + 1} of {p['total']} in this sprint" if tid in p["tasks"] else ""
+
+
+def line(p):
+    s = f"sprint {p['done']}/{p['total']} done"
+    if p["in_progress"]:
+        s += f", {len(p['in_progress'])} in progress"
+    if p["open"]:
+        s += f", {p['open']} to go"
+    return s
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    p = progress(sys.argv[1])
+    if "--json" in sys.argv:
+        print(json.dumps(p))
+    elif "--task" in sys.argv:   # sprint-progress <dir> --task 214 : "4 of 6 in this sprint | sprint 1/6 done, ..."
+        pos = position(p, sys.argv[sys.argv.index("--task") + 1])
+        print(f"{pos} | {line(p)}" if pos else line(p))
+    else:
+        print(line(p))

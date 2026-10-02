@@ -26,6 +26,7 @@ import os
 import re
 import select
 import shutil
+import subprocess
 import sys
 import termios
 import threading
@@ -201,6 +202,19 @@ def llama_phase(state):
     return f"ctx {k(used)}/{k(n_ctx)} ({100 * used / n_ctx:.0f}%) | {phase}"
 
 
+def sprint_line():
+    """Where the current task sits in the sprint and how far the sprint is, from sprint-progress (next to this
+    script): '4 of 6 in this sprint | sprint 1/6 done, 3 in progress, 2 to go', or '' if unavailable."""
+    if not ui.get("project"):
+        return ""
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sprint-progress")
+    cmd = [tool, ui["project"]] + (["--task", ui["task_id"]] if ui.get("task_id") else [])
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def status_loop():
     state = {}
     setup_region()
@@ -212,8 +226,12 @@ def status_loop():
         if ui["composing"]:
             name, chars = ui["composing"]
             phase += f" | writing a {name} call ({k(chars)} chars)"
+        if time.time() - state.get("sprint_t", 0) > 15:   # merges move it; a few seconds of lag is fine
+            state["sprint_t"] = time.time()
+            ui["sprint"] = sprint_line()
         mins, secs = divmod(int(time.time() - ui["t0"]), 60)
-        ui["status"] = f"{ui['label']} | {phase} | session {mins}m{secs:02d}s"
+        sprint = f" | {ui['sprint']}" if ui.get("sprint") else ""
+        ui["status"] = f"{ui['label']}{sprint} | {phase} | session {mins}m{secs:02d}s"
         size = shutil.get_terminal_size()
         if (size.lines, size.columns) != (ui["rows"], ui["cols"]):
             setup_region()
@@ -555,11 +573,15 @@ def follow(project):
                         task = l.split(f"iteration {n}: ", 1)[-1].split(" (harness")[0].strip()
             except OSError:
                 pass
-            ui["label"] = f"session {n} | {task}"
+            m = re.match(r"tasks/(\d+[a-z]*)-(.+)\.md$", task)
+            short = f"task {m.group(1)} ({m.group(2).replace('-', ' ')})" if m else task
+            ui["task_id"] = m.group(1) if m else ""
+            ui["label"] = f"session {n} | {short}"
             ui["t0"] = os.path.getmtime(os.path.join(project, ".agent/loop.log"))
+            ui["sprint"] = sprint_line()
             R.end_stream()
             R.reset()
-            out(f"\n{BOLD}── session {n} · {task} ──{RST}\n")
+            out(f"\n{BOLD}── session {n} · {short}{' · ' + ui['sprint'] if ui['sprint'] else ''} ──{RST}\n")
         line = fh.readline() if fh else ""
         if line:
             yield line

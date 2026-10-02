@@ -95,6 +95,7 @@ status)
     tail -n 3 "$W/.agent/loop.log" 2>/dev/null | sed 's/^/    /' || true
   done
   echo "main: $(git -C "$P" log --oneline -1)"
+  echo "$(sprint-progress "$P" 2>/dev/null || echo "sprint: unknown")"
   [ -f "$TEAM/STOP" ] && echo "STOP: $(cat "$TEAM/STOP")"
   python3 - "$TEAM/events.jsonl" <<'PY'
 import json, sys
