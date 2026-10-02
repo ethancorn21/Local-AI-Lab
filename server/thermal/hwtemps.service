@@ -1,5 +1,5 @@
 [Unit]
-Description=CPU/GPU temperature log (/var/log/hwtemps.csv) with an overheat safety stop for the vLLM container
+Description=CPU and every GPU temperature log (/var/log/hwtemps.csv) with phone alerts and per-card overheat stops
 After=docker.service
 
 [Service]
