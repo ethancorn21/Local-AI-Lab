@@ -16,6 +16,11 @@ import subprocess
 import sys
 
 KIT = "/home/claude/ab-effort2-kit"
+# Model arm (2026-10-01): AB_SCHEDULE = comma-separated schedule files (default schedule.json), AB_ARMS = the arms that
+# get judge packets (default: all), AB_TAG = suffix for the outputs (summary<TAG>.json/md, packets<TAG>/).
+SCHEDULES = [s if s.startswith("/") else f"{KIT}/{s}" for s in os.environ.get("AB_SCHEDULE", "schedule.json").split(",")]
+ARMS = [a for a in os.environ.get("AB_ARMS", "").split(",") if a]
+TAG = os.environ.get("AB_TAG", "")
 MEMORY = re.compile(r"^(AGENTS|CODEMAP|DECISIONS(-archive)?|PROGRESS|PLAN|GOAL(-CHECK)?)\.md$|^tasks/|^\.agent/|^codemap/")
 TEXT_EXT = (".py", ".md", ".toml", ".cfg", ".ini", ".txt", ".json", ".service", ".timer", ".sh")
 
@@ -91,7 +96,7 @@ def run_metrics(r):
 def summarize(rows):
     out = {}
     for phase in ("probes", "project"):
-        for eff in ("xhigh", "medium"):
+        for eff in dict.fromkeys(r["effort"] for r in rows):
             rs = [r for r in rows if r["phase"] == phase and r["effort"] == eff]
             if not rs:
                 continue
@@ -181,7 +186,7 @@ def mutation(r, pdir, res):
     if os.path.exists(f"{res}/mutation.json"):
         return json.loads(read(f"{res}/mutation.json"))
     n = 40 if r["kind"] == "project" else 30
-    seed = int(r["id"].lstrip("r") or 0)
+    seed = int(re.sub(r"\D", "", r["id"]) or 0)   # r001 -> 1; MoE arm ids m001 -> 1
     tmp = subprocess.run(["sudo", "-u", "agent", "mktemp", "-d", "/tmp/abmut.XXXXXX"], capture_output=True, text=True).stdout.strip()
     try:
         subprocess.run(["sudo", "-u", "agent", "git", "clone", "-q", pdir, f"{tmp}/p"], check=True, capture_output=True)
@@ -215,7 +220,7 @@ def lint(pdir, res):
 
 
 def main():
-    sched = json.load(open(f"{KIT}/schedule.json"))
+    sched = [r for s in SCHEDULES for r in json.load(open(s))]
     done = [r for r in sched if read(f"{KIT}/results/{r['id']}/status").strip() == "done"]
     rows = [run_metrics(r) for r in done]
     for row, r in zip(rows, done):
@@ -225,22 +230,24 @@ def main():
         if "--mutate" in sys.argv or os.path.exists(f"{res}/mutation.json"):
             row["mutation"] = mutation(r, pdir, res).get("score")
     summ = summarize(rows)
-    json.dump({"rows": rows, "summary": summ}, open(f"{KIT}/results/summary.json", "w"), indent=1)
-    open(f"{KIT}/results/summary.md", "w").write(md(rows, summ))
+    json.dump({"rows": rows, "summary": summ}, open(f"{KIT}/results/summary{TAG}.json", "w"), indent=1)
+    open(f"{KIT}/results/summary{TAG}.md", "w").write(md(rows, summ))
     print(md(rows, summ))
     if "--packets" in sys.argv:
-        os.makedirs(f"{KIT}/packets", exist_ok=True)
+        done = [r for r in done if not ARMS or r["effort"] in ARMS]
+        PK = f"{KIT}/packets{TAG}"
+        os.makedirs(PK, exist_ok=True)
         ids = [f"S{i:03d}" for i in range(1, len(done) + 1)]
         random.Random(4242).shuffle(ids)
         key = {}
         for anon, r in zip(ids, done):
             pdir = json.loads(read(f"{KIT}/results/{r['id']}/meta.json"))["dir"]
-            open(f"{KIT}/packets/{anon}.spec.md", "w").write(spec_packet(r, pdir, f"{KIT}/results/{r['id']}"))
-            open(f"{KIT}/packets/{anon}.code.md", "w").write(code_packet(r, pdir))
+            open(f"{PK}/{anon}.spec.md", "w").write(spec_packet(r, pdir, f"{KIT}/results/{r['id']}"))
+            open(f"{PK}/{anon}.code.md", "w").write(code_packet(r, pdir))
             key[anon] = {"id": r["id"], "effort": r["effort"], "name": r["name"], "kind": r["kind"], "rep": r["rep"]}
-        json.dump(key, open(f"{KIT}/packets/key.json", "w"), indent=1)
-        json.dump({k: {"name": v["name"], "kind": v["kind"]} for k, v in key.items()}, open(f"{KIT}/packets/tasks.json", "w"), indent=1)
-        print(f"{len(key)} packets in {KIT}/packets")
+        json.dump(key, open(f"{PK}/key.json", "w"), indent=1)
+        json.dump({k: {"name": v["name"], "kind": v["kind"]} for k, v in key.items()}, open(f"{PK}/tasks.json", "w"), indent=1)
+        print(f"{len(key)} packets in {PK}")
 
 
 if __name__ == "__main__":

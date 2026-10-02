@@ -17,6 +17,14 @@ Usage (on the VM, as claude):  run.py plan   -> KIT/schedule.json
                                 run.py status
                                 run.py smoke NAME EFFORT   (one extra run outside the schedule, id smoke-*)
                                 run.py cltest   (does the auto-responder's classifier route known requests right?)
+
+Model arm (2026-10-01): the schedule's "effort" field names an ARM. "moe" = Qwen3.6-35B-A3B on the RTX 5060 Ti
+(llama.cpp, port 8082) with thinking on (that template has no effort levels: thinking on is its maximum), driven
+by the same driver, Pi and extensions; only Pi's default model differs (own config dir). Its runs live in their own schedule:
+  run.py plan-moe   -> KIT/schedule-moe.json (ids m001-m024: the 24 probe runs, same task order as the A/B)
+  AB_SCHEDULE=KIT/schedule-moe.json run.py go probes | status
+For the MoE arm, vllm.csv holds the arm's own server (llama.cpp metrics, same columns) and vllm-3090.csv the
+production server's activity, for the record. The auto-responder's classifier stays on the production model.
 """
 import json
 import os
@@ -35,9 +43,14 @@ RUNS = f"{AB}/runs"
 FAKEBIN = f"{AB}/fakebin"
 LAUNCH = os.environ.get("AB_LAUNCH", f"{AB}/ab-launch")   # override only for plumbing tests
 VLLM = "http://127.0.0.1:8080"
+MOE = "http://127.0.0.1:8082"
+SCHEDULE = os.environ.get("AB_SCHEDULE", f"{KIT}/schedule.json")
 PROBES = {"p_contra": "fwtop", "p_missing": "anon", "p_ambig": "daily", "p_wrongref": "sshtools", "c_sums": "sumcheck",
           "c_failcount": "failcount"}
 EFFORTS = ["xhigh", "medium"]
+ARMS = {"xhigh": {"thinking": "xhigh", "server": VLLM, "launch": LAUNCH},
+        "medium": {"thinking": "medium", "server": VLLM, "launch": LAUNCH},
+        "moe": {"thinking": "xhigh", "server": MOE, "launch": f"{AB}/ab-launch-moe"}}
 PROBE_REPS, PROJECT_REPS = 4, 3
 LIMITS = {"probe": {"max_iters": 6, "goal_checks": 0, "hard_hours": 1.5},
           "project": {"max_iters": 80, "goal_checks": 3, "hard_hours": 12}}
@@ -65,22 +78,25 @@ def put(path, text, mode="644"):
 
 
 # ---------- model server ----------
-def metrics():
+def metrics(server=VLLM):
     try:
-        body = urllib.request.urlopen(f"{VLLM}/metrics", timeout=10).read().decode()
+        body = urllib.request.urlopen(f"{server}/metrics", timeout=10).read().decode()
     except OSError:
         return None
-    val = lambda name: sum(float(m) for m in re.findall(rf"^vllm:{name}(?:{{[^}}]*}})? ([0-9.e+]+)$", body, re.M))
-    return {"running": val("num_requests_running"), "waiting": val("num_requests_waiting"),
-            "gen_tokens": val("generation_tokens_total"), "prompt_tokens": val("prompt_tokens_total")}
+    val = lambda name: sum(float(m) for m in re.findall(rf"^{name}(?:{{[^}}]*}})? ([0-9.e+]+)$", body, re.M))
+    if server != VLLM:   # llama.cpp server (--metrics)
+        return {"running": val("llamacpp:requests_processing"), "waiting": val("llamacpp:requests_deferred"),
+                "gen_tokens": val("llamacpp:tokens_predicted_total"), "prompt_tokens": val("llamacpp:prompt_tokens_total")}
+    return {"running": val("vllm:num_requests_running"), "waiting": val("vllm:num_requests_waiting"),
+            "gen_tokens": val("vllm:generation_tokens_total"), "prompt_tokens": val("vllm:prompt_tokens_total")}
 
 
-def wait_gpu_idle(quiet_s=60):
+def wait_gpu_idle(quiet_s=60, server=VLLM):
     if os.environ.get("AB_SKIP_IDLE"):   # plumbing tests only
         return
     idle_since, last_note = None, 0
     while True:
-        m = metrics()
+        m = metrics(server)
         busy = m is None or m["running"] > 0 or m["waiting"] > 0
         t = time.time()
         if busy:
@@ -136,12 +152,35 @@ def plan():
     print(f"{len(sched)} runs: {sum(r['kind'] == 'probe' for r in sched)} probe, {sum(r['kind'] == 'project' for r in sched)} project")
 
 
+def plan_moe():
+    """The MoE arm's probe runs, in the A/B's task order (same seed and shuffle), one run per probe and rep."""
+    rng = random.Random(20260930)
+    sched = []
+    for rep in range(1, PROBE_REPS + 1):
+        names = list(PROBES)
+        rng.shuffle(names)
+        for name in names:
+            sched.append({"id": f"m{len(sched) + 1:03d}", "phase": "probes", "kind": "probe", "name": name, "effort": "moe", "rep": rep})
+    json.dump(sched, open(f"{KIT}/schedule-moe.json", "w"), indent=1)
+    print(f"{len(sched)} MoE probe runs -> {KIT}/schedule-moe.json")
+
+
 def ensure_fakes():
     sh(f"mkdir -p {RUNS} {FAKEBIN}", agent=True)
     put(f"{FAKEBIN}/ring-doorbell", "#!/bin/sh\n# effort A/B: no Telegram. Swallow the ask text, report success.\n"
         "cat > /dev/null 2>&1 &\necho \"rang (test run: no message sent)\"\nexit 0\n", "755")
     put(f"{AB}/ab-launch", f"#!/bin/bash -l\n# ab-launch EFFORT MAX_ITERS GOAL_CHECKS DIR : agent-loop with production settings except THINKING,\n"
         f"# asks answered by the A/B's auto-responder, doorbell faked.\nexport PATH={FAKEBIN}:$PATH RING_DOORBELL={FAKEBIN}/ring-doorbell\n"
+        "export THINKING=\"$1\" MAX_ITERS=\"$2\" GOAL_CHECKS=\"$3\"\ncd \"$4\" && exec agent-loop \"$4\"\n", "755")
+    # MoE arm: Pi's own config dir (PI_CODING_AGENT_DIR) = the production one (models, auth, extensions, bin symlinked)
+    # with settings.json's default model switched. A pi wrapper on PATH does not work: agent-loop puts
+    # ~/.npm-global/bin first.
+    d, prod = f"{AB}/pi-moe-agent", "/home/agent/.pi/agent"
+    sh(f"mkdir -p {d} && for f in models.json auth.json extensions bin; do ln -sfn {prod}/$f {d}/$f; done && "
+       f"jq '.defaultProvider=\"llama5060\" | .defaultModel=\"qwen3.6-35b-a3b\"' {prod}/settings.json > {d}/settings.json", agent=True)
+    put(f"{AB}/ab-launch-moe", f"#!/bin/bash -l\n# ab-launch-moe EFFORT MAX_ITERS GOAL_CHECKS DIR : as ab-launch, but Pi's default model is the MoE\n"
+        f"# (config dir {d}) and the driver's server health check points at the MoE server.\n"
+        f"export PATH={FAKEBIN}:$PATH RING_DOORBELL={FAKEBIN}/ring-doorbell LLM_URL={MOE} PI_CODING_AGENT_DIR={d}\n"
         "export THINKING=\"$1\" MAX_ITERS=\"$2\" GOAL_CHECKS=\"$3\"\ncd \"$4\" && exec agent-loop \"$4\"\n", "755")
 
 
@@ -221,25 +260,33 @@ def grade(r, pdir, res):
 def execute(r):
     res = f"{KIT}/results/{r['id']}"
     os.makedirs(res, exist_ok=True)
-    lim = LIMITS[r["kind"]]
-    wait_gpu_idle()
+    lim, arm = LIMITS[r["kind"]], ARMS[r["effort"]]
+    wait_gpu_idle(server=arm["server"])
     pdir = setup(r)
     log(f"{r['id']}: start {r['kind']} {r['name']} effort={r['effort']} rep={r.get('rep')} dir={pdir}")
-    meta = {**r, "dir": pdir, "start": now(), "driver_sha": sh("sha256sum /home/agent/bin/agent-loop | cut -c1-12", agent=True).strip(),
+    try:
+        model = json.loads(urllib.request.urlopen(f"{arm['server']}/v1/models", timeout=10).read())["data"][0]["id"]
+    except Exception as e:
+        model = f"unknown ({e!r})"[:120]
+    meta = {**r, "dir": pdir, "start": now(), "server": arm["server"], "model": model, "thinking": arm["thinking"],
+            "driver_sha": sh("sha256sum /home/agent/bin/agent-loop | cut -c1-12", agent=True).strip(),
             "extensions": sh("cd /home/agent/.pi/agent/extensions && sha256sum *.ts | cut -c1-12,65-", agent=True).split("\n")}
     json.dump(meta, open(f"{res}/meta.json", "w"), indent=1)
     t0 = time.time()
     with open(f"{res}/loop.out", "w") as out:
-        proc = subprocess.Popen(["sudo", "-u", "agent", "-H", LAUNCH, r["effort"], str(lim["max_iters"]), str(lim["goal_checks"]), pdir],
+        proc = subprocess.Popen(["sudo", "-u", "agent", "-H", arm["launch"], arm["thinking"], str(lim["max_iters"]), str(lim["goal_checks"]), pdir],
                                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
     answered, capped = set(), False
+    other = open(f"{res}/vllm-3090.csv", "w") if arm["server"] != VLLM else None
+    if other:
+        other.write("time,running,waiting,gen_tokens,prompt_tokens\n")
     with open(f"{res}/vllm.csv", "w") as mc:
         mc.write("time,running,waiting,gen_tokens,prompt_tokens\n")
         while proc.poll() is None:
-            m = metrics()
-            if m:
-                mc.write(f"{now()},{m['running']:.0f},{m['waiting']:.0f},{m['gen_tokens']:.0f},{m['prompt_tokens']:.0f}\n")
-                mc.flush()
+            for f, m in ((mc, metrics(arm["server"])), (other, metrics() if other else None)):
+                if f and m:
+                    f.write(f"{now()},{m['running']:.0f},{m['waiting']:.0f},{m['gen_tokens']:.0f},{m['prompt_tokens']:.0f}\n")
+                    f.flush()
             try:
                 answer_asks(r, pdir, res, answered)
             except Exception as e:
@@ -249,6 +296,8 @@ def execute(r):
                 stop_run(pdir)
                 capped = True
             time.sleep(20)
+    if other:
+        other.close()
     meta.update(end=now(), wall_s=round(time.time() - t0), rc=proc.returncode, hard_capped=capped)
     for f in ("loop.log", "iterations.jsonl"):
         subprocess.run(["sudo", "cp", f"{pdir}/.agent/{f}", f"{res}/{f}"], capture_output=True)
@@ -262,7 +311,7 @@ def execute(r):
 
 def go(phase="all"):
     ensure_fakes()
-    sched = json.load(open(f"{KIT}/schedule.json"))
+    sched = json.load(open(SCHEDULE))
     for r in sched:
         if phase != "all" and r["phase"] != phase:
             continue
@@ -274,7 +323,7 @@ def go(phase="all"):
             sys.exit(3)
         execute(r)
     log(f"phase {phase}: all runs finished")
-    open(f"{KIT}/DONE-{phase}", "w").write(now() + "\n")
+    open(f"{KIT}/DONE-{phase}" + ("" if SCHEDULE.endswith("/schedule.json") else "-" + os.path.basename(SCHEDULE)[:-5]), "w").write(now() + "\n")
 
 
 # Classifier self-test cases live in hidden/cltest.json: they describe the planted flaws.
@@ -296,7 +345,7 @@ def cltest():
 
 
 def status():
-    sched = json.load(open(f"{KIT}/schedule.json"))
+    sched = json.load(open(SCHEDULE))
     for r in sched:
         res = f"{KIT}/results/{r['id']}"
         st = open(f"{res}/status").read().strip() if os.path.exists(f"{res}/status") else ("started" if os.path.exists(f"{res}/meta.json") else "-")
@@ -310,10 +359,12 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "plan":
         plan()
+    elif cmd == "plan-moe":
+        plan_moe()
     elif cmd == "go":
         go(sys.argv[2] if len(sys.argv) > 2 else "all")
     elif cmd == "regrade":   # re-run the hidden check on finished runs (after a check fix); keeps the old grade as grade.v1.json
-        sched = {x["id"]: x for x in json.load(open(f"{KIT}/schedule.json"))}
+        sched = {x["id"]: x for x in json.load(open(SCHEDULE))}
         for rid in sys.argv[2:]:
             res = f"{KIT}/results/{rid}"
             meta = json.load(open(f"{res}/meta.json"))

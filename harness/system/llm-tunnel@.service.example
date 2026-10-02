@@ -1,5 +1,10 @@
 [Unit]
-Description=SSH tunnel: localhost:8080 -> the model server (127.0.0.1:8080)
+Description=SSH tunnel: VM 127.0.0.1:%i -> AI box 127.0.0.1:%i
+# One instance per model port (systemctl enable --now llm-tunnel@<port>). The AI box side decides what is
+# reachable: the tunnel key's permitopen list. Port plan: 8080 production vLLM, 8081 reserved
+# (2nd 24 GB card), 8082 RTX 5060 Ti llama-server, 8090 reserved (type-1 scorer).
+# AI box authorized_keys line for the tunnel account (one permitopen per live port):
+#   from="<vm-address>",restrict,port-forwarding,permitopen="127.0.0.1:8080",permitopen="127.0.0.1:8082",command="/bin/false" ssh-ed25519 <key>
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +14,7 @@ ExecStart=/usr/bin/ssh -N -T \
   -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
   -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes \
   -i /var/lib/<tunnel-user>/.ssh/id_ed25519 \
-  -L 127.0.0.1:8080:127.0.0.1:8080 <ai-box-tunnel-account>@<ai-box-address>
+  -L 127.0.0.1:%i:127.0.0.1:%i <ai-box-tunnel-account>@<ai-box-address>
 Restart=always
 RestartSec=5
 

@@ -366,6 +366,76 @@ intended behaviour was asking, at either effort.
 Limits from the design still apply: 3 project runs per effort, an auto-responder that answers in seconds, one judge
 model family, one author's planted flaws. The choice of setting is the human's.
 
+## Model arm: Qwen3.6-35B-A3B (mixture of experts) on the RTX 5060 Ti (2026-10-01/02)
+
+**Question:** could the new 16 GB card run a third coding agent on a mixture-of-experts model, which generates about 3x
+faster than the dense 27B on that card ([numbers](ai-lab.md#second-card-rtx-5060-ti-2026-10-01)), and what would it
+cost in quality?
+
+**Setup:** the 24 probe runs again, with everything kept except the model: same probes, order, seeds, driver, Pi,
+extensions, auto-responder, hidden checks, mutation scoring and blind judge. The model: Qwen3.6-35B-A3B IQ4_XS in
+llama.cpp on the 5060 Ti, with production's 150k window and thinking on. It is compared with the 27B `xhigh` arm's
+existing runs; the judge's verdicts on those were reused, because their packets were byte-identical. No project runs
+(probes first, by the human's call).
+
+**Differences that are not the model:**
+- Engine: llama.cpp instead of vLLM (no speculative decoding; llama.cpp's own prompt cache).
+- `xhigh` means thinking on: Qwen3.6's chat template has no effort levels, so thinking on is its maximum.
+- The hand-over turn's 2k thinking cap is a vLLM request field; llama.cpp enforces only the 16k per-response cap
+  (server-side). This matters only in sessions that reach the 120k hand-over.
+- Different card: wall times compare the two setups, not the two models on equal hardware.
+
+| Probes (24 runs per arm) | 27B `xhigh` (3090 Ti) | 27B `medium` (3090 Ti) | MoE (5060 Ti) |
+|---|---|---|---|
+| Wall minutes per probe (median) | 3.3 | 1.7 | 3.15 (range 1.3-18.7) |
+| Sessions per probe (median) | 1 | 1 | 2 |
+| Output tokens (median) / thinking share | 19.9k / 70% | 8.3k / 49% | 10.9k / 37% |
+| Hidden-check core score (mean) | 1.00 | 1.00 | 0.98 (one miss) |
+| Mutation score (median) | 1.0 | 1.0 | 1.0 |
+| Lint issues per 100 lines (median) | 0.14 | 0.18 | 0.67 |
+| Done claims rejected by the driver | 0 | 2 | 32 (in 14 runs) |
+| Planted flaws noticed (blind judge) | 13/16 | (see above) | 6/16 |
+| Code rubric, overall (1-10, mean) | 7.21 | 7.21 | 6.46 |
+
+**Head to head, MoE vs 27B `xhigh`** (rep-matched pairs, each judged in both orders; pair winner = won more of its two
+verdicts; p = two-sided sign test over pairs):
+
+| Dimension | Pairs won: MoE | 27B `xhigh` | Tie/split | p |
+|---|---|---|---|---|
+| Overall | 2 | 21 | 1 | <0.001 |
+| Tests | 0 | 24 | 0 | <0.001 |
+| Robustness | 2 | 16 | 6 | 0.001 |
+| Correctness risk | 3 | 16 | 5 | 0.004 |
+| Design | 4 | 17 | 3 | 0.007 |
+| Readability | 4 | 16 | 4 | 0.012 |
+| Simplicity | 14 | 4 | 6 | 0.031 (MoE simpler) |
+
+For scale: `medium` against `xhigh` was 3-18 overall on the same probes.
+
+**What it shows:**
+1. **Working code, weaker engineering.** The hidden checks and mutation scores barely separate the arms (the probes are
+   small), but the blind judge prefers the 27B's code in 21 of 23 decided pairs, and every pair on tests. The gap is
+   larger than `medium`'s.
+2. **Shallow spec reading.** It noticed 6 of 16 planted flaws (27B `xhigh`: 13/16). It never noticed the wrong
+   reference (though its code did the right thing there, silently, in all 4 runs) or the ambiguity. It raised almost
+   no other concerns (3, none legitimate), where `xhigh` raised many. It did not ask the author once.
+3. **It does not act on the harness's corrections.** It rewrote the human's acceptance criterion
+   (`- [ ] ... passes` became `- ✅ ... passes (11 passed)`), so the driver's verbatim check found the criterion
+   missing and rejected the done claim with "restore them". The model blamed the status line instead and repeated the
+   edit: 32 rejections in 14 of 24 runs (17 of them recorded with this reason). One run spent all 6 sessions without
+   a verified done, although its code passed the hidden check. The 27B never did this at `xhigh`. The harness could
+   accept tick variants (a rule in code), but ignoring an explicit correction is the model.
+4. **Speed:** on the slower card it matched the 27B `xhigh`'s wall time on the 3090 Ti: fewer tokens (much less
+   thinking) at about 3x the dense 27B's speed on the same card, with the extra sessions eating part of the gain.
+
+**What it means:** as a general third coding agent, the MoE adds throughput of clearly lower-quality code, reads specs
+less critically and fights the harness's rules. Against the lab's goal (throughput *and* quality) that is a poor
+trade. Remaining options for the card: the dense 27B (production quality at roughly a quarter of the 3090 Ti's agent
+speed), the type-1 log triage model, or a MoE "fast tier" for low-stakes tasks (untested). The choice is the human's.
+
+**Limits:** probes only (small one-task projects; the project runs were not done), 24 runs per arm, one judge model
+family, a different engine and 4-bit format than production.
+
 ## Operating it
 
 On the harness VM, in the kit directory (admin account):
@@ -382,6 +452,11 @@ On the Mac, in `analysis/ab-effort2/`: `python3 judge.py pull`, `python3 judge.p
 `python3 judge.py report`. Calibration (`judge.py calibrate`) already passed. `run` and `retest` are resumable: failed
 calls are not saved (they go to `hidden/judge/errors.log`), and a subscription limit (HTTP 429) stops the run, so the
 same command after the limit resets picks up where it stopped.
+
+MoE arm: `python3 run.py plan-moe`, then `AB_SCHEDULE=<kit>/schedule-moe.json python3 run.py go probes`; analysis
+with `AB_SCHEDULE=schedule.json,schedule-moe.json AB_ARMS=moe,xhigh AB_TAG=-moe sudo -E python3 analyze.py --packets
+--mutate`; judging with `AB_JUDGE=judge-moe AB_ARMS=moe,xhigh AB_TAG=-moe AB_REUSE=judge` in front of each `judge.py`
+command (the arm's judging used about 1.2M input and 174k output tokens).
 
 Judging budget, estimated beforehand: about 2.3M tokens, almost all input (probe spec and code judgments ~0.5M,
 project spec and code ~0.4M, head-to-head probes ~0.4M and project ~0.5M, retest ~0.3M, calibration and overhead

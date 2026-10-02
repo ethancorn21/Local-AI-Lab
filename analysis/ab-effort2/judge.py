@@ -25,6 +25,7 @@ import math
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -32,7 +33,13 @@ import tempfile
 from collections import Counter, defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-J = f"{HERE}/hidden/judge"
+# Model arm (2026-10-01): AB_ARMS = the two arms to pair (first one counts +1; default xhigh,medium), AB_JUDGE = the
+# judge directory under hidden/ (default judge), AB_TAG = the VM-side packets/summary suffix, AB_REUSE = another judge
+# directory whose spec/code verdicts are copied for byte-identical packets (no re-judging of unchanged runs).
+J = f"{HERE}/hidden/" + os.environ.get("AB_JUDGE", "judge")
+ARMS = os.environ.get("AB_ARMS", "xhigh,medium").split(",")
+TAG = os.environ.get("AB_TAG", "")
+REUSE = os.environ.get("AB_REUSE")
 MODEL = os.environ.get("JUDGE_MODEL", "claude-opus-5-5[1m]")
 EFFORT = os.environ.get("JUDGE_EFFORT", "high")
 SYSTEM = ("You are an impartial senior reviewer grading work for a controlled experiment. You never see who or what "
@@ -182,13 +189,17 @@ def save(path, obj):
 # ---------- commands ----------
 def pull():
     os.makedirs(J, exist_ok=True)
-    data = subprocess.run(["ssh", "harnessvm", "sudo tar -C /home/claude/ab-effort2-kit -czf - packets results/summary.json"], capture_output=True, check=True).stdout
+    data = subprocess.run(["ssh", "harnessvm", f"sudo tar -C /home/claude/ab-effort2-kit -czf - packets{TAG} results/summary{TAG}.json"], capture_output=True, check=True).stdout
     subprocess.run(["tar", "-C", J, "-xzf", "-"], input=data, check=True)
+    if TAG:
+        shutil.rmtree(f"{J}/packets", ignore_errors=True)
+        os.rename(f"{J}/packets{TAG}", f"{J}/packets")
+        os.replace(f"{J}/results/summary{TAG}.json", f"{J}/results/summary.json")
     files = [f for f in os.listdir(f"{J}/packets") if f.endswith(".md")]
     print(f"{len(files)} packet files in {J}/packets")
     for f in sorted(files):   # blinding check: effort words must not reach the judge
         t = open(f"{J}/packets/{f}").read()
-        hits = re.findall(r".{0,50}\b(?:xhigh|THINKING|--thinking)\b.{0,50}", t)
+        hits = re.findall(r".{0,50}(?:\bxhigh\b|THINKING|--thinking|qwen3\.[68]|\b35b\b|\ba3b\b|llama5060|5060|\b808[02]\b).{0,50}", t, re.I)
         med = re.findall(r".{0,40}\bmedium\b.{0,40}", t)
         if hits:
             print(f"LEAK? {f}: {hits[:3]}")
@@ -204,11 +215,25 @@ def pairs():
     rng = random.Random(77)
     out = []
     for (name, rep), d in sorted(groups.items()):
-        if "xhigh" in d and "medium" in d:
-            p = [d["xhigh"], d["medium"]]
+        if ARMS[0] in d and ARMS[1] in d:
+            p = [d[ARMS[0]], d[ARMS[1]]]
             rng.shuffle(p)
             out.append((name, rep, p))
     return out
+
+
+def reused(anon, kind, outdir):
+    """Copy a verdict from AB_REUSE for a byte-identical packet (same run, same packet builder)."""
+    if not REUSE or outdir != "out":
+        return False
+    src = f"{HERE}/hidden/{REUSE}"
+    mine = open(f"{J}/packets/{anon}.{kind}.md").read()
+    for f in os.listdir(f"{src}/packets"):
+        if f.endswith(f".{kind}.md") and os.path.exists(f"{src}/out/{f[:-3]}.json") and open(f"{src}/packets/{f}").read() == mine:
+            v = json.load(open(f"{src}/out/{f[:-3]}.json"))
+            save(f"{J}/out/{anon}.{kind}.json", {**v, "_reused_from": f"{REUSE}/{f[:-3]}"})
+            return True
+    return False
 
 
 def run(which="all", sub=None, outdir="out"):
@@ -216,11 +241,11 @@ def run(which="all", sub=None, outdir="out"):
     for anon, t in sorted(tasks.items()):
         if sub is not None and anon not in sub:
             continue
-        if which in ("spec", "all") and not os.path.exists(f"{J}/{outdir}/{anon}.spec.json"):
+        if which in ("spec", "all") and not os.path.exists(f"{J}/{outdir}/{anon}.spec.json") and not reused(anon, "spec", outdir):
             packet = open(f"{J}/packets/{anon}.spec.md").read()
             save(f"{J}/{outdir}/{anon}.spec.json", verify_evidence(claude(spec_prompt(t["name"], packet)), packet))
             print(f"spec {anon} done", flush=True)
-        if which in ("code", "all") and not os.path.exists(f"{J}/{outdir}/{anon}.code.json"):
+        if which in ("code", "all") and not os.path.exists(f"{J}/{outdir}/{anon}.code.json") and not reused(anon, "code", outdir):
             save(f"{J}/{outdir}/{anon}.code.json", claude(CODE_PROMPT.format(packet=open(f"{J}/packets/{anon}.code.md").read())))
             print(f"code {anon} done", flush=True)
     if which in ("pair", "all") and sub is None:
@@ -295,7 +320,7 @@ def report():
     by = defaultdict(lambda: defaultdict(list))
     ev_total = ev_found = 0
     usage = Counter()
-    L = ["# Effort A/B v2: judged results (blind judge, unblinded here)", ""]
+    L = [f"# Effort A/B v2: judged results, {ARMS[0]} vs {ARMS[1]} (blind judge, unblinded here)", ""]
     if os.path.exists(f"{J}/calibration/RESULT"):
         L += [f"Judge calibration: {open(f'{J}/calibration/RESULT').read().strip()}", ""]
     for f in os.listdir(f"{J}/out"):
@@ -323,7 +348,7 @@ def report():
         for dim in DIMS + ("overall",):
             if isinstance(c.get(dim), (int, float)):
                 by[eff][f"code:{k['kind']}:{dim}"].append(c[dim])
-    for eff in ("xhigh", "medium"):
+    for eff in ARMS:
         d = by[eff]
         k_, n_ = sum(d["detected"]), len(d["detected"])
         L += [f"## {eff}", "",
@@ -344,15 +369,16 @@ def report():
                 v = p.get(dim)
                 e = key[p[v]]["effort"] if v in ("A", "B") else "tie"
                 verdicts[(kind, dim)][e] += 1
-                net[(kind, dim)][(p["task"], p["rep"])] += {"xhigh": 1, "medium": -1}.get(e, 0)
+                net[(kind, dim)][(p["task"], p["rep"])] += {ARMS[0]: 1, ARMS[1]: -1}.get(e, 0)
     if verdicts:
         L += ["## Pairwise (rep-matched, each pair judged in both orders)", "",
               "Pair winner = the effort that won more of the pair's two verdicts; p is a two-sided sign test over pairs.", "",
-              "| scope | dimension | pairs won: xhigh | medium | tie/split | p | verdicts xhigh / medium / tie |", "|---|---|---|---|---|---|---|"]
+              f"| scope | dimension | pairs won: {ARMS[0]} | {ARMS[1]} | tie/split | p | verdicts {ARMS[0]} / {ARMS[1]} / tie |", "|---|---|---|---|---|---|---|"]
+        a0, a1 = ARMS
         for (kind, dim), w in sorted(verdicts.items()):
-            c = Counter("xhigh" if x > 0 else "medium" if x < 0 else "tie" for x in net[(kind, dim)].values())
-            L.append(f"| {kind} | {dim} | {c['xhigh']} | {c['medium']} | {c['tie']} | "
-                     f"{binom_two_sided(min(c['xhigh'], c['medium']), c['xhigh'] + c['medium'])} | {w['xhigh']} / {w['medium']} / {w['tie']} |")
+            c = Counter(a0 if x > 0 else a1 if x < 0 else "tie" for x in net[(kind, dim)].values())
+            L.append(f"| {kind} | {dim} | {c[a0]} | {c[a1]} | {c['tie']} | "
+                     f"{binom_two_sided(min(c[a0], c[a1]), c[a0] + c[a1])} | {w[a0]} / {w[a1]} / {w['tie']} |")
         L.append("")
     if os.path.exists(f"{J}/results/summary.json"):   # flaw BEHAVIOUR comes from the hidden checks, not the judge
         rows = {r["id"]: r for r in json.load(open(f"{J}/results/summary.json"))["rows"]}
@@ -365,10 +391,10 @@ def report():
                 ok = v.get("matches_answer") if isinstance(v, dict) else (v == 1.0)
                 beh[k["effort"]][f"{k['name']}:{fid}"].append(bool(ok))
         L += ["## Flaw behaviour from the hidden checks (matches the author's resolution)", "",
-              "| flaw | xhigh | medium |", "|---|---|---|"]
+              f"| flaw | {ARMS[0]} | {ARMS[1]} |", "|---|---|---|"]
         for f in sorted({f for e in beh.values() for f in e}):
             cell = lambda e: f"{sum(beh[e][f])}/{len(beh[e][f])}" if beh[e][f] else "-"
-            L.append(f"| {f} | {cell('xhigh')} | {cell('medium')} |")
+            L.append(f"| {f} | {cell(ARMS[0])} | {cell(ARMS[1])} |")
         L.append("")
     if os.path.isdir(f"{J}/retest"):
         same = n = 0

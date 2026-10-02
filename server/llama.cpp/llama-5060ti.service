@@ -1,0 +1,39 @@
+[Unit]
+Description=llama.cpp server on the RTX 5060 Ti (127.0.0.1:8082) - Qwen3.8-27B UD-IQ4_XS dense, 114k ctx, second coding agent
+# Port plan: 8080 3090 Ti vLLM, 8081 reserved (2nd big card), 8082 this card, 8090 reserved (type-1 scorer).
+# The VM reaches 8082 only through llm-tunnel@8082 + permitopen on the harness-tunnel key.
+# MoE test config (Qwen3.6-35B-A3B, 2026-10-01/02): /var/backups/llama-5060ti.service.moe-148k-2026-10-02
+After=network-online.target power-limits.service
+Wants=network-online.target
+Requires=power-limits.service
+
+[Service]
+User=llm
+Group=llm
+WorkingDirectory=/opt/llm/openjev-lab
+Environment=CUDA_VISIBLE_DEVICES=<rtx-5060-ti-uuid>
+CPUAffinity=0 2 4 6 8 10 12 14
+# The 4080 SUPER setup: all on the card; 114k = largest all-GPU context on 16 GB. llama-bench on this card
+# (2026-10-01): 28 tok/s fresh, 23 at 32k, 20 at 64k, 17 at 96k. Chat template = the production vLLM template
+# (HyperQwen), so effort levels (xhigh/medium/low via reasoning_effort) behave exactly as on the 3090 Ti agent.
+ExecStart=/opt/llm/llama.cpp/build/bin/llama-server \
+  -m models/qwen27b/unsloth/Qwen3.8-27B-UD-IQ4_XS.gguf --alias qwen3.8-27b \
+  --host 127.0.0.1 --port 8082 \
+  -c 114688 -ctk q4_0 -ctv q4_0 -ub 512 \
+  -ngl 99 --fit off -fa on -t 8 \
+  -np 1 --cache-ram 2048 --ctx-checkpoints 32 \
+  --mmproj models/qwen27b/unsloth/mmproj-F16.gguf --no-mmproj-offload \
+  --load-mode none --metrics --jinja \
+  --chat-template-file /opt/llm/engines/models/hyperqwen/Qwen3.8-27B-W4A16-AutoRound/chat_template.jinja \
+  --reasoning-budget 16384 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/llm
+
+[Install]
+WantedBy=multi-user.target

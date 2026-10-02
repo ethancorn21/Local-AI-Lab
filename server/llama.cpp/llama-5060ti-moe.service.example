@@ -1,0 +1,36 @@
+[Unit]
+Description=llama.cpp server on the RTX 5060 Ti (127.0.0.1:8082) - Qwen3.6-35B-A3B UD-IQ4_XS MoE, 148k ctx (production window 150k)
+# Port plan: 8080 3090 Ti vLLM, 8081 reserved (2nd big card), 8082 this card, 8090 reserved (type-1 scorer).
+# The VM reaches 8082 only through llm-tunnel@8082 + permitopen on the harness-tunnel key.
+After=network-online.target power-limits.service
+Wants=network-online.target
+Requires=power-limits.service
+
+[Service]
+User=llm
+Group=llm
+WorkingDirectory=/opt/llm/models/qwen3.6-35b-a3b
+Environment=CUDA_VISIBLE_DEVICES=<rtx-5060-ti-uuid>
+# One thread per P-core (8 cores; CPUs 0-15 are P-core hyperthread pairs), E-cores left for vLLM and the system.
+CPUAffinity=0 2 4 6 8 10 12 14
+# 2026-10-01 llama-bench: experts of 10 layers in RAM crashed at 64k ctx (CUDA pool OOM); 11 and 12 ran to 96k.
+# 12 = headroom for 114k. ubatch 2048: prefill 1890 vs 843 tok/s at 512 (fewer expert copies over the x4 link).
+# Measured (12): gen 84 tok/s fresh, 67 at 32k, 56 at 64k, 48 at 96k; prefill 1890 / 1556 / 1259 / 1101 tok/s.
+ExecStart=/opt/llm/llama.cpp/build/bin/llama-server \
+  -m /opt/llm/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf --alias qwen3.6-35b-a3b \
+  --host 127.0.0.1 --port 8082 \
+  -c 151552 -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
+  -ngl 99 --n-cpu-moe 13 --fit off -fa on -t 8 \
+  -np 1 --cache-ram 2048 --ctx-checkpoints 32 \
+  --load-mode none --metrics --jinja --reasoning-budget 16384 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/llm
+
+[Install]
+WantedBy=multi-user.target
