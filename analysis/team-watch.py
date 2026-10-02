@@ -44,7 +44,7 @@ for e in ev[st["n"]:]:
     elif e["event"] == "merge":
         out.append(f"info {when} agent {e['agent']} merged {e['task']}")
     elif e["event"] == "wait_end" and int(e["detail"] or 0) >= 900:
-        kind = "ALERT" if blocked(start_of.get(e["agent"], "")) else "info"
+        kind = "info"   # a blocked stretch was already alerted while it lasted ("held up"); its end is news, not an alarm
         out.append(f"{kind} {when} agent {e['agent']} waited {int(e['detail']) // 60} min before taking {e['task']} "
                    f"(waiting since: {start_of.get(e['agent'], '?')[:160]})")
 st["n"] = len(ev)
