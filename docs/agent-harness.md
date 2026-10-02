@@ -262,18 +262,28 @@ behave the same). One model copy per card: two agents sharing one card measured 
 
 **Layout.** `~/projects/<name>` is the main checkout: branch `main`, finished and merged work only; nobody works in it.
 Each agent works in its own git worktree, `~/projects/<name>.<id>`, on branch `agent/<id>`. The worktree's
-`.agent/team.env` holds that agent's settings (model server, Pi config directory, hand-over limits) and the driver
-reads it whenever it starts there, so `agent-start <name>.b` or a telecloak start runs agent b correctly too.
+`.agent/team.env` holds that agent's settings (model server, Pi config directory, hand-over limits, task size limit),
+copied from `~/.agent-kit/agents/<id>.env` at set-up (a later change to that file must be made in the worktree too).
+The driver reads it whenever it starts there, so `agent-start <name>.b` or a telecloak start runs agent b correctly.
 
 **The rules, enforced by the driver (`agent-team-lib`), not asked of the model:**
-- **Claims:** a top-level task, with all its subtasks, belongs to one agent at a time (an atomic directory per task;
-  the claim of an agent whose loop is gone is stale and can be taken over).
+- **Claims:** a top-level task, with all its subtasks, belongs to one agent (an atomic directory per task). A claim
+  belongs to the agent, not to one run of its loop: each loop refreshes a heartbeat file all the time (every
+  iteration, every 30 s during a session, in every wait), and a claim can be taken over only when its agent's loop is
+  not running *and* its heartbeat is older than `TEAM_STALE_MIN` (120 min). `agent-team stop/restart/start` refresh
+  the heartbeats, so a deliberate stop or a restart never looks like a crash.
+- **No re-taking finished work:** a claim is checked against `main` right after it is taken; a task this checkout
+  still shows open but `main` has done was just finished by another agent and is given back. The planning task and
+  the goal check are exempt (the driver itself reopens them).
 - **Dependencies:** every task has a `Depends on:` line; a task is offered only when those tasks are done *in main*.
 - **No two agents on the same files:** every task has a `Touches:` line; a task is not offered while another agent
   holds a task whose paths overlap.
+- **Task size per agent:** an agent's env can cap the files a task may touch (`TEAM_MAX_TOUCHES`; agent b: 8). Bigger
+  tasks are left to agents with bigger windows.
 - **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
-  `Touches:` on every task, a plan in waves of tasks that can run at once, and tests that never bind a fixed port
-  (two checkouts run their tests at the same time). The done claim of 000 is rejected without them.
+  `Touches:` on every task, a plan in waves of tasks that can run at once, tests that never bind a fixed port (two
+  checkouts run their tests at the same time), and no hotspot files: a plan where more than 3 open tasks change the
+  same file is rejected, naming the file and the tasks.
 - **Sync:** before every session the driver merges `main` into the agent's branch. A conflict is handed to the next
   session, first thing in its prompt.
 - **Merge:** an accepted task goes into `main` under a lock: merge `main` into the branch, re-run the tests if `main`
@@ -287,28 +297,53 @@ reads it whenever it starts there, so `agent-start <name>.b` or a telecloak star
 - **Idle and stop:** an agent with nothing to take waits (it syncs every minute) while another agent holds work. When
   nobody holds anything, the first running agent runs the goal check; if that adds nothing it writes STOP and the
   others stop. Open tasks that nobody can start because their dependencies cannot be met (a planning mistake) are
-  logged as a deadlock and the first one is taken anyway.
+  logged as a deadlock and the first one is taken anyway. A refused claim on that path waits a cycle: it never spins.
 - **Python packages:** each checkout has its own `.venv`, built by the driver from the pinned, hashed
   `requirements.txt` before every test run, so both agents test against the same packages.
 - **The prompt** tells each agent it is in a team, what the other agent is working on and touching, its task-number
   range, and not to merge, rebase or switch branches unless asked to resolve a merge.
 
-**Monitoring.** Every claim, release, wait (with the reason and its length), merge, conflict and stale claim goes to
-`<main>/.agent/team/events.jsonl`. `agent-team status <name>` shows who holds what and, per agent, merges, minutes
-waited, conflicts and tasks bounced after a merge. A watcher (`analysis/team-watch.py`) reports conflicts, deadlocks,
-waits of 20+ minutes outside planning, and a loop that died before the team finished.
+**Monitoring.** Every claim, release, wait (with the reason, again whenever the reason changes, and its length),
+merge, conflict and stale claim goes to `<main>/.agent/team/events.jsonl`. `agent-team status <name>` shows who holds
+what and, per agent, merges, minutes waited, conflicts and tasks bounced after a merge. A watcher
+(`analysis/team-watch.py`) alerts on conflicts, deadlocks, stale claims, an agent held up 20+ minutes by a dependency
+or a file overlap (once per idle stretch), and a loop that died before the team finished; waiting at the end of a
+queue or during planning is reported as information only.
 
-**Commands:** `agent-team init <name> [ids]` (a folder with a GOAL.md; default agents a and b, settings in
-`~/.agent-kit/agents/<id>.env`), `agent-team start|stop|status <name>`, and per agent the usual
-`agent-watch <name>.<id>`.
+**Commands:** `agent-team init <name> [ids]` (a folder with a GOAL.md; default agents a and b),
+`agent-team start|stop|restart|status <name>` (`restart`: every agent finishes its current session, then all start
+again on the current driver code), and per agent the usual `agent-watch <name>.<id>`.
 
-**Tested without a model** (`analysis/tests/test_team.sh`, two stub agents): planning by one agent while the other
-waits, parallel work, a dependency honoured, two tasks on the same files never held at once, an undeclared shared
-file caught as a merge conflict and resolved, the goal check and a clean stop, and only 000/999 registered as the
-human's. The single-agent scenario test gives identical logs, history and task files with the old and the new driver
-(`analysis/tests/test_single_regression.sh`).
+**Tested without a model** (`analysis/tests/test_team.sh`, two stub agents, about 10 minutes):
+- planning by one agent while the other waits, parallel work, a dependency honoured, two tasks on the same files
+  never held at once, every task done in main, the goal check and a clean stop, only 000/999 the human's;
+- a second round: GOAL.md changes after the team finished, the lead re-plans and runs a second goal check, clean stop;
+- an undeclared shared file caught as a merge conflict, explained, resolved, both tasks in main;
+- a restart: b holds 001, a holds 002, both stopped mid-task, a starts first; each takes back its own task.
+Each fix below came with a scenario that fails on the code before the fix. The single-agent scenario gives identical
+logs, history and task files with the old and the new driver (`analysis/tests/test_single_regression.sh`), and
+`analysis/tests/test_venv.sh` checks the virtualenv handling against real PyPI (including a tampered hash).
 
-**First project:** `frontpage`, a personal reading feed (started 2026-10-02).
+### First run: what broke and what changed (frontpage, 2026-10-02)
+
+The first team project was also team mode's first real test. Every problem below was found by the watcher or by the
+human, fixed in the driver with a test, and deployed the same day.
+
+| What happened | Cause | Fix |
+|---|---|---|
+| Agent b idle for most of a re-plan | Planning is one agent's job, and two GOAL.md changes meant two planning passes | By design; plans are now cheaper to keep parallel (next rows) |
+| After the plan, b waited again: 7 of 9 tasks hung off one task | Hotspot files: `config.py`, `README.md` and the sample config were in almost every task, so the tasks lined up | Plans with a file in more than 3 open tasks are rejected |
+| An agent re-took a task the other had just finished | Its checkout synced a moment before the other agent's merge; the claim was free | Claims are checked against main |
+| After a restart the agents swapped tasks (b took a's half-done task, a took b's) | A claim was tied to a loop's process id; a restarted loop looked like a crashed one | Heartbeat-based claims (above) |
+| b spent three sessions on a 14-file task without writing anything | Orientation plus reading 14 files filled its 114k window before the hand-over could finish | Per-agent task size limit; hand-over for b at 75k (llama.cpp ignores the hand-over turn's 2k thinking cap) |
+| A merge conflict on a test file | b added the file to its `Touches:` mid-task, after a had claimed a task on it; the overlap check runs only at claim time | Caught by the merge step as designed. Idea, not built: warn both agents when a task's files grow into another agent's task |
+| The second goal-check round spun every 2 s (1,500 events) | The claim check above refused the goal check the driver had just reopened | 000/999 exempt; refused claims on that path wait a cycle |
+| The same spin again on the other agent an hour later | That agent's loop still ran the old code, and the watcher had not been re-armed | `agent-team restart` after every harness change; the watcher stays armed |
+
+**Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40
+tasks, 98 agent commits; no task was lost or done twice in the end, and every conflict went back to the agent with the
+reason. Agent b (the 5060 Ti at about a quarter of the 3090 Ti's speed) merged 7 of the ~42 accepted tasks: the
+smaller card helps on parallel waves and small tasks, and waits on long chains.
 
 ## Do-later list
 
