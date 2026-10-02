@@ -53,7 +53,7 @@ waiting = {}
 for e in ev:
     if e["event"] in ("wait_start", "wait_reason"):   # a changed reason counts from the moment it changed
         waiting[e["agent"]] = e
-    elif e["event"] == "wait_end":
+    elif e["event"] in ("wait_end", "claim"):   # a claim also ends a wait (a loop killed mid-wait never logs wait_end)
         waiting.pop(e["agent"], None)
 for a, e in waiting.items():
     mins = (time.time() - datetime.fromisoformat(e["time"]).timestamp()) / 60
