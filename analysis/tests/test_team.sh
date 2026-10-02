@@ -119,7 +119,7 @@ PY
 rm -f "$FX"/*.md
 task 001-left.md none "src/left/" "Stub-writes: shared.txt"
 task 002-right.md none "src/right/" "Stub-writes: shared.txt"
-export STUB_SLEEP=8; run_team tc
+export STUB_SLEEP=8 STUB_NO_STATUS='999-'; run_team tc; unset STUB_NO_STATUS   # also: a goal check whose status is left open must still end
 M=$PR/tc
 grep -q '"merge_conflict".*shared.txt' "$M/.agent/team/events.jsonl" && ok "tc: the undeclared shared file was caught as a merge conflict" || bad "tc: no merge conflict recorded for shared.txt"
 [ -d "$M/src/left" ] && [ -d "$M/src/right" ] && ok "tc: after the conflict both tasks' work is in main" || bad "tc: work missing in main"

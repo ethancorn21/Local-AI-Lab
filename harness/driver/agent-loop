@@ -117,6 +117,7 @@ GOAL.md says, in the human's own words, what this project should be. Turn it int
 - Research what you need (web_search, web_fetch) before settling on a stack you are unsure of; say why in PLAN.md.
 - A question only the human can answer (an account, hardware, a preference that changes the plan): ask_human. Prefer a stated assumption in PLAN.md and a non-blocking question over waiting.
 - This task is the plan only: create PLAN.md, the task files and the test setup, not the product.
+- When every box above is ticked, set this file's first line to `Status: done`: that is what ends the planning task.
 EOF
 }
 plan_task() {
@@ -141,6 +142,7 @@ The task queue is empty. Check the project against GOAL.md point by point, the w
 
 ## Notes
 - If everything is met, say so in GOAL-CHECK.md and add no tasks: the loop then stops.
+- When every box above is ticked, set this file's first line to `Status: done`: that is what ends the check.
 EOF
 }
 if [ ! -f AGENTS.md ]; then cp -rn "$HOME/.agent-kit/template/." . && log "project set up from the template"; fi
@@ -787,6 +789,15 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     stall_note "$task" ".agent/sessions/iter-$n4.jsonl" "$stalled_s"
     git add "$task" && git commit -q -m "[driver] stall note for $(task_id "$task"): the previous session hung"
   fi
+  # The planning task and the goal check end when their boxes are ticked: an agent that ticks them all but leaves the
+  # status open gets the task again and again (frontpage 2026-10-02: 19 goal-check rounds, all "DONE" in the notes).
+  case $task in
+    tasks/000-*|tasks/999-*)
+      if [ -f "$task" ] && [ "$(status_of "$task")" != done ] && [ -z "$(unticked "$task")" ] && grep -qE '^[[:space:]]*- \[x\]' "$task"; then
+        sed -i '1s/.*/Status: done/' "$task"; git add "$task" && git commit -q -m "[driver] $(task_id "$task"): every box ticked - closed (the status had been left open)"
+        log "$task: every box ticked but the status was left open - closed by the driver, verifying"
+      fi ;;
+  esac
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
   if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
@@ -847,6 +858,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
   if [ "$(status_of "$task")" != done ] && [ "$runs" -ge "$STALL_SESSIONS" ] && [ $(( (runs - STALL_SESSIONS) % 4 )) -eq 0 ]; then
     log "STALLED: $task has run $runs sessions without finishing"
+    [ -n "${TEAM_DIR:-}" ] && tev stalled "$task" "$runs sessions"
   fi
   if [ "$no_progress" -ge "$NO_PROGRESS_LIMIT" ]; then
     { echo "# STUCK - $(date '+%F %T')"; echo; echo "$NO_PROGRESS_LIMIT iterations in a row without an agent commit on $task."; echo;

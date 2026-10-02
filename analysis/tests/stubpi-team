@@ -28,6 +28,8 @@ case $TASK in
     w=$(sed -n 's/^Stub-writes:[[:space:]]*//p' "$TASK")
     [ -n "$w" ] && echo "written by $(basename "$TASK" .md)" > "$w" ;;
 esac
-sed -i -e '/^## Hand-over/,$!s/^- \[ \]/- [x]/' -e '1s/.*/Status: done/' "$TASK"
+sed -i -e '/^## Hand-over/,$!s/^- \[ \]/- [x]/' "$TASK"
+# STUB_NO_STATUS: a pattern of tasks whose status the stub "forgets" to set (it still ticks every box)
+if [ -z "${STUB_NO_STATUS:-}" ] || ! grep -qE "$STUB_NO_STATUS" <<<"$TASK"; then sed -i '1s/.*/Status: done/' "$TASK"; fi
 git add -A && git commit -q -m "$(basename "$TASK" .md): stub step by agent ${AGENT_ID:-?}"
 echo '{"type":"stub"}'

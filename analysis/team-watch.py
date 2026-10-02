@@ -26,7 +26,7 @@ def once(key, line):
         out.append(line)
 
 
-ALERT = {"merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "stale_claim", "dup_task_id", "merge_failed"}
+ALERT = {"merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "stale_claim", "dup_task_id", "merge_failed", "stalled"}
 planning_only = lambda d: all(x.strip().startswith("000 ") for x in d.split(";") if x.strip())
 # Held up by the other agent = there is work, but it waits for a dependency or overlaps the other agent's files.
 # Waiting while the only open tasks are held by others (end of the queue, or planning) is expected, not blocking.
