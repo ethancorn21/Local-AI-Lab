@@ -57,8 +57,9 @@ for e in ev:
         waiting.pop(e["agent"], None)
 for a, e in waiting.items():
     mins = (time.time() - datetime.fromisoformat(e["time"]).timestamp()) / 60
+    claims = sum(1 for x in ev if x["agent"] == a and x["event"] == "claim")   # one alert per idle stretch, not per reason change
     if mins >= 20 and blocked(e["detail"]):
-        once(f"wait:{e['time']}", f"ALERT agent {a} has been held up {mins:.0f} min: {e['detail'][:240]}")
+        once(f"held:{a}:{claims}", f"ALERT agent {a} has been held up {mins:.0f} min: {e['detail'][:240]}")
     elif mins >= 20 and not planning_only(e["detail"]):
         once(f"idle:{e['time']}", f"info agent {a} idle {mins:.0f} min, no free work (end of queue): {e['detail'][:160]}")
 
