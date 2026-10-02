@@ -136,6 +136,7 @@ The task queue is empty. Check the project against GOAL.md point by point, the w
 
 ## Acceptance criteria
 - [ ] GOAL-CHECK.md lists every point of GOAL.md with its state (met, partly, not met) and the evidence checked in this session (a command and its result, a test, a file)
+- [ ] Anything with a user interface was used the way the human would: in a browser (Playwright), starting from the first page and only clicking and typing. A feature that cannot be reached that way is not met, whatever the code or a direct URL does
 - [ ] Every point not fully met has a new task file with testable acceptance criteria, numbered after the highest task below 999, and PLAN.md is updated to match
 
 ## Notes
