@@ -641,10 +641,11 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
         stop) log "team: stopping - $(cat "$TEAM/STOP" 2>/dev/null)"; task=""; break ;;
         force*) task=${decision#force }
                 log "team: DEADLOCK - open tasks wait on dependencies nobody can finish ($(team_idle_reason)); taking $task anyway"
-                tev deps_deadlock "$task" "$(team_idle_reason)"; claim_task "$task" || continue; break ;;
+                tev deps_deadlock "$task" "$(team_idle_reason)"
+                claim_task "$task" || { team_wait; continue; }; break ;;   # refused: wait a cycle, never spin
       esac
       task=$(goal_check_next)
-      if [ -n "$task" ]; then claim_task "$task" || continue
+      if [ -n "$task" ]; then claim_task "$task" || { team_wait; continue; }
       else echo "$(date '+%F %T') agent $AGENT_ID: the goal check found nothing more to do, or ran out of rounds" > "$TEAM/STOP"; tev stop "" ""; fi
       break
     fi

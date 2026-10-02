@@ -56,6 +56,7 @@ claim_task() {  # claim_task <task file> : take the task (atomic); fails while a
   tev claim "$1"; return 0
 }
 done_in_main() {  # done_in_main <task file> : its status in main, if this checkout still shows it open but main has it done or dropped
+  case $1 in tasks/000-*|tasks/999-*) return 0 ;; esac   # the driver itself reopens these (GOAL.md change, a new goal-check round)
   [ "$(status_of "$1")" = open ] || return 0   # in progress here = reopened by this agent: this checkout knows better
   local m s; m=$(compgen -G "$TEAM_DIR/tasks/$(task_id "$1")-*.md" | head -1)
   [ -n "$m" ] || return 0

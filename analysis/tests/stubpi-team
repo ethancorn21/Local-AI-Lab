@@ -16,7 +16,7 @@ if grep -q 'FIRST, before your task step' <<<"$PROMPT" || tail -6 DECISIONS.md 2
 fi
 case $TASK in
   tasks/000-*)
-    cp "$STUB_FIXTURES"/*.md tasks/
+    for f in "$STUB_FIXTURES"/*.md; do [ -e "tasks/$(basename "$f")" ] || cp "$f" tasks/; done   # a re-plan keeps the tasks it has
     printf '# PLAN\n\nWaves: 001 002 004 006 007 | 003 | 005\n' > PLAN.md ;;
   tasks/999-*)
     printf '# GOAL-CHECK\n\nEverything met.\n' > GOAL-CHECK.md ;;

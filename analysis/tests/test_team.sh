@@ -88,6 +88,33 @@ for id in a b; do
   case $h in "['000']"|"['000', '999']") ok "tt: agent $id human tasks $h" ;; *) bad "tt: agent $id human tasks $h" ;; esac
 done
 
+# --- scenario 1b: GOAL.md changes after the team finished -> 000 re-planned, a second goal-check round, clean stop.
+# Both tasks are done in main from round 1 and reopened by the driver; they must not look like a stale view
+# (frontpage 2026-10-02: the lead spun refusing and forcing 999).
+n0=$(wc -l < "$M/.agent/team/events.jsonl")
+(cd "$M" && echo "- one more wish" >> GOAL.md && git commit -qam "[human] GOAL.md: one more wish")
+agent-team start tt > /dev/null
+for _ in $(seq 1 60); do
+  sleep 5
+  [ -f "$M/.agent/team/STOP" ] && ! pgrep -u "$(id -u)" -f "agent-loop $PR/tt" > /dev/null && break
+done
+agent-team stop tt --now > /dev/null 2>&1
+python3 - "$M/.agent/team/events.jsonl" "$n0" <<'PY' || fail=1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()][int(sys.argv[2]):]
+bad = 0
+def check(cond, msg):
+    global bad
+    print(("ok   " if cond else "FAIL ") + "tt round 2: " + msg); bad += not cond
+has = lambda e, t: any(x["event"] == e and t in x["task"] for x in ev)
+check(has("claim", "/000-") and has("merge", "/000-"), "GOAL.md change: 000 re-planned and merged")
+check(has("claim", "/999-") and has("merge", "/999-"), "a second goal-check round ran and merged")
+check(any(x["event"] == "stop" for x in ev), "the team stopped after it")
+odd = [(x["event"], x["task"]) for x in ev if x["event"] in ("deps_deadlock", "stale_view", "stale_claim")]
+check(not odd, f"no deadlock, stale view or stale claim {odd if odd else ''}")
+sys.exit(1 if bad else 0)
+PY
+
 # --- scenario 2: two tasks write the same undeclared file at the same time ---
 rm -f "$FX"/*.md
 task 001-left.md none "src/left/" "Stub-writes: shared.txt"
