@@ -37,7 +37,21 @@ claim_task() {  # claim_task <task file> : take the task (atomic); fails while a
   fi
   local p; read -r o p _ <<<"$(owner_line "$k")"
   [ "${o:-}" = "$AGENT_ID" ] && [ "${p:-}" = "$$" ] && return 0
-  echo "$AGENT_ID $$ $(date +%s) $P/$1" > "$d/owner"; tev claim "$1"; return 0
+  echo "$AGENT_ID $$ $(date +%s) $P/$1" > "$d/owner"
+  # Another agent may have finished it between this checkout's last sync and the claim: it merges into main before
+  # it releases, so main knows. Then this checkout is only behind: give the claim back.
+  if [ -n "$(done_in_main "$1")" ]; then
+    rm -rf "${TEAM:?}/claims/$k"; tev stale_view "$1" "done in main before this checkout synced"
+    log "team: $1 was just finished by another agent - not taking it"; return 1
+  fi
+  tev claim "$1"; return 0
+}
+done_in_main() {  # done_in_main <task file> : its status in main, if this checkout still shows it open but main has it done or dropped
+  [ "$(status_of "$1")" = open ] || return 0   # in progress here = reopened by this agent: this checkout knows better
+  local m s; m=$(compgen -G "$TEAM_DIR/tasks/$(task_id "$1")-*.md" | head -1)
+  [ -n "$m" ] || return 0
+  s=$(status_of "$m"); case $s in done|dropped) echo "$s" ;; esac
+  return 0
 }
 release_claim() {  # release_claim <task file> : after the top-level task is merged into main or dropped
   local k; k=$(claim_key "$1")
@@ -79,6 +93,7 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
   local k o t u
   k=$(claim_key "$1"); o=$(claim_owner "$k")
   if [ -n "$o" ]; then [ "$o" = "$AGENT_ID" ] || echo "held by agent $o"; return 0; fi   # own claim: subtasks, continuing work
+  u=$(done_in_main "$1"); [ -n "$u" ] && { echo "already $u in main"; return 0; }
   u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }
   for t in $(others_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
   return 0
@@ -177,12 +192,14 @@ team_idle_decision() {
   [ -n "$f" ] && { echo "force $f"; return; }
   echo goal
 }
-TEAM_WAIT_T0=""
+TEAM_WAIT_T0="" TEAM_WAIT_REASON=""
 team_wait() {  # one wait step (60 s) while another agent works
-  local r
+  local r; r=$(team_idle_reason)
   if [ -z "$TEAM_WAIT_T0" ]; then
-    TEAM_WAIT_T0=$(date +%s); r=$(team_idle_reason)
+    TEAM_WAIT_T0=$(date +%s); TEAM_WAIT_REASON=$r
     log "team: nothing to take now - waiting for the other agent(s): $r"; tev wait_start "" "$r"
+  elif [ "$r" != "$TEAM_WAIT_REASON" ]; then   # e.g. "no open tasks" during planning, then "waits for 203": the watcher needs to see that
+    TEAM_WAIT_REASON=$r; log "team: still waiting, now because: $r"; tev wait_reason "" "$r"
   fi
   [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting - stopping"; exit 0; }
   sleep "${TEAM_WAIT_S:-60}"
@@ -190,7 +207,7 @@ team_wait() {  # one wait step (60 s) while another agent works
 }
 team_wait_done() {  # a task was picked after a wait: record how long this agent was held up
   [ -n "$TEAM_WAIT_T0" ] || return 0
-  local s=$(( $(date +%s) - TEAM_WAIT_T0 )); TEAM_WAIT_T0=""
+  local s=$(( $(date +%s) - TEAM_WAIT_T0 )); TEAM_WAIT_T0="" TEAM_WAIT_REASON=""
   log "team: waited $((s / 60)) min for the other agent(s)"; tev wait_end "${1:-}" "$s"
 }
 team_prompt() {  # the team part of the session prompt
@@ -207,7 +224,16 @@ team_prompt() {  # the team part of the session prompt
 TEAM_PLAN_CRITERIA='- [ ] Every task file besides 000 and 999 has a `Depends on:` line (the numbers of the tasks that must be finished first, or `none`) and a `Touches:` line (the files and directories the task will create or change)
 - [ ] The work is split into modules that two agents can build at the same time: tasks that could run at once touch different files, and PLAN.md shows the order as waves (all tasks of a wave can run at once, and most waves have two or more tasks)
 - [ ] Tests never bind a fixed network port (use port 0) or write outside the project and the system temp dir: two checkouts of this project run their tests at the same time'
-TEAM_PLAN_NOTE='- Two agents build this project at the same time, each in its own checkout; a task goes to one agent once all its `Depends on:` tasks are finished, and never while the other agent works on a task that touches the same files. Put shared foundations first (project skeleton, data model, the interfaces between modules), so the later tasks can go ahead independently.'
+TEAM_PLAN_NOTE='- Two agents build this project at the same time, each in its own checkout; a task goes to one agent once all its `Depends on:` tasks are finished, and never while the other agent works on a task that touches the same files. Put shared foundations first (project skeleton, data model, the interfaces between modules), so the later tasks can go ahead independently. Avoid hotspot files: when many tasks would edit the same file (README, a central config module, the sample config), give each module its own file or section, or make those edits once in an early task; the driver rejects a plan where more than 3 open tasks change one file. List only real dependencies: tasks that touch the same files are already kept apart.'
+open_touches() {  # "<path> <task id>" for every Touches path of every open task (not 000/999)
+  local f
+  for f in tasks/[0-9]*.md; do
+    case $f in tasks/000-*|tasks/999-*) continue ;; esac
+    case $(status_of "$f") in done|dropped) continue ;; esac
+    touches_of "$f" | sed "s#\$# $(task_id "$f")#"
+  done
+  return 0
+}
 team_plan_check() {  # extra checks of the planning task's done claim in team mode
   local f r=""
   for f in tasks/[0-9]*.md; do
@@ -216,5 +242,10 @@ team_plan_check() {  # extra checks of the planning task's done claim in team mo
     grep -qiE '^Touches:' "$f" || r+="    $f has no \`Touches:\` line"$'\n'
   done
   [ -n "$r" ] && printf '%s\n%s' "- Team project: every task needs \`Depends on:\` and \`Touches:\` lines:" "$r"
+  # Hotspots: a file that many open tasks change forces them into a line (no two agents on the same files), so the
+  # queue runs one task at a time however it is drawn in waves. frontpage 2026-10-02: config.py, README.md and the
+  # sample config in most tasks left the second agent idle.
+  local h; h=$(open_touches | awk '{n[$1]++; t[$1]=t[$1] " " $2} END {for (p in n) if (n[p] > 3) printf "    %s is changed by %d open tasks:%s\n", p, n[p], t[p]}')
+  [ -n "$h" ] && printf '%s\n%s' "- Team project: files that more than 3 open tasks change make the agents wait for each other; give each module its own file or section for these, or make the shared changes in one early task:" "$h"
   return 0
 }

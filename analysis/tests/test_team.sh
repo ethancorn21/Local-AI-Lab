@@ -79,8 +79,8 @@ c000 = [e["agent"] for e in ev if e["event"] == "claim" and "/000-" in e["task"]
 check(len(set(c000)) == 1, f"planning done by one agent ({c000})")
 waits = [e for e in ev if e["event"] == "wait_end"]
 check(len(waits) > 0, f"waits recorded ({len(waits)}, {sum(int(e['detail']) for e in waits)} s)")
-check(not [e for e in ev if e["event"] in ("merge_conflict", "post_merge_fail", "dup_task_id", "merge_failed", "deps_deadlock", "stale_claim")],
-      "no conflicts, duplicate ids, failed merges, deadlocks or stale claims")
+odd = [(e["agent"], e["event"], e["task"], e["detail"][:80]) for e in ev if e["event"] in ("merge_conflict", "post_merge_fail", "dup_task_id", "merge_failed", "deps_deadlock", "stale_claim")]
+check(not odd, f"no conflicts, duplicate ids, failed merges, deadlocks or stale claims {odd if odd else ''}")
 sys.exit(1 if bad else 0)
 PY
 for id in a b; do

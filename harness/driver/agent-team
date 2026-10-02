@@ -3,6 +3,7 @@
 #   agent-team init <name> [ids...]   set up ~/projects/<name> (a folder with a GOAL.md) for a team (default ids: a b)
 #   agent-team start <name>           start every agent's loop in the background
 #   agent-team stop <name> [--now]    stop them (after the current sessions, or now)
+#   agent-team restart <name>         after a harness change: let current sessions finish, then start all again
 #   agent-team status <name>          who works on what, waits, merges and conflicts
 # Layout: ~/projects/<name> is the main checkout (branch main: finished, merged work; nobody works in it), each agent
 # works in ~/projects/<name>.<id> (a git worktree on branch agent/<id>). Each agent's settings (model server, Pi config
@@ -12,7 +13,7 @@
 set -euo pipefail
 export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
 cmd=${1:-}; name=${2:-}
-[ -n "$cmd" ] && [ -n "$name" ] || { sed -n '2,6p' "$0" | sed 's/^# //'; exit 1; }
+[ -n "$cmd" ] && [ -n "$name" ] || { sed -n '2,7p' "$0" | sed 's/^# //'; exit 1; }
 P=$HOME/projects/$name; TEAM=$P/.agent/team
 ids() { ls "$TEAM/agents" 2>/dev/null; }
 wt() { echo "$HOME/projects/$name.$1"; }
@@ -71,6 +72,16 @@ start)
   ;;
 stop)
   for id in $(ids); do echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
+  ;;
+restart)   # after a harness change: every agent finishes its current session, then all start again (new driver code)
+  for id in $(ids); do agent-stop "$(wt "$id")" > /dev/null; done
+  echo "waiting for the agents' current sessions to end..."
+  while :; do
+    n=0; for id in $(ids); do flock -n "$(wt "$id")/.agent/loop.lock" true || n=$((n + 1)); done
+    [ "$n" -eq 0 ] && break; sleep 20
+  done
+  rm -f "$TEAM/STOP"
+  for id in $(ids); do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
   ;;
 status)
   [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project"; exit 1; }

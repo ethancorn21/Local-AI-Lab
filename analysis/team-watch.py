@@ -33,10 +33,10 @@ planning_only = lambda d: all(x.strip().startswith("000 ") for x in d.split(";")
 blocked = lambda d: "waits for" in d or "touches the same files" in d
 start_of = {}   # agent -> detail of its latest wait_start (a wait that began while 000 was planned is expected)
 for e in ev[:st["n"]]:
-    if e["event"] == "wait_start":
+    if e["event"] in ("wait_start", "wait_reason"):
         start_of[e["agent"]] = e["detail"]
 for e in ev[st["n"]:]:
-    if e["event"] == "wait_start":
+    if e["event"] in ("wait_start", "wait_reason"):
         start_of[e["agent"]] = e["detail"]
     when = e["time"][11:16]
     if e["event"] in ALERT:
@@ -51,7 +51,7 @@ st["n"] = len(ev)
 
 waiting = {}
 for e in ev:
-    if e["event"] == "wait_start":
+    if e["event"] in ("wait_start", "wait_reason"):   # a changed reason counts from the moment it changed
         waiting[e["agent"]] = e
     elif e["event"] == "wait_end":
         waiting.pop(e["agent"], None)
