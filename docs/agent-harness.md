@@ -254,14 +254,61 @@ and was the only arm to write down its choice when a spec allowed two readings. 
 behaviour was asking, at either effort. On the project (3 runs each) no overall quality winner: xhigh's tests were
 stronger, medium's code simpler, and medium had more early done claims (5 vs 1, all caught by the driver). Full process and results: [effort-ab.md](effort-ab.md).
 
-## Planned: two agents on one project (when a second 24 GB GPU arrives)
+## Team mode: two agents on one project (built 2026-10-02)
 
-- One model copy per card (ports 8080 and 8081), 4-bit, MTP, 150k window each. First a ~30 minute A/B: two separate servers with two agents, one split server with two agents, one split server with one agent.
-- Each agent works in its own git worktree and branch; `main` is where finished work comes together, and each session starts by merging the latest `main`.
-- One scheduler hands each task to at most one agent, and only when its dependencies are done. Subtasks get a `Depends on:` line from the agent that splits them (missing means "after the previous sibling").
-- On acceptance the driver merges `main` into the branch, re-runs the tests, then merges to `main`; a conflict goes back to the same agent.
-- Memory for two writers: hand-over notes in task files (if the A/B confirms), DECISIONS.md merged with git's union strategy (both sides' appended entries kept), CODEMAP and the archive regenerated after each merge.
-- Parallelism depends on declared dependencies: the current human task chain (027 to 033) is strictly sequential, so seed tasks should list only real dependencies.
+Two coding agents build one project at the same time: agent a on the 3090 Ti (vLLM, 150k window) and agent b on the
+RTX 5060 Ti (llama.cpp, the same Qwen3.8-27B in 4-bit, 114k window, the production chat template so effort levels
+behave the same). One model copy per card: two agents sharing one card measured only ~1.06x.
+
+**Layout.** `~/projects/<name>` is the main checkout: branch `main`, finished and merged work only; nobody works in it.
+Each agent works in its own git worktree, `~/projects/<name>.<id>`, on branch `agent/<id>`. The worktree's
+`.agent/team.env` holds that agent's settings (model server, Pi config directory, hand-over limits) and the driver
+reads it whenever it starts there, so `agent-start <name>.b` or a telecloak start runs agent b correctly too.
+
+**The rules, enforced by the driver (`agent-team-lib`), not asked of the model:**
+- **Claims:** a top-level task, with all its subtasks, belongs to one agent at a time (an atomic directory per task;
+  the claim of an agent whose loop is gone is stale and can be taken over).
+- **Dependencies:** every task has a `Depends on:` line; a task is offered only when those tasks are done *in main*.
+- **No two agents on the same files:** every task has a `Touches:` line; a task is not offered while another agent
+  holds a task whose paths overlap.
+- **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
+  `Touches:` on every task, a plan in waves of tasks that can run at once, and tests that never bind a fixed port
+  (two checkouts run their tests at the same time). The done claim of 000 is rejected without them.
+- **Sync:** before every session the driver merges `main` into the agent's branch. A conflict is handed to the next
+  session, first thing in its prompt.
+- **Merge:** an accepted task goes into `main` under a lock: merge `main` into the branch, re-run the tests if `main`
+  brought anything, then fast-forward `main`. A conflict or a new test failure reopens the task with the reason.
+- **Memory for several writers:** DECISIONS.md and its archive merge with git's union strategy (both sides' entries
+  kept); PROGRESS.md and CODEMAP are regenerated in every checkout (`merge=ours`); hand-over notes live in the task
+  files, which only the claiming agent edits.
+- **Who owns what:** the human's tasks are those present at team set-up (000) plus the goal check (999); tasks that
+  arrive through merges stay the agents'. New top-level tasks get numbers from the creating agent's range (a: 200-499,
+  b: 500-799), so two branches cannot create the same number.
+- **Idle and stop:** an agent with nothing to take waits (it syncs every minute) while another agent holds work. When
+  nobody holds anything, the first running agent runs the goal check; if that adds nothing it writes STOP and the
+  others stop. Open tasks that nobody can start because their dependencies cannot be met (a planning mistake) are
+  logged as a deadlock and the first one is taken anyway.
+- **Python packages:** each checkout has its own `.venv`, built by the driver from the pinned, hashed
+  `requirements.txt` before every test run, so both agents test against the same packages.
+- **The prompt** tells each agent it is in a team, what the other agent is working on and touching, its task-number
+  range, and not to merge, rebase or switch branches unless asked to resolve a merge.
+
+**Monitoring.** Every claim, release, wait (with the reason and its length), merge, conflict and stale claim goes to
+`<main>/.agent/team/events.jsonl`. `agent-team status <name>` shows who holds what and, per agent, merges, minutes
+waited, conflicts and tasks bounced after a merge. A watcher (`analysis/team-watch.py`) reports conflicts, deadlocks,
+waits of 20+ minutes outside planning, and a loop that died before the team finished.
+
+**Commands:** `agent-team init <name> [ids]` (a folder with a GOAL.md; default agents a and b, settings in
+`~/.agent-kit/agents/<id>.env`), `agent-team start|stop|status <name>`, and per agent the usual
+`agent-watch <name>.<id>`.
+
+**Tested without a model** (`analysis/tests/test_team.sh`, two stub agents): planning by one agent while the other
+waits, parallel work, a dependency honoured, two tasks on the same files never held at once, an undeclared shared
+file caught as a merge conflict and resolved, the goal check and a clean stop, and only 000/999 registered as the
+human's. The single-agent scenario test gives identical logs, history and task files with the old and the new driver
+(`analysis/tests/test_single_regression.sh`).
+
+**First project:** `frontpage`, a personal reading feed (started 2026-10-02).
 
 ## Do-later list
 

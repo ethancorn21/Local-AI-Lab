@@ -88,9 +88,19 @@ Then, in this order:
 
 - Record what you learned on the web as a short `PITFALL:` entry with the URL, so the next agent does not search
   again. Do not paste page text into memory files.
-- Packages: `npm install` works; system packages install with `sudo apt-get install -y <package>`. Never download and
-  unpack packages or binaries by hand. Record each new system package as a `PITFALL:` entry (the machine must be
-  rebuildable from the notes).
+- Packages: `npm install` works; system packages install with `sudo apt-get install -y <package>`.
+- Python packages apt does not have go in the project's virtualenv `.venv` (gitignored), from PyPI, pinned: list what
+  you need in `requirements.in`, generate `requirements.txt` with every version and hash pinned (`pip-compile
+  --generate-hashes`; pip-tools in a throwaway venv outside the project), commit both. Before every test run the
+  driver builds `.venv` from `requirements.txt` with `pip install --require-hashes` (it sees the system packages too)
+  and runs the tests with `.venv/bin/python`: an unhashed or changed package fails the install, so fix the file
+  rather than work around it. (A package apt already installed at the same version is used as it is; apt checks its
+  own signatures.) Never `pip install --break-system-packages`.
+- Model weights (for example a sentence-embedding model from Hugging Face): only through the library's own download,
+  at a pinned revision (a commit hash, not `main`), with the files' sha256 recorded in the repo and checked before
+  use; weights stay out of git (a cache directory). Tests never download: they use small fixed stand-ins.
+- Never download and unpack packages or binaries by hand. Record each new package or model as a `PITFALL:` entry (the
+  machine must be rebuildable from the notes).
 
 ## Context limit
 

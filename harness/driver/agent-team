@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# agent-team : several coding agents on one project at the same time.
+#   agent-team init <name> [ids...]   set up ~/projects/<name> (a folder with a GOAL.md) for a team (default ids: a b)
+#   agent-team start <name>           start every agent's loop in the background
+#   agent-team stop <name> [--now]    stop them (after the current sessions, or now)
+#   agent-team status <name>          who works on what, waits, merges and conflicts
+# Layout: ~/projects/<name> is the main checkout (branch main: finished, merged work; nobody works in it), each agent
+# works in ~/projects/<name>.<id> (a git worktree on branch agent/<id>). Each agent's settings (model server, Pi config
+# dir, hand-over limits) come from ~/.agent-kit/agents/<id>.env and are copied into the worktree's .agent/team.env,
+# which agent-loop reads, so `agent-start <name>.<id>` (or telecloak) starts that agent correctly too.
+# The rules (claims, Depends on / Touches, sync, merge into main) live in agent-loop's team mode: agent-team-lib.
+set -euo pipefail
+export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
+cmd=${1:-}; name=${2:-}
+[ -n "$cmd" ] && [ -n "$name" ] || { sed -n '2,6p' "$0" | sed 's/^# //'; exit 1; }
+P=$HOME/projects/$name; TEAM=$P/.agent/team
+ids() { ls "$TEAM/agents" 2>/dev/null; }
+wt() { echo "$HOME/projects/$name.$1"; }
+
+case $cmd in
+init)
+  shift 2; [ $# -gt 0 ] || set -- a b
+  [ -d "$P" ] || { echo "No folder $P: create it with a GOAL.md (what you want built)."; exit 1; }
+  [ -f "$P/.agent/team-main" ] && { echo "$P is already a team project (agent-team status $name)."; exit 1; }
+  for id in "$@"; do
+    [[ $id =~ ^[a-z]$ ]] || { echo "agent ids are single letters (a, b, ...): $id"; exit 1; }
+    [ -f "$HOME/.agent-kit/agents/$id.env" ] || { echo "missing $HOME/.agent-kit/agents/$id.env (that agent's model server and settings)"; exit 1; }
+    [ ! -e "$(wt "$id")" ] || { echo "$(wt "$id") already exists"; exit 1; }
+  done
+  if [ ! -e "$P/.git" ]; then   # the usual GOAL.md set-up, on branch main, with the team planning criteria
+    [ -f "$P/GOAL.md" ] || { echo "Put a GOAL.md in $P first."; exit 1; }
+    INIT_BRANCH=main TEAM_PLAN=1 AGENT_LOOP_INIT_ONLY=1 agent-loop "$P" > /dev/null
+  else
+    [ "$(git -C "$P" branch --show-current)" = main ] || git -C "$P" branch -m main
+    [ -z "$(git -C "$P" status --porcelain)" ] || { echo "$P has uncommitted changes: commit them first."; exit 1; }
+  fi
+  cd "$P"
+  # Generated files are rebuilt in each checkout: on a merge keep this side's copy. Journals: keep both sides' entries.
+  cat >> .gitattributes <<'EOF'
+# team mode (agent-team): generated per checkout, or appended by every agent
+PROGRESS.md merge=ours
+CODEMAP.md merge=ours
+codemap/** merge=ours
+DECISIONS.md merge=union
+DECISIONS-archive.md merge=union
+EOF
+  git config merge.ours.driver true
+  git add .gitattributes && git commit -q -m "[driver] team project: merge rules for generated files and journals"
+  mkdir -p "$TEAM/claims" "$TEAM/loops" "$TEAM/agents"; : > "$TEAM/events.jsonl"; touch .agent/team-main
+  first=1
+  for id in "$@"; do
+    W=$(wt "$id")
+    git worktree add -q -b "agent/$id" "$W" main
+    mkdir -p "$W/.agent"
+    { echo "# team mode (agent-team init $(date +%F)): read by agent-loop"; echo "TEAM_DIR=$P"; echo "AGENT_ID=$id"
+      grep -v '^[[:space:]]*#' "$HOME/.agent-kit/agents/$id.env" | grep .; } > "$W/.agent/team.env" || true
+    # The human's tasks are the ones present now (000, and later the goal check 999): register them in every checkout
+    # before any agent starts, so tasks that arrive through merges stay the agents'.
+    (cd "$W" && task-audit init > /dev/null)
+    # GOAL.md edits re-plan in the first agent only (it alone keeps the last planned GOAL.md)
+    [ $first = 1 ] && [ -f .agent/goal.last ] && cp .agent/goal.last "$W/.agent/"; first=0
+    echo "$W" > "$TEAM/agents/$id"
+  done
+  echo "Team project ready: main checkout $P, agents: $(echo "$@")."
+  echo "  Start: agent-team start $name    Watch one agent: agent-watch $name.<id>    Overview: agent-team status $name"
+  ;;
+start)
+  [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project (agent-team init $name)"; exit 1; }
+  rm -f "$TEAM/STOP"
+  for id in $(ids); do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
+  ;;
+stop)
+  for id in $(ids); do echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
+  ;;
+status)
+  [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project"; exit 1; }
+  for id in $(ids); do
+    W=$(wt "$id"); st="stopped"
+    [ -f "$TEAM/loops/$id.pid" ] && kill -0 "$(cat "$TEAM/loops/$id.pid")" 2>/dev/null && st="running"
+    claims=$(grep -l "^$id " "$TEAM"/claims/*/owner 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename | tr '\n' ' ' || true)
+    echo "agent $id ($st) holds: ${claims:-nothing}"
+    tail -n 3 "$W/.agent/loop.log" 2>/dev/null | sed 's/^/    /' || true
+  done
+  echo "main: $(git -C "$P" log --oneline -1)"
+  [ -f "$TEAM/STOP" ] && echo "STOP: $(cat "$TEAM/STOP")"
+  python3 - "$TEAM/events.jsonl" <<'PY'
+import json, sys
+from collections import Counter, defaultdict
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+c = Counter((e["agent"], e["event"]) for e in ev)
+wait = defaultdict(int)
+for e in ev:
+    if e["event"] == "wait_end":
+        wait[e["agent"]] += int(e["detail"] or 0)
+agents = sorted({e["agent"] for e in ev})
+for a in agents:
+    print(f"agent {a}: claims {c[(a, 'claim')]}, merged {c[(a, 'merge')]}, waited {wait[a] // 60} min, "
+          f"merge conflicts {c[(a, 'merge_conflict')]}, sync conflicts {c[(a, 'sync_conflict')]}, "
+          f"failed after merge {c[(a, 'post_merge_fail')]}, stale claims taken {c[(a, 'stale_claim')]}")
+bad = [e for e in ev if e["event"] in ("merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "dup_task_id", "merge_failed")]
+for e in bad[-6:]:
+    print(f"  {e['time'][5:16]} {e['agent']} {e['event']} {e['task']} {e['detail'][:120]}")
+PY
+  ;;
+*) echo "unknown command $cmd"; exit 1 ;;
+esac

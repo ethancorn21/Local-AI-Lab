@@ -1,0 +1,220 @@
+# agent-team-lib : team mode for agent-loop, sourced when TEAM_DIR is set (agent-team sets it up; see agent-team).
+# Several agents build one project at once. Each works in its own git worktree on branch agent/<id>; `main`, checked
+# out in TEAM_DIR, collects finished work. Coordination state lives in TEAM_DIR/.agent/team/ (never in git):
+#   claims/<key>/owner   one top-level task (its subtasks included) belongs to one agent: "<agent> <loop pid> <epoch> <task file>"
+#   loops/<id>.pid       the agents' running loops (a claim whose loop is gone is stale and can be taken over)
+#   merge.lock           one merge into main at a time
+#   events.jsonl         what happened, for monitoring (agent-team status): claims, waits, merges, conflicts
+#   STOP                 written by the agent that ran the last goal check; the others stop too
+# Rules in code, not prose: a task is offered only when its `Depends on:` tasks are done in main and its `Touches:`
+# paths do not overlap the paths of a task another agent holds; an accepted task goes into main only after main has
+# been merged into the branch and the tests pass there.
+TEAM=${TEAM_DIR:-}/.agent/team
+BRANCH=agent/${AGENT_ID:-}
+[ -n "${TEAM_DIR:-}" ] && mkdir -p "$TEAM/claims" "$TEAM/loops"   # (agent-team init loads this only for the plan text)
+
+tev() {  # tev <event> [task] [detail] : one line in the team's event log
+  jq -n -c --arg t "$(date -Iseconds)" --arg a "$AGENT_ID" --arg e "$1" --arg task "${2:-}" --arg d "${3:-}" \
+    '{time: $t, agent: $a, event: $e, task: $task, detail: $d}' >> "$TEAM/events.jsonl"
+}
+claim_key() { task_id "$1" | grep -oE '^[0-9]+'; }   # 025b -> 025: a claim covers the task and all its subtasks
+owner_line() { cat "$TEAM/claims/$1/owner" 2>/dev/null; }
+claim_owner() {  # claim_owner <key> : the agent holding a live claim on it (this agent's own claims always count)
+  local a p
+  read -r a p _ <<<"$(owner_line "$1")"
+  [ -n "${a:-}" ] || return 0
+  if [ "$a" = "$AGENT_ID" ] || kill -0 "$p" 2>/dev/null; then echo "$a"; fi
+}
+claim_task() {  # claim_task <task file> : take the task (atomic); fails while another live agent holds it
+  local k d o; k=$(claim_key "$1"); d=$TEAM/claims/$k
+  if ! mkdir "$d" 2>/dev/null; then
+    o=$(claim_owner "$k")
+    if [ -z "$o" ]; then   # the holder's loop is gone: take the claim over (rename is atomic: one agent wins)
+      local old; old=$(owner_line "$k")
+      mv "$d" "$TEAM/claims/.stale-$k-$$-$(date +%s)" 2>/dev/null && mkdir "$d" 2>/dev/null || return 1
+      tev stale_claim "$1" "$old"; log "team: took over the stale claim on $k ($old)"
+    elif [ "$o" != "$AGENT_ID" ]; then return 1; fi
+  fi
+  local p; read -r o p _ <<<"$(owner_line "$k")"
+  [ "${o:-}" = "$AGENT_ID" ] && [ "${p:-}" = "$$" ] && return 0
+  echo "$AGENT_ID $$ $(date +%s) $P/$1" > "$d/owner"; tev claim "$1"; return 0
+}
+release_claim() {  # release_claim <task file> : after the top-level task is merged into main or dropped
+  local k; k=$(claim_key "$1")
+  [ "$(claim_owner "$k")" = "$AGENT_ID" ] || return 0
+  rm -rf "${TEAM:?}/claims/$k"; tev release "$1"; log "team: released $k"
+}
+others_tasks() {  # task files (in their worktrees) that other live agents hold
+  local o a p f
+  for o in "$TEAM"/claims/*/owner; do
+    [ -f "$o" ] || continue
+    read -r a p _ f < "$o"
+    [ "$a" != "$AGENT_ID" ] && kill -0 "$p" 2>/dev/null && [ -f "$f" ] && echo "$f"
+  done
+  return 0
+}
+deps_of() { sed -n 's/^Depends on:[[:space:]]*//Ip' "$1" | head -1 | grep -oE '\b[0-9]+[a-z]*\b' || true; }
+unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (or dropped) in main
+  local d f s
+  for d in $(deps_of "$1"); do
+    [[ $d =~ ^[0-9]+$ ]] && d=$(printf %03d "$((10#$d))")
+    f=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
+    if [ -z "$f" ]; then echo "$d"; continue; fi
+    s=$(status_of "$f"); [ "$s" = done ] || [ "$s" = dropped ] || echo "$d"
+  done
+  return 0
+}
+touches_of() {  # the task's Touches: paths, normalised (no ./, no trailing / or globs); words that are not paths dropped
+  sed -n 's/^Touches:[[:space:]]*//Ip' "$1" | head -1 | tr -d '`' | tr ',;' '  ' | tr -s ' ' '\n' \
+    | grep -E '^(\.|\*|[A-Za-z0-9_@.*/-]*[./][A-Za-z0-9_@.*/-]*)$' | sed -E 's#^\./##; s#/?\*+$##; s#/+$##; s#^$#.#' || true
+}
+overlap() {  # overlap <task A> <task B> : a Touches path of one equals or contains one of the other's
+  local x y
+  for x in $(touches_of "$1"); do for y in $(touches_of "$2"); do
+    { [ "$x" = . ] || [ "$y" = . ] || [ "$x" = "$y" ] || [[ $x == "$y"/* ]] || [[ $y == "$x"/* ]]; } && return 0
+  done; done
+  return 1
+}
+team_why_not() {  # team_why_not <task file> : why another agent's presence keeps this task from this agent (empty = free)
+  local k o t u
+  k=$(claim_key "$1"); o=$(claim_owner "$k")
+  if [ -n "$o" ]; then [ "$o" = "$AGENT_ID" ] || echo "held by agent $o"; return 0; fi   # own claim: subtasks, continuing work
+  u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }
+  for t in $(others_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
+  return 0
+}
+team_workable() { [ -z "$(team_why_not "$1")" ]; }
+team_idle_reason() {  # one line: why nothing is workable for this agent
+  local f s r out=""
+  for f in tasks/[0-9]*.md; do
+    [ -f "$f" ] || continue; s=$(status_of "$f")
+    case $s in done|dropped) continue ;; esac
+    r=$(team_why_not "$f"); [ -z "$r" ] && r=$s
+    out+="$(task_id "$f") $r; "
+  done
+  printf '%s' "${out:-no open tasks}" | cut -c1-400
+}
+live_agents() {  # ids of agents whose loops run, this one included
+  local f
+  for f in "$TEAM"/loops/*.pid; do [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && basename "$f" .pid; done
+  return 0
+}
+team_lead() { [ "$(live_agents | sort | head -1)" = "$AGENT_ID" ]; }   # the first live agent runs goal checks
+any_claims() { local o; for o in "$TEAM"/claims/*/owner; do [ -f "$o" ] && [ -n "$(claim_owner "$(basename "$(dirname "$o")")")" ] && return 0; done; return 1; }
+task_range() {  # task_range : the numbers this agent gives the top-level tasks it creates (a: 200-499, b: 500-799, ...)
+  local i; i=$(( $(printf %d "'$AGENT_ID") - 97 )); echo "${TASK_RANGE:-$(( 200 + 300 * i ))-$(( 499 + 300 * i ))}"
+}
+
+# Sync: the latest main into this agent's branch before every pick (and during waits). A conflict is left to the next
+# session (SYNC_CONFLICT goes into its prompt); the branch stays as it was.
+SYNC_CONFLICT=""
+team_sync() {
+  commit_leftovers "uncommitted work before syncing with main"
+  git merge-base --is-ancestor main HEAD && { SYNC_CONFLICT=""; return 0; }
+  if git merge --no-ff --no-edit -m "[driver] sync: merge main into $BRANCH" main > /dev/null 2>&1; then
+    SYNC_CONFLICT=""; log "team: merged the latest main into $BRANCH"; return 0
+  fi
+  SYNC_CONFLICT=$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ $//')
+  git merge --abort 2>/dev/null
+  log "team: main conflicts with $BRANCH in: $SYNC_CONFLICT - the next session resolves it"; tev sync_conflict "" "$SYNC_CONFLICT"
+  return 1
+}
+# Accepted: bring the branch into main. Under the team's merge lock: merge main into the branch, re-run the tests if
+# main brought anything, then fast-forward main. A conflict or a new test failure reopens the task with the reason.
+team_merge() {  # team_merge <task file>
+  local f=$1 files cur new base d
+  exec 8> "$TEAM/merge.lock"; flock 8
+  commit_leftovers "before merging $(task_id "$f") into main"
+  if ! git merge-base --is-ancestor main HEAD; then
+    if ! git merge --no-ff --no-edit -m "[driver] merge main into $BRANCH before merging $(task_id "$f")" main > /dev/null 2>&1; then
+      files=$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ $//'); git merge --abort 2>/dev/null; flock -u 8
+      tev merge_conflict "$f" "$files"; log "team: $f accepted but conflicts with main in: $files - reopened"
+      VERIFY=rejected
+      reopen "$f" "- Accepted, but it cannot go into main yet: your branch conflicts with main (the other agent's finished work) in: $files"$'\n'"    Run \`git merge main\`, resolve each conflict keeping both sides' intent, run the tests, commit, then set the task done again."$'\n'
+      return 1
+    fi
+    if ! run_tests; then
+      cur=$(failing_set "$TEST_OUT"); base=.agent/baselines/$(task_id "$f").txt; [ -f "$base" ] || base=$BASELINE
+      new=$(comm -13 <(sort -u "$base" 2>/dev/null) <(echo "$cur" | sed '/^$/d'))
+      if [ -n "$new" ] || [ -z "$cur" ]; then
+        flock -u 8; tev post_merge_fail "$f" "$(echo $new | cut -c1-200)"; log "team: tests fail after merging main into $BRANCH - $f reopened"
+        VERIFY=rejected
+        reopen "$f" "- Accepted on its own, but after merging main (the other agent's finished work) these tests fail:"$'\n'"${TEST_REPORT:-$(sed 's/^/    /' <<<"$new")}"$'\n'"    Fix the combination (your branch now contains main), then set the task done again."$'\n'
+        return 1
+      fi
+    fi
+  fi
+  if git -C "$TEAM_DIR" merge --ff-only -q "$BRANCH" > /dev/null 2>&1; then
+    rm -f .agent/merge-pending
+    tev merge "$f" "$(git rev-parse --short HEAD)"; log "team: $f merged into main ($(git rev-parse --short HEAD))"
+    d=$(ls "$TEAM_DIR"/tasks/[0-9]*.md 2>/dev/null | xargs -n1 basename | cut -d- -f1 | sort | uniq -d | tr '\n' ' ')
+    [ -n "$d" ] && { tev dup_task_id "" "$d"; log "WARNING team: duplicate task numbers in main: $d"; }
+  else
+    touch .agent/merge-pending
+    tev merge_failed "$f" "main refused a fast-forward (uncommitted changes in $TEAM_DIR?)"
+    log "WARNING team: main ($TEAM_DIR) refused the fast-forward of $BRANCH - retried before the next session"
+  fi
+  flock -u 8
+  return 0
+}
+team_retry_merge() {  # a fast-forward that main refused earlier, retried before the next pick
+  [ -f .agent/merge-pending ] || return 0
+  exec 8> "$TEAM/merge.lock"; flock 8
+  if git merge-base --is-ancestor main HEAD && git -C "$TEAM_DIR" merge --ff-only -q "$BRANCH" > /dev/null 2>&1; then
+    rm -f .agent/merge-pending; tev merge "" "retry $(git rev-parse --short HEAD)"; log "team: pending merge into main done"
+  fi
+  flock -u 8
+}
+# Nothing workable. Wait while another agent holds work (main changes when it finishes); when nobody holds anything,
+# the lead agent runs the goal check (or breaks a dependency deadlock), and the others wait for it or for STOP.
+# Prints: wait | goal | stop | force <task file>
+team_idle_decision() {
+  local f
+  [ -f "$TEAM/STOP" ] && { echo stop; return; }
+  any_claims && { echo wait; return; }
+  team_lead || { echo wait; return; }
+  f=$(TEAM_IGNORE=1 next_task)   # open work nobody holds and nobody can start: its dependencies cannot be met
+  [ -n "$f" ] && { echo "force $f"; return; }
+  echo goal
+}
+TEAM_WAIT_T0=""
+team_wait() {  # one wait step (60 s) while another agent works
+  local r
+  if [ -z "$TEAM_WAIT_T0" ]; then
+    TEAM_WAIT_T0=$(date +%s); r=$(team_idle_reason)
+    log "team: nothing to take now - waiting for the other agent(s): $r"; tev wait_start "" "$r"
+  fi
+  [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting - stopping"; exit 0; }
+  sleep "${TEAM_WAIT_S:-60}"
+  team_sync || true
+}
+team_wait_done() {  # a task was picked after a wait: record how long this agent was held up
+  [ -n "$TEAM_WAIT_T0" ] || return 0
+  local s=$(( $(date +%s) - TEAM_WAIT_T0 )); TEAM_WAIT_T0=""
+  log "team: waited $((s / 60)) min for the other agent(s)"; tev wait_end "${1:-}" "$s"
+}
+team_prompt() {  # the team part of the session prompt
+  local t a txt
+  txt=" TEAM MODE: you are agent $AGENT_ID; other agents build other tasks of this project at the same time, each in its own checkout and git branch. The driver merges every accepted task into \`main\` and merges \`main\` into your branch before each session. Rules: change only the files your task's \`Touches:\` line names (add a path there first if your task really needs another); do not edit other tasks' files, except to add new tasks; new top-level tasks you create take the lowest free number in $(task_range) and need a \`Depends on:\` line and a \`Touches:\` line, one module per task, so the agents can work in parallel; tests must not bind fixed network ports or write outside the project and the temp dir (the other checkouts run their tests at the same time); never run git merge, rebase, reset, stash or switch branches unless this prompt asks you to resolve a merge."
+  for t in $(others_tasks); do
+    a=$(grep -l -- "$t" "$TEAM"/claims/*/owner 2>/dev/null | head -1 | xargs -r cat | cut -d' ' -f1)
+    txt+=" Agent ${a:-?} is working on $(task_id "$t") ($(sed -n 's/^# //p' "$t" | head -1 | cut -c1-80)), touching: $(touches_of "$t" | tr '\n' ' ' | sed 's/ $//')."
+  done
+  [ -n "$SYNC_CONFLICT" ] && txt+=" FIRST, before your task step: merging the latest \`main\` into your branch conflicts in: $SYNC_CONFLICT. Run \`git merge main\`, resolve every conflict keeping both sides' intent (main holds the other agents' finished work), run the tests, and commit the merge."
+  printf '%s' "$txt"
+}
+# Planning a team project: tasks must say what they need and what they touch, so the scheduler can run them in parallel.
+TEAM_PLAN_CRITERIA='- [ ] Every task file besides 000 and 999 has a `Depends on:` line (the numbers of the tasks that must be finished first, or `none`) and a `Touches:` line (the files and directories the task will create or change)
+- [ ] The work is split into modules that two agents can build at the same time: tasks that could run at once touch different files, and PLAN.md shows the order as waves (all tasks of a wave can run at once, and most waves have two or more tasks)
+- [ ] Tests never bind a fixed network port (use port 0) or write outside the project and the system temp dir: two checkouts of this project run their tests at the same time'
+TEAM_PLAN_NOTE='- Two agents build this project at the same time, each in its own checkout; a task goes to one agent once all its `Depends on:` tasks are finished, and never while the other agent works on a task that touches the same files. Put shared foundations first (project skeleton, data model, the interfaces between modules), so the later tasks can go ahead independently.'
+team_plan_check() {  # extra checks of the planning task's done claim in team mode
+  local f r=""
+  for f in tasks/[0-9]*.md; do
+    case $f in tasks/000-*|tasks/999-*) continue ;; esac
+    grep -qiE '^Depends on:' "$f" || r+="    $f has no \`Depends on:\` line"$'\n'
+    grep -qiE '^Touches:' "$f" || r+="    $f has no \`Touches:\` line"$'\n'
+  done
+  [ -n "$r" ] && printf '%s\n%s' "- Team project: every task needs \`Depends on:\` and \`Touches:\` lines:" "$r"
+  return 0
+}

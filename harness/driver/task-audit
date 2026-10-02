@@ -3,8 +3,9 @@
 
 The agent owns HOW work is done: it may split tasks into subtasks (tasks/025a-*.md), add tasks, rewrite its own tasks.
 The human owns WHAT done means: the acceptance boxes of tasks the agent did not create. Registry: .agent/tasks.json.
-  init         register every task file not yet known as the human's (run at loop start: files present when a loop
-               starts were written by a human), recording its acceptance boxes
+  init [FILE..] register every task file not yet known as the human's (run at loop start: files present when a loop
+               starts were written by a human); with FILEs, only those (team mode: tasks the other agents created
+               arrive through merges and must not become the human's); records each one's acceptance boxes
   scan         after an iteration: register new task files as the agent's, and report (one line each, for the loop
                log) new tasks, human tasks whose boxes went missing, and new or changed `## Proposed changes` sections
   owner FILE   print human or agent
@@ -76,8 +77,9 @@ def main():
     reg, ts = load(), tasks()
     if cmd == "init":
         n = 0
+        only = {m.group(1) for m in (TASK_FILE.match(os.path.basename(a)) for a in sys.argv[2:]) if m}
         for tid, f in ts.items():
-            if tid not in reg:
+            if tid not in reg and (not sys.argv[2:] or tid in only):
                 reg[tid] = {"owner": "human", "file": f, "boxes": boxes(f), "proposal": sha(proposal(f)), "reported": ""}
                 n += 1
         save(reg)

@@ -18,9 +18,14 @@
 # Requests to the human (the agent's ask_human tool, .agent/asks/): a blocking one makes its task wait while the loop
 # works on other tasks; answered, that task runs next. With nothing else to do the loop waits (never exits) and the
 # doorbell pings the human when the wait starts and every ASK_REMIND_HOURS after.
+# Team mode (several agents on one project, set up by `agent-team`): a worktree's .agent/team.env sets TEAM_DIR (the
+# main checkout) and AGENT_ID; agent-team-lib then adds claims, dependencies, file-overlap checks, syncing with main and
+# merging accepted tasks into main. Without team.env nothing changes.
 set -uo pipefail
 DRIVER_FILE=$(realpath "${BASH_SOURCE[0]}")
 P=$(realpath "${1:?usage: agent-loop <project dir>}")
+[ -f "$P/.agent/team-main" ] && { echo "$P is the main checkout of a team project: start the team with agent-team start" >&2; exit 1; }
+if [ -z "${TEAM_DIR:-}" ] && [ -f "$P/.agent/team.env" ]; then set -a; . "$P/.agent/team.env"; set +a; fi
 MAX_ITERS=${MAX_ITERS:-200}
 ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
@@ -49,6 +54,7 @@ mkdir -p .agent/sessions .agent/harness
 LOG=.agent/loop.log
 LEDGER=.agent/iterations.jsonl
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
+[ -n "${TEAM_DIR:-}" ] && . "$HOME/bin/agent-team-lib"
 
 # One loop per project, and never start while a previous loop's agent is still running.
 # fd 9 holds the lock. Children get it closed (9>&-): an agent that outlives a killed loop must not keep the lock, or a
@@ -58,18 +64,42 @@ flock -n 9 || { echo "another agent-loop is running on $P" >&2; exit 1; }
 # The running session's pid is recorded in .agent/pi.pid (text matching with pgrep -f is fooled by any process whose
 # command line merely mentions pi, including the check itself).
 while [ -f .agent/pi.pid ] && kill -0 "$(cat .agent/pi.pid)" 2>/dev/null; do log "waiting for running agent session (pid $(cat .agent/pi.pid))"; sleep 30; done
+[ -n "${TEAM_DIR:-}" ] && echo $$ > "$TEAM/loops/$AGENT_ID.pid" && log "team mode: agent $AGENT_ID, main checkout $TEAM_DIR, model server $LLM_URL"
 
 USER_TEST_CMD=${TEST_CMD:-}
 pick_test_cmd() {
   if [ -n "$USER_TEST_CMD" ]; then TEST_CMD=$USER_TEST_CMD
-  elif [ -f package.json ]; then TEST_CMD="npm test --silent"; else TEST_CMD="python3 -m pytest -q"; fi
+  elif [ -f package.json ]; then TEST_CMD="npm test --silent"
+  elif [ -x .venv/bin/python ]; then TEST_CMD=".venv/bin/python -m pytest -q"
+  else TEST_CMD="python3 -m pytest -q"; fi
+}
+# Python packages a project pins in requirements.txt (every version and hash, AGENTS.md) live in its virtualenv .venv
+# (gitignored; each checkout of a team project has its own). Rebuilt from scratch whenever requirements.txt changes,
+# with --require-hashes so an unpinned or altered package fails instead of installing; it sees the system packages.
+ensure_venv() {
+  [ -f requirements.txt ] || return 0
+  local want; want=$(sha256sum < requirements.txt | cut -c1-16)
+  [ -x .venv/bin/python ] && [ "$(cat .venv/.requirements-sha 2>/dev/null)" = "$want" ] && return 0
+  [ -f ".agent/venv-failed-$want" ] && return 0   # this requirements.txt already failed: no retry until it changes
+  mkdir -p .agent/reports
+  if rm -rf .venv && python3 -m venv --system-site-packages .venv > .agent/reports/venv.txt 2>&1 \
+     && timeout 900 .venv/bin/pip install -q --require-hashes -r requirements.txt >> .agent/reports/venv.txt 2>&1 9>&- 8>&-; then
+    echo "$want" > .venv/.requirements-sha; log "virtualenv .venv built from requirements.txt ($want)"
+  else
+    rm -rf .venv   # tests fall back to the system python, so the missing packages show up as failures
+    local msg; msg=$(grep -m1 -iE 'error|not match' .agent/reports/venv.txt || grep -v '^[[:space:]]*$' .agent/reports/venv.txt | tail -1)
+    log "WARNING: building .venv from requirements.txt failed: ${msg:0:200} - full output .agent/reports/venv.txt"
+    touch ".agent/venv-failed-$want"   # the agents read DECISIONS.md, not the loop log: say it there, once per version
+    printf '\n## %s DRIVER: .venv could not be built from requirements.txt\n    %s\n    Every package needs a pinned version and hash (AGENTS.md, Research and packages); full pip output: .agent/reports/venv.txt\n' \
+      "$(date +%F)" "${msg:0:300}" >> DECISIONS.md
+  fi
 }
 pick_test_cmd
 
 # ---- Projects that start from GOAL.md ----------------------------------------------------------------------------
 # The human writes GOAL.md in their own words; the agent owns the plan (PLAN.md) and the task queue. Task-audit
 # registers 000 and 999 as the human's (the driver writes them), so their acceptance boxes stay fixed.
-plan_task() { cat <<'EOF'
+plan_task_text() { cat <<'EOF'
 Status: open
 # 000: Plan the project from GOAL.md
 
@@ -89,6 +119,14 @@ GOAL.md says, in the human's own words, what this project should be. Turn it int
 - This task is the plan only: create PLAN.md, the task files and the test setup, not the product.
 EOF
 }
+plan_task() {
+  local t; t=$(plan_task_text)
+  if [ -n "${TEAM_PLAN:-}${TEAM_DIR:-}" ]; then   # team project: tasks must say what they need and what they touch
+    [ -n "${TEAM_PLAN_CRITERIA:-}" ] || . "$HOME/bin/agent-team-lib"
+    t=${t/$'\n\n## Notes'/$'\n'"$TEAM_PLAN_CRITERIA"$'\n\n## Notes'}; t+=$'\n'"$TEAM_PLAN_NOTE"
+  fi
+  printf '%s\n' "$t"
+}
 goal_check_task() { cat <<'EOF'
 Status: open
 # 999: Check the project against GOAL.md
@@ -105,12 +143,13 @@ The task queue is empty. Check the project against GOAL.md point by point, the w
 EOF
 }
 if [ ! -f AGENTS.md ]; then cp -rn "$HOME/.agent-kit/template/." . && log "project set up from the template"; fi
-[ -d .git ] || git init -q -b agent/work
+[ -e .git ] || git init -q -b "${INIT_BRANCH:-agent/work}"   # -e: in a worktree .git is a file
 if [ -f GOAL.md ] && ! compgen -G "tasks/[0-9]*.md" > /dev/null; then
   plan_task > tasks/000-plan.md; cp GOAL.md .agent/goal.last
   git add -A && git commit -q -m "[driver] project set up from GOAL.md: planning task 000"
   log "no tasks yet: tasks/000-plan.md asks the agent to plan from GOAL.md"
 fi
+[ -n "${AGENT_LOOP_INIT_ONLY:-}" ] && { log "set up only (AGENT_LOOP_INIT_ONLY)"; exit 0; }   # agent-team init
 # GOAL.md edited since the last plan: reopen the planning task with the change (before the hand-over section, which
 # stays last).
 goal_changed() {
@@ -152,7 +191,7 @@ goal_check_next() {
   rounds=$((rounds + 1))
   if [ -f "$gc" ]; then sed -i -e '1s/.*/Status: open/' -e 's/^- \[x\]/- [ ]/' "$gc"; else goal_check_task > "$gc"; fi
   printf 'sha_=%s\nrounds=%s\nstart=%s\nadded=-1\n' "$sha" "$rounds" "$n" > .agent/goal-check
-  task-audit init > /dev/null 2>&1   # a new 999 is registered as the human's, like 000
+  task-audit init "$gc" > /dev/null 2>&1   # 999 alone is registered as the human's, like 000
   git add -A && git commit -q -m "[driver] queue empty: goal check round $rounds"
   log "queue empty: goal check round $rounds against GOAL.md" >&2
   echo "$gc"
@@ -167,12 +206,12 @@ keep() {  # keep < content : store content under its sha256, print the sha
   if [ -e ".agent/harness/$s" ]; then rm -f "$t"; else mv "$t" ".agent/harness/$s"; fi; echo "$s"
 }
 masked() { jq 'walk(if type == "object" then with_entries(if (.key | test("apikey|secret|password"; "i")) then .value = "***" else . end) else . end)' "$1"; }
-DRIVER_SHA=$(keep < "$DRIVER_FILE")  # hashed at start: the file may be replaced while this copy keeps running
+DRIVER_SHA=$(cat "$DRIVER_FILE" ${TEAM_DIR:+"$HOME/bin/agent-team-lib"} | keep)  # hashed at start: the file may be replaced while this copy keeps running
 harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
-  local pc=$HOME/.pi/agent props models f vllm notes=$HOME/.agent-kit/server-notes.json
+  local pc=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent} props models f vllm notes=$HOME/.agent-kit/server-notes.json
   # llama-server answers /props; vLLM answers /version + /v1/models (and a JSON 404 on /props, hence the select).
-  props=$(curl -s -m 5 127.0.0.1:8080/props | jq -S 'select(.model_path) | del(.is_sleeping)' 2>/dev/null)
-  vllm=$({ curl -s -m 5 127.0.0.1:8080/version; curl -s -m 5 127.0.0.1:8080/v1/models; } | jq -s -S -c \
+  props=$(curl -s -m 5 "$LLM_URL/props" | jq -S 'select(.model_path) | del(.is_sleeping)' 2>/dev/null)
+  vllm=$({ curl -s -m 5 "$LLM_URL/version"; curl -s -m 5 "$LLM_URL/v1/models"; } | jq -s -S -c \
     'if length == 2 and (.[0].version // null) != null then {version: .[0].version, model: (.[1].data[0] | {id, max_model_len})} else null end' 2>/dev/null)
   models=$(masked "$pc/models.json" 2>/dev/null)
   HARNESS=$(jq -n -S -c \
@@ -224,7 +263,8 @@ workable() {  # workable <file> in-progress|open
   local s; s=$(status_of "$1")
   grep -qxF -- "$1" <<<"${WAITING:-}" && return 1   # waits for the human's answer to a request
   [ "$(pending_subtasks "$(task_id "$1")")" -eq 0 ] || return 1
-  if [ "$2" = in-progress ]; then [ "$s" = in-progress ]; else [ "$s" = open ] || [ "$s" = split ]; fi
+  if [ "$2" = in-progress ]; then [ "$s" = in-progress ]; else [ "$s" = open ] || [ "$s" = split ]; fi || return 1
+  [ -z "${TEAM_DIR:-}" ] || [ -n "${TEAM_IGNORE:-}" ] || team_workable "$1"   # claims, dependencies, file overlap
 }
 next_task() {
   local f
@@ -242,7 +282,7 @@ codemap_sync() {
     *) log "WARNING: codemap-gen failed - CODEMAP.md left unchanged ($1)" ;;
   esac
 }
-agent_commits() { git log --oneline --invert-grep --grep='^\[driver\]' | wc -l; }
+agent_commits() { git log --first-parent --oneline --invert-grep --grep='^\[driver\]' | wc -l; }   # first parent: not the other agents' commits merged in
 commit_leftovers() {
   if [ -n "$(git status --porcelain)" ]; then git add -A && git commit -q -m "[driver] $1"; log "driver committed: $1"; fi
 }
@@ -360,10 +400,11 @@ task_baseline() {  # task_baseline <task file> : record the failing tests at the
   if [ -n "$(git status --porcelain DECISIONS.md)" ]; then git add DECISIONS.md && git commit -q -m "[driver] flaky test logged (baseline run)"; fi
 }
 run_tests() {
+  ensure_venv
   pick_test_cmd
   local out1 out2 rc
   TEST_OUT=""
-  out1=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); rc=$?
+  out1=$(timeout 900 bash -c "$TEST_CMD" 2>&1 8>&- 9>&-); rc=$?
   [ $rc -eq 0 ] && return 0
   # pytest exits 5 when it collects no tests: a project with no tests yet is not a failing one
   [ $rc -eq 5 ] && [[ $TEST_CMD == *pytest* ]] && return 0
@@ -374,7 +415,7 @@ run_tests() {
     log "test suite timed out after 900 s (a test hangs) - not rerun"
     return 1
   fi
-  if out2=$(timeout 900 bash -c "$TEST_CMD" 2>&1 9>&-); then
+  if out2=$(timeout 900 bash -c "$TEST_CMD" 2>&1 8>&- 9>&-); then
     printf '\n## %s DRIVER FLAKY: test failed once, passed on rerun (fix or de-flake it)\n%s\n' "$(date +%F)" \
       "$(failing_names "$out1")" >> DECISIONS.md
     log "flaky test detected (logged in DECISIONS.md), not blocking"
@@ -521,6 +562,7 @@ verify_done() {
   if [ "$f" = tasks/000-plan.md ]; then
     [ -f PLAN.md ] || reasons+="- PLAN.md does not exist."$'\n'
     ls tasks/[0-9]*.md 2>/dev/null | grep -qv -e '/000' -e '/999-' || reasons+="- There are no task files besides the planning task."$'\n'
+    [ -n "${TEAM_DIR:-}" ] && reasons+=$(team_plan_check)
   fi
   [ "$f" = tasks/999-goal-check.md ] && [ ! -f GOAL-CHECK.md ] && reasons+="- GOAL-CHECK.md does not exist."$'\n'
   if run_tests; then
@@ -544,7 +586,8 @@ verify_done() {
 # Start-up: save anything an interrupted session left behind, and audit tasks already marked done:
 # checkboxes per task, the test suite ONCE (a suite failure can't be pinned on one task, so it is logged, not reopened).
 commit_leftovers "uncommitted work found at loop start"
-task-audit init | while IFS= read -r l; do log "$l"; done
+# team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
+if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
 task_scan
 for f in tasks/[0-9]*.md; do
   [ -f "$f" ] && [ "$(status_of "$f")" = done ] || continue
@@ -573,6 +616,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
   wait_for_talk
   wait_for_server
+  [ -n "${TEAM_DIR:-}" ] && { team_retry_merge; team_sync || true; }
   goal_changed
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
@@ -581,11 +625,27 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     WAITING=$(waiting_tasks)
     task=$(answered_first)
     [ -z "$task" ] && task=$(next_task)
+    if [ -n "$task" ] && [ -n "${TEAM_DIR:-}" ] && ! claim_task "$task"; then continue; fi   # another agent was faster
     [ -n "$task" ] && break
     if [ -n "$WAITING" ] && { inbox_pending || [ -n "$(asks_with answered)" ]; }; then task=$(head -1 <<<"$WAITING"); break; fi
     if [ -n "$(asks_with open)" ]; then wait_for_human; continue; fi
+    if [ -n "${TEAM_DIR:-}" ]; then   # wait for the other agents, or (lead agent, nobody holding work) check the goal
+      decision=$(team_idle_decision)
+      case $decision in
+        wait) team_wait; continue ;;
+        stop) log "team: stopping - $(cat "$TEAM/STOP" 2>/dev/null)"; task=""; break ;;
+        force*) task=${decision#force }
+                log "team: DEADLOCK - open tasks wait on dependencies nobody can finish ($(team_idle_reason)); taking $task anyway"
+                tev deps_deadlock "$task" "$(team_idle_reason)"; claim_task "$task" || continue; break ;;
+      esac
+      task=$(goal_check_next)
+      if [ -n "$task" ]; then claim_task "$task" || continue
+      else echo "$(date '+%F %T') agent $AGENT_ID: the goal check found nothing more to do, or ran out of rounds" > "$TEAM/STOP"; tev stop "" ""; fi
+      break
+    fi
     task=$(goal_check_next); break
   done
+  [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   before=$(agent_commits)
   harness_stamp
@@ -610,6 +670,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
     [ "$runs" -ge 5 ] && PROMPT="$PROMPT This task has taken $runs sessions so far: if what remains is more than a few sessions of work, split it into subtasks first (AGENTS.md, Tasks)."
   fi
+  [ -n "${TEAM_DIR:-}" ] && PROMPT="$PROMPT$(team_prompt)"
   # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).
   pb=$(stat -c %s PROGRESS.md 2>/dev/null || echo 0)
   [ "$pb" -gt 30720 ] && PROMPT="$PROMPT FIRST, before anything else: PROGRESS.md is $((pb / 1024)) KB, far over its ~150-line budget. Rewrite it to the current state only (drop finished and superseded notes; git history keeps them) and commit that on its own." \
@@ -722,6 +783,10 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   fi
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
+  if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
+    if [ "$VERIFY" = accepted ] && team_merge "$task" && [ "$(task_id "$task")" = "$(claim_key "$task")" ]; then release_claim "$task"; fi
+    [ "$status_after" = dropped ] && [ "$(task_id "$task")" = "$(claim_key "$task")" ] && release_claim "$task"
+  fi
   if [ "$status_after" = blocked ]; then   # blocked while a request is open: it resumes when that is answered
     for a in $(asks_with open); do grep -qxF -- "$task" "${a%.md}.waiters" 2>/dev/null || echo "$task" >> "${a%.md}.waiters"; done
   fi

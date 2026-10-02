@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# stub pi for the team-mode test: an honest agent that does its task from the task file alone (no model).
+#   000  copies the fixture tasks ($STUB_FIXTURES/*.md) and writes PLAN.md
+#   999  writes GOAL-CHECK.md (everything met)
+#   any  task: writes one line per `Touches:` path; a task with a `Stub-writes:` line also overwrites that file (an
+#        undeclared shared file: the conflict case). Then ticks its boxes and sets itself done.
+# When the driver asks for a merge with main, the stub merges it, conflicts resolved to this side.
+[ "${1:-}" = --version ] && { echo "stub-team-pi 0"; exit 0; }
+PROMPT="${@: -1}"
+TASK=$(grep -oE 'Your task file is tasks/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^Your task file is //')
+mkdir -p .agent; printf '%s\n---\n' "$PROMPT" >> .agent/stub-prompts.txt
+sleep "${STUB_SLEEP:-3}"
+# only when the driver asks (sync conflict in the prompt, or a done claim that could not go into main), as agents are told
+if grep -q 'FIRST, before your task step' <<<"$PROMPT" || tail -6 DECISIONS.md 2>/dev/null | grep -q 'cannot go into main yet'; then
+  git merge-base --is-ancestor main HEAD || git merge -q -X ours --no-edit -m "merge main (stub resolves)" main
+fi
+case $TASK in
+  tasks/000-*)
+    cp "$STUB_FIXTURES"/*.md tasks/
+    printf '# PLAN\n\nWaves: 001 002 004 006 007 | 003 | 005\n' > PLAN.md ;;
+  tasks/999-*)
+    printf '# GOAL-CHECK\n\nEverything met.\n' > GOAL-CHECK.md ;;
+  *)
+    for p in $(sed -n 's/^Touches:[[:space:]]*//p' "$TASK" | tr ',' ' '); do
+      case $p in */) mkdir -p "$p"; p="${p}part-$(basename "$TASK" .md).txt" ;; *) mkdir -p "$(dirname "$p")" ;; esac
+      echo "$(basename "$TASK" .md) by agent ${AGENT_ID:-?}" >> "$p"
+    done
+    w=$(sed -n 's/^Stub-writes:[[:space:]]*//p' "$TASK")
+    [ -n "$w" ] && echo "written by $(basename "$TASK" .md)" > "$w" ;;
+esac
+sed -i -e '/^## Hand-over/,$!s/^- \[ \]/- [x]/' -e '1s/.*/Status: done/' "$TASK"
+git add -A && git commit -q -m "$(basename "$TASK" .md): stub step by agent ${AGENT_ID:-?}"
+echo '{"type":"stub"}'
