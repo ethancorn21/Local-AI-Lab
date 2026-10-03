@@ -29,7 +29,8 @@ The ONLY memory you have is these files and git history. If you do not write it 
    them (a value, what a function returns, how a float rounds, what a regex matches): `node -e`, `python3 -c` or a
    throwaway script answers in seconds what working it out in your head takes minutes to guess. If the step changes
    existing code, follow Changing existing code below.
-4. **Verify.** Run the tests (`npm test` or the project's test command). The moment an approach fails, append it to
+4. **Verify.** Run the tests that exercise the code you changed, not the whole suite (the driver runs that when you
+   claim done). The moment an approach fails, append it to
    `DECISIONS.md`: if the session is cut short, anything not written down is lost.
 5. **Write memory.** Rewrite your task's `## Hand-over`. Append a `DECISIONS.md` entry for each choice you made and
    each thing that failed.
@@ -44,10 +45,16 @@ The next agent has to change what you write. Keep it easy:
   Length is the warning sign: a function over about 50 lines is almost always doing several jobs.
 - **One place for each piece of knowledge.** Before copying code or a rule, use or extract the one that exists.
   Only merge code that would change for the same reason: two things that merely look alike stay separate.
-- **No unit tests.** Tests drive the app the way its user does, through its public entry point (the page in a
-  browser, the command line, the HTTP API), and check what comes out. Never import a function or module to test it
-  on its own. When code feels like it needs a unit test, have it re-read instead: add
-  `Re-read: <file>:<function> - <what to check>` to your hand-over, and the next agent reviews it with fresh eyes.
+- **Tests, in this order of preference:** end-to-end (the whole app driven the way its user drives it: the page in a
+  browser, the command line, the HTTP API), integration (several real parts working together), golden (run on a
+  fixed input and compare the output with an approved file in the repo; regenerate the file only for an intended
+  change). **No unit tests**: never test one function or module on its own. When code feels like it needs one, have
+  it re-read instead: add `Re-read: <file>:<function> - <what to check>` to your hand-over, and the next agent
+  reviews it with fresh eyes.
+- **Edge cases belong in the spec and the code, not in a test of their own.** When you find an input the code
+  mishandles (empty, zero, the largest value, malformed), fix the implementation, then add the case to the
+  acceptance boxes of your own task, or to `## Proposed changes` on the human's task. Cover it with an end-to-end or
+  golden case.
 - **Comments say why the code is the way it is.** Task history belongs in commits and `DECISIONS.md`.
 
 ### Changing existing code: refactor first, then add
@@ -63,8 +70,8 @@ Then, in this order:
 1. **Refactor** the code your change goes into (split a function by job, extract a helper or module, rename) without
    changing what it does. Your new feature is not part of this.
 2. **Prove nothing changed.** Run the tests: the same tests pass as before, and no assertion was edited or deleted.
-   If no test covers what that code does, first write one through the public entry point for what it does now and
-   see it pass, then refactor.
+   If no test covers what that code does, first write an end-to-end or golden test of what it does now and see it
+   pass, then refactor.
 3. **Commit the refactor alone**: `<task id>: refactor <what> - to make room for <change>`. That can be the whole step.
 4. **Add your change** to the new shape, in its own commit.
 
