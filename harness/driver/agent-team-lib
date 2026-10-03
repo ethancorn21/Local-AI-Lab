@@ -79,8 +79,12 @@ others_tasks() {  # task files (in their worktrees) that other live agents hold
 }
 deps_of() { sed -n 's/^Depends on:[[:space:]]*//Ip' "$1" | head -1 | grep -oE '\b[0-9]+[a-z]*\b' || true; }
 unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (or dropped) in main
-  local d f s
+  local d f s p
+  p=$(claim_key "$1")
   for d in $(deps_of "$1"); do
+    # A subtask's dependency on its own parent is void: the parent (split) waits for its subtasks, so the two would
+    # wait for each other (frontpage 2026-10-03: 221a "Depends on: 221" left both agents idle).
+    [ "$(task_id "$1")" != "$p" ] && [[ $d =~ ^[0-9]+$ ]] && [ "$((10#$d))" = "$((10#$p))" ] && continue
     [[ $d =~ ^[0-9]+$ ]] && d=$(printf %03d "$((10#$d))")
     f=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
     if [ -z "$f" ]; then echo "$d"; continue; fi
@@ -138,6 +142,7 @@ live_agents() {  # ids of agents whose loops run, this one included
   return 0
 }
 team_lead() { [ "$(live_agents | sort | head -1)" = "$AGENT_ID" ]; }   # the first live agent runs goal checks
+others_hold_claims() { local o a; for o in "$TEAM"/claims/*/owner; do [ -f "$o" ] || continue; a=$(claim_owner "$(basename "$(dirname "$o")")"); [ -n "$a" ] && [ "$a" != "$AGENT_ID" ] && return 0; done; return 1; }
 any_claims() { local o; for o in "$TEAM"/claims/*/owner; do [ -f "$o" ] && [ -n "$(claim_owner "$(basename "$(dirname "$o")")")" ] && return 0; done; return 1; }
 task_range() {  # task_range : the numbers this agent gives the top-level tasks it creates (a: 200-499, b: 500-799, ...)
   local i; i=$(( $(printf %d "'$AGENT_ID") - 97 )); echo "${TASK_RANGE:-$(( 200 + 300 * i ))-$(( 499 + 300 * i ))}"
@@ -209,7 +214,7 @@ team_retry_merge() {  # a fast-forward that main refused earlier, retried before
 team_idle_decision() {
   local f
   [ -f "$TEAM/STOP" ] && { echo stop; return; }
-  any_claims && { echo wait; return; }
+  others_hold_claims && { echo wait; return; }   # only this agent's own claims, none workable: nobody frees them, so force
   team_lead || { echo wait; return; }
   f=$(TEAM_IGNORE=1 next_task)   # open work nobody holds and nobody can start: its dependencies cannot be met
   [ -n "$f" ] && { echo "force $f"; return; }

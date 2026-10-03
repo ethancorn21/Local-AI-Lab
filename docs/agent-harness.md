@@ -294,6 +294,9 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   the same agent. A marker with the state `pending` (written by hand while that agent is stopped) is finished at its
   next start. `analysis/tests/test_team_handover.sh`.
 - **The goal check waits for the queue:** 999 is not taken while any other task in main is still open.
+- **No waiting on yourself:** a subtask's `Depends on:` its own parent is ignored (the split parent waits for its
+  subtasks, never the reverse), and an idle agent waits only for another agent's claim. With nothing but its own blocked
+  claims it takes the deadlock path. `analysis/tests/test_team_deps.sh`.
 - **Open requests in a team:** an agent with an open request waits for the human only when no other agent holds work;
   otherwise it waits the team way and takes freed work within a minute. A task's open requests are withdrawn when the
   task is accepted (answering one would reopen the finished task).
@@ -363,6 +366,7 @@ human, fixed in the driver with a test, and deployed the same day.
 | The goal check ran six sessions while three tasks were still being built | A 999 left open by an earlier round has `Depends on: none`, so the idle fast agent took it | 999 waits until every other task is done in main |
 | b spent 10 sessions on 220 (0 of 7 boxes, the last four cut off at the window) while a waited | Nothing moved a stuck task from the small agent to the big one; the third time after 205 and 215 | Hand-over after 3 sessions without a ticked box while a bigger agent waits (above) |
 | a sat 25 min on a request from the day before, while the task it needed was being handed to it | The request (non-blocking, about a task finished since) was never closed, and the wait for the human never looked for team work | Team agents wait the team way while others work; accepted tasks withdraw their requests |
+| Both agents idle with four tasks left | a split 221 into 221a-d and wrote "Depends on: 221" (the parent) into 221a; the parent waits for its subtasks, and an agent holding only its own claims never reached the deadlock check | A dependency on the own parent is void; only another agent's claim means "wait" |
 | STALLED alert at 12 sessions on a re-plan that was 4 sessions old, and the planner was told to split itself | The count covered every session the task ever had, across three earlier plans; the planning file also carried all four GOAL.md diffs (29 KB) | Count since the last accepted done; a finished plan drops its old change notes on reopen (29 KB to 11 KB). `analysis/tests/test_replan.sh` |
 
 **Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40
