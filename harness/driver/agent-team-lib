@@ -230,6 +230,53 @@ team_wait_done() {  # a task was picked after a wait: record how long this agent
   local s=$(( $(date +%s) - TEAM_WAIT_T0 )); TEAM_WAIT_T0="" TEAM_WAIT_REASON=""
   log "team: waited $((s / 60)) min for the other agent(s)"; tev wait_end "${1:-}" "$s"
 }
+# A task too big for another running agent (over its TEAM_MAX_TOUCHES) can only ever go to the bigger agents, and a
+# claim covers a task's subtasks too: frontpage 2026-10-03, a re-plan put a 19-file task first in the chain and the
+# 8-file agent sat idle. So the agent that takes such a task first splits it into new top-level tasks the small agent
+# can take, and the task itself waits for them (its own Depends on). `Split: no - <reason>` in the task opts out.
+smallest_other_limit() {  # the smallest TEAM_MAX_TOUCHES among the other running agents (their env files), or empty
+  local id v m=""
+  for id in $(live_agents); do
+    [ "$id" = "$AGENT_ID" ] && continue
+    v=$(sed -n 's/^TEAM_MAX_TOUCHES=//p' "$HOME/.agent-kit/agents/$id.env" 2>/dev/null | tail -1)
+    [[ $v =~ ^[0-9]+$ ]] || continue
+    if [ -z "$m" ] || [ "$v" -lt "$m" ]; then m=$v; fi
+  done
+  echo "$m"
+}
+team_split_note() {  # team_split_note <task file> : the split instruction for a task too big for another agent, or nothing
+  local lim n
+  case $(task_id "$1") in 000|999) return 0 ;; esac
+  grep -qiE '^Split:[[:space:]]*no' "$1" && return 0
+  lim=$(smallest_other_limit); [ -n "$lim" ] || return 0
+  n=$(touches_of "$1" | grep -c .); [ "$n" -gt "$lim" ] || return 0
+  printf '%s' " SPLIT THIS TASK FIRST: it changes $n files, and another agent can only take tasks of at most $lim files, so as one task it waits for you alone. Split what is not built yet into new top-level tasks (the lowest free numbers in $(task_range)) of at most $lim files each, every one with a Goal, testable Acceptance criteria, a \`Depends on:\` line and a \`Touches:\` line, so that parts which do not need each other can be built at the same time. Either this task keeps what is already built and what the parts need first (the parts then depend on this task), or, when nothing is built yet, it waits for the parts (add their numbers to its \`Depends on:\` line). Move the acceptance boxes the parts deliver into the parts, and cut this task's \`Touches:\` line down to the files it still changes itself. Where another open task depends on this one and needs a part, add that part's number to its \`Depends on:\` line too. Commit and end the session: the driver puts these task files into main at once, so the other agent can take the parts. Only if the work truly cannot be divided: add the line \`Split: no - <reason>\` under this task's \`Touches:\` line and carry on."
+}
+team_publish_split() {  # team_publish_split <task file> <commit before the session> : after a session told to split
+  # its task, the task files it wrote or changed go into main at once (the parts, this task, Depends on lines added to
+  # others), so the other agents can take the parts now; code still reaches main only with an accepted task. A task
+  # another agent holds, or one main changed meanwhile, is left to the normal merge.
+  local f o files=""
+  for f in $(git diff --name-only "$2" HEAD -- 'tasks/[0-9]*.md'); do
+    [ -f "$f" ] || continue
+    o=$(claim_owner "$(claim_key "$f")")
+    if [ -z "$o" ]; then   # an unclaimed task: only if main still has the version this session started from
+      [ "$(git rev-parse -q --verify "main:$f" 2>/dev/null)" = "$(git rev-parse -q --verify "$2:$f" 2>/dev/null)" ] || continue
+    elif [ "$o" != "$AGENT_ID" ]; then continue; fi   # this agent's own tasks: nobody else edits them
+    files+=" $f"
+  done
+  [ -n "$files" ] || { log "team: $1 was to be split, but no task file changed - nothing published"; return 0; }
+  exec 8> "$TEAM/merge.lock"; flock 8
+  # shellcheck disable=SC2086
+  if git -C "$TEAM_DIR" checkout "$BRANCH" -- $files && git -C "$TEAM_DIR" commit -q -m "[driver] $(task_id "$1") split by agent $AGENT_ID: task files published to main ($(for f in $files; do task_id "$f"; done | tr '\n' ' ' | sed 's/ $//'))" -- $files; then
+    tev split_published "$1" "$files"; log "team: $1 split - task files published to main:$files"
+  else
+    git -C "$TEAM_DIR" reset -q -- $files 2>/dev/null; git -C "$TEAM_DIR" checkout -q main -- $files 2>/dev/null
+    tev split_publish_failed "$1" "$files"; log "WARNING team: could not publish the split of $1 to main"
+  fi
+  flock -u 8
+  return 0
+}
 team_prompt() {  # the team part of the session prompt
   local t a txt
   txt=" TEAM MODE: you are agent $AGENT_ID; other agents build other tasks of this project at the same time, each in its own checkout and git branch. The driver merges every accepted task into \`main\` and merges \`main\` into your branch before each session. Rules: change only the files your task's \`Touches:\` line names (add a path there first if your task really needs another); do not edit other tasks' files, except to add new tasks; new top-level tasks you create take the lowest free number in $(task_range) and need a \`Depends on:\` line and a \`Touches:\` line, one module per task, so the agents can work in parallel; tests must not bind fixed network ports or write outside the project and the temp dir (the other checkouts run their tests at the same time); never run git merge, rebase, reset, stash or switch branches unless this prompt asks you to resolve a merge. If your task cannot be finished before another task is done, do not build stand-ins for it: add that task's number to your task's \`Depends on:\` line, commit, and end the session; the driver gives you other work and brings this task back once that one is merged."

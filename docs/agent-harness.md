@@ -280,6 +280,12 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   holds a task whose paths overlap.
 - **Task size per agent:** an agent's env can cap the files a task may touch (`TEAM_MAX_TOUCHES`; agent b: 8). Bigger
   tasks are left to agents with bigger windows.
+- **Splitting for the smaller agent:** an agent that takes a task bigger than another running agent's cap is told to
+  split it first into new top-level tasks within that cap (a claim covers a task's subtasks, so only new top-level
+  tasks can go to the other agent). Either the task keeps what is built and the parts depend on it, or it waits for
+  the parts. After that session the driver puts the task files it wrote or changed into main at once (never code, never
+  a task another agent holds or main changed meanwhile), so the other agent can take a part right away. `Split: no -
+  <reason>` in a task opts out. `analysis/tests/test_team_split.sh`.
 - **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
   `Touches:` on every task, a plan in waves of tasks that can run at once, tests that never bind a fixed port (two
   checkouts run their tests at the same time), and no hotspot files: a plan where more than 3 open tasks change the
@@ -342,6 +348,7 @@ human, fixed in the driver with a test, and deployed the same day.
 | The goal check ran 19 rounds without stopping | Every round the agent ticked every box and wrote "all met", but left the first line `Status: in-progress` | The driver closes 000 or 999 when every box is ticked, then verifies as usual |
 | Sessions hit the context window again and again; DECISIONS.md was 76 KB | Entries of open tasks were never archived, and the goal check adds one per round | An open task keeps its newest 3 entries. The same fix found the archiver losing archived goal-check entries |
 | a spent 8 sessions on a task that needed another of its own tasks first | The dependency check only looked at the other agent's tasks | An agent's own tasks wait for their `Depends on:` too; the prompt says to add the dependency and end the session instead of building stand-ins |
+| Agent b idle for hours after the re-plan | The plan put a 19-file task first in a chain; b takes at most 8 files, and the plan check only looked for shared files | The agent that takes a too-big task splits it, and the parts go into main at once (above) |
 | STALLED alert at 12 sessions on a re-plan that was 4 sessions old, and the planner was told to split itself | The count covered every session the task ever had, across three earlier plans; the planning file also carried all four GOAL.md diffs (29 KB) | Count since the last accepted done; a finished plan drops its old change notes on reopen (29 KB to 11 KB). `analysis/tests/test_replan.sh` |
 
 **Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40

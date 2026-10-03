@@ -667,7 +667,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   done
   [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
-  before=$(agent_commits)
+  before=$(agent_commits); head0=$(git rev-parse HEAD); split=""
   harness_stamp
   log "iteration $i: $task (harness $HARNESS_ID)"
   codemap_sync "before iteration $i"
@@ -690,7 +690,11 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     runs=$(task_runs "$task")
     [ "$runs" -ge 5 ] && PROMPT="$PROMPT This task has taken $runs sessions so far: if what remains is more than a few sessions of work, split it into subtasks first (AGENTS.md, Tasks)."
   fi
-  [ -n "${TEAM_DIR:-}" ] && PROMPT="$PROMPT$(team_prompt)"
+  if [ -n "${TEAM_DIR:-}" ]; then
+    PROMPT="$PROMPT$(team_prompt)"
+    split=$(team_split_note "$task")
+    [ -n "$split" ] && { PROMPT="$PROMPT$split"; log "$task is too big for another agent: this session is told to split it"; tev split_asked "$task"; }
+  fi
   # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).
   pb=$(stat -c %s PROGRESS.md 2>/dev/null || echo 0)
   [ "$pb" -gt 30720 ] && PROMPT="$PROMPT FIRST, before anything else: PROGRESS.md is $((pb / 1024)) KB, far over its ~150-line budget. Rewrite it to the current state only (drop finished and superseded notes; git history keeps them) and commit that on its own." \
@@ -810,6 +814,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
         log "$task: every box ticked but the status was left open - closed by the driver, verifying"
       fi ;;
   esac
+  [ -n "$split" ] && team_publish_split "$task" "$head0"
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
   if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
