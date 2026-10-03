@@ -29,8 +29,7 @@ The ONLY memory you have is these files and git history. If you do not write it 
    them (a value, what a function returns, how a float rounds, what a regex matches): `node -e`, `python3 -c` or a
    throwaway script answers in seconds what working it out in your head takes minutes to guess. If the step changes
    existing code, follow Changing existing code below.
-4. **Verify.** Run the tests that exercise the code you changed, not the whole suite (the driver runs that when you
-   claim done). The moment an approach fails, append it to
+4. **Verify.** Run the tests (`npm test` or the project's test command). The moment an approach fails, append it to
    `DECISIONS.md`: if the session is cut short, anything not written down is lost.
 5. **Write memory.** Rewrite your task's `## Hand-over`. Append a `DECISIONS.md` entry for each choice you made and
    each thing that failed.
