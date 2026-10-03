@@ -334,6 +334,15 @@ wait_for_server() {
 # (<n>.waiters) and resume with it. Only when nothing else can be worked on does the loop wait; it never exits with a
 # request open, and a message typed in agent-watch also ends the wait. Nothing about a request leaves the VM.
 ask_field() { sed -n "s/^$2: //p" "$1" | head -1; }
+withdraw_asks_of() {  # withdraw_asks_of <task file> : a finished task's open requests are moot (answering one would reopen it)
+  local a
+  for a in $(asks_with open); do
+    [ "$(ask_field "$a" task)" = "$1" ] || continue
+    printf '\n## Withdrawn (%s, by the driver)\nThe task was finished and accepted before this was answered.\n' "$(date '+%F %H:%M')" >> "$a"
+    sed -i 's/^status: open$/status: withdrawn/' "$a"; log "$a withdrawn: $1 was accepted before it was answered"
+  done
+  return 0
+}
 asks_with() {  # asks_with <status> [blocking] : request files with that status (and blocking: yes)
   local f
   for f in .agent/asks/[0-9]*.md; do
@@ -605,6 +614,7 @@ verify_done() {
 # Start-up: save anything an interrupted session left behind, and audit tasks already marked done:
 # checkboxes per task, the test suite ONCE (a suite failure can't be pinned on one task, so it is logged, not reopened).
 commit_leftovers "uncommitted work found at loop start"
+[ -n "${TEAM_DIR:-}" ] && team_handover_finish   # a hand-over marked while this loop was stopped
 # team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
 if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
 task_scan
@@ -647,7 +657,13 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     if [ -n "$task" ] && [ -n "${TEAM_DIR:-}" ] && ! claim_task "$task"; then continue; fi   # another agent was faster
     [ -n "$task" ] && break
     if [ -n "$WAITING" ] && { inbox_pending || [ -n "$(asks_with answered)" ]; }; then task=$(head -1 <<<"$WAITING"); break; fi
-    if [ -n "$(asks_with open)" ]; then wait_for_human; continue; fi
+    # Open requests: wait for the human - but in a team, while another agent still works, wait the team way, which
+    # takes freed work within a minute (frontpage 2026-10-03: a stale non-blocking request held agent a here while
+    # the task it needed was being handed to it).
+    if [ -n "$(asks_with open)" ]; then
+      if [ -n "${TEAM_DIR:-}" ] && [ -n "$(others_tasks)" ]; then team_wait; continue; fi
+      wait_for_human; continue
+    fi
     if [ -n "${TEAM_DIR:-}" ]; then   # wait for the other agents, or (lead agent, nobody holding work) check the goal
       decision=$(team_idle_decision)
       case $decision in
@@ -668,6 +684,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   before=$(agent_commits); head0=$(git rev-parse HEAD); split=""
+  ticked0=$(grep -cE '^[[:space:]]*- \[x\]' "$task" 2>/dev/null || true)
   harness_stamp
   log "iteration $i: $task (harness $HARNESS_ID)"
   codemap_sync "before iteration $i"
@@ -687,7 +704,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     PROMPT="$PROMPT All subtasks of this task are finished: check its own acceptance boxes, tick the ones you verify, and set it done, or add subtasks for what is still missing."
   else
     # A task that keeps going session after session is too big for one step at a time: say so (AGENTS.md, Tasks).
-    runs=$(task_runs "$task")
+    runs=$(task_runs "$task"); case $tid in 000|999) runs=0 ;; esac   # the plan and the goal check are not split
     [ "$runs" -ge 5 ] && PROMPT="$PROMPT This task has taken $runs sessions so far: if what remains is more than a few sessions of work, split it into subtasks first (AGENTS.md, Tasks)."
   fi
   if [ -n "${TEAM_DIR:-}" ]; then
@@ -817,9 +834,11 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   [ -n "$split" ] && team_publish_split "$task" "$head0"
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
+  [ "$VERIFY" = accepted ] && withdraw_asks_of "$task"
   if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
     if [ "$VERIFY" = accepted ] && team_merge "$task" && [ "$(task_id "$task")" = "$(claim_key "$task")" ]; then release_claim "$task"; fi
     [ "$status_after" = dropped ] && [ "$(task_id "$task")" = "$(claim_key "$task")" ] && release_claim "$task"
+    case $status_after in done|dropped) ;; *) [ -f "$task" ] && team_handover_check "$task" "${ticked0:-0}" ;; esac
   fi
   if [ "$status_after" = blocked ]; then   # blocked while a request is open: it resumes when that is answered
     for a in $(asks_with open); do grep -qxF -- "$task" "${a%.md}.waiters" 2>/dev/null || echo "$task" >> "${a%.md}.waiters"; done

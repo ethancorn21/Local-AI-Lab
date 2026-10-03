@@ -287,6 +287,16 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   the parts. After that session the driver puts the task files it wrote or changed into main at once (never code, never
   a task another agent holds or main changed meanwhile), so the other agent can take a part right away. `Split: no -
   <reason>` in a task opts out. `analysis/tests/test_team_split.sh`.
+- **Handing over to the bigger agent:** when the smaller agent has had 3 sessions in a row on a task without ticking
+  a box (`TEAM_HANDOVER_SESSIONS`) while a bigger agent waits for work, its driver gives the task up. The branch is
+  kept as `agent/<id>-handover-<task>-<time>` and reset to main, so the half-done work cannot ride into main with the
+  agent's next task. The claim is released, and `handed/<task>` in the team dir keeps the task from coming back to
+  the same agent. A marker with the state `pending` (written by hand while that agent is stopped) is finished at its
+  next start. `analysis/tests/test_team_handover.sh`.
+- **The goal check waits for the queue:** 999 is not taken while any other task in main is still open.
+- **Open requests in a team:** an agent with an open request waits for the human only when no other agent holds work;
+  otherwise it waits the team way and takes freed work within a minute. A task's open requests are withdrawn when the
+  task is accepted (answering one would reopen the finished task).
 - **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
   `Touches:` on every task, a plan in waves of tasks that can run at once, tests that never bind a fixed port (two
   checkouts run their tests at the same time), and no hotspot files: a plan where more than 3 open tasks change the
@@ -350,6 +360,9 @@ human, fixed in the driver with a test, and deployed the same day.
 | Sessions hit the context window again and again; DECISIONS.md was 76 KB | Entries of open tasks were never archived, and the goal check adds one per round | An open task keeps its newest 3 entries. The same fix found the archiver losing archived goal-check entries |
 | a spent 8 sessions on a task that needed another of its own tasks first | The dependency check only looked at the other agent's tasks | An agent's own tasks wait for their `Depends on:` too; the prompt says to add the dependency and end the session instead of building stand-ins |
 | Agent b idle for hours after the re-plan | The plan put a 19-file task first in a chain; b takes at most 8 files, and the plan check only looked for shared files | The agent that takes a too-big task splits it, and the parts go into main at once (above) |
+| The goal check ran six sessions while three tasks were still being built | A 999 left open by an earlier round has `Depends on: none`, so the idle fast agent took it | 999 waits until every other task is done in main |
+| b spent 10 sessions on 220 (0 of 7 boxes, the last four cut off at the window) while a waited | Nothing moved a stuck task from the small agent to the big one; the third time after 205 and 215 | Hand-over after 3 sessions without a ticked box while a bigger agent waits (above) |
+| a sat 25 min on a request from the day before, while the task it needed was being handed to it | The request (non-blocking, about a task finished since) was never closed, and the wait for the human never looked for team work | Team agents wait the team way while others work; accepted tasks withdraw their requests |
 | STALLED alert at 12 sessions on a re-plan that was 4 sessions old, and the planner was told to split itself | The count covered every session the task ever had, across three earlier plans; the planning file also carried all four GOAL.md diffs (29 KB) | Count since the last accepted done; a finished plan drops its old change notes on reopen (29 KB to 11 KB). `analysis/tests/test_replan.sh` |
 
 **Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40

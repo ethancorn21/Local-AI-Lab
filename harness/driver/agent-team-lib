@@ -103,6 +103,10 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
   local k o t u
   k=$(claim_key "$1"); o=$(claim_owner "$k")
   if [ -n "$o" ] && [ "$o" != "$AGENT_ID" ]; then echo "held by agent $o"; return 0; fi
+  # The goal check grades the finished project: frontpage 2026-10-03, a 999 left open from an earlier round was taken
+  # (Depends on: none) while three tasks were still being built, and ran six sessions checking unfinished work.
+  case $1 in tasks/999-*) t=$(open_in_main); [ -n "$t" ] && { echo "the goal check waits until every other task is finished ($t)"; return 0; } ;; esac
+  if [ -f "$TEAM/handed/$k" ] && [ "$(cut -d' ' -f1 "$TEAM/handed/$k")" = "$AGENT_ID" ]; then echo "handed over to a bigger agent"; return 0; fi
   # Own work too waits for its declared dependencies: frontpage 2026-10-03, an agent spent 8 sessions on a subtask
   # that needed another agent's unfinished task (it builds stand-ins instead of the feature). Claim is kept.
   u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }
@@ -276,6 +280,62 @@ team_publish_split() {  # team_publish_split <task file> <commit before the sess
   fi
   flock -u 8
   return 0
+}
+open_in_main() {  # task ids in main, besides 000 and 999, that are not done or dropped
+  local f
+  for f in "$TEAM_DIR"/tasks/[0-9]*.md; do
+    [ -f "$f" ] || continue
+    case $(basename "$f") in 000-*|999-*) continue ;; esac
+    case $(status_of "$f") in done|dropped) ;; *) task_id "$f" ;; esac
+  done | tr '\n' ' ' | sed 's/ $//'
+}
+# A task the smaller agent cannot get through goes to a bigger agent that is waiting for work: frontpage 2026-10-03,
+# agent b (114k window, about a quarter of a's speed) spent 10 sessions on 220 without ticking a box, the last four
+# cut off at the window's edge, while agent a waited for it (the same had happened with 205 and 215). After
+# TEAM_HANDOVER_SESSIONS (3) sessions in a row without a newly ticked box, while a bigger agent waits, this agent gives
+# the task up: its branch is kept as a backup branch and reset to main (the half-done work must not ride into main with
+# its next task), the claim is released, and $TEAM/handed/<key> keeps it from taking the task again.
+agent_limit() { sed -n 's/^TEAM_MAX_TOUCHES=//p' "$HOME/.agent-kit/agents/$1.env" 2>/dev/null | tail -1; }
+waiting_bigger_agent() {  # a running agent with a bigger window than this one (no limit, or a higher one) that waits now
+  local id l e mine=${TEAM_MAX_TOUCHES:-}
+  [ -n "$mine" ] || return 0
+  for id in $(live_agents); do
+    [ "$id" = "$AGENT_ID" ] && continue
+    l=$(agent_limit "$id"); { [ -z "$l" ] || [ "$l" -gt "$mine" ]; } || continue
+    e=$(tail -n 3000 "$TEAM/events.jsonl" 2>/dev/null | jq -r --arg a "$id" \
+        'select(.agent == $a and (.event | test("^(wait_start|wait_reason|wait_end|claim)$"))) | .event' 2>/dev/null | tail -1)
+    case $e in wait_start|wait_reason) echo "$id"; return 0 ;; esac
+  done
+  return 0
+}
+team_handover_finish() {  # back up this agent's branch and reset it to main, for a task marked handed over by it
+  local m k a s b
+  for m in "$TEAM"/handed/*; do
+    [ -f "$m" ] || continue
+    read -r a _ s _ < "$m"; [ "$a" = "$AGENT_ID" ] && [ "$s" = pending ] || continue
+    k=$(basename "$m"); b="$BRANCH-handover-$k-$(date +%Y%m%d-%H%M)"
+    commit_leftovers "before handing $k over"
+    if [ "$(git rev-list --count main..HEAD)" -gt 0 ]; then
+      git branch "$b" HEAD && git reset -q --hard main || { log "WARNING team: could not reset $BRANCH after handing $k over"; continue; }
+      log "team: $k handed over - this branch's work on it is kept on $b, and $BRANCH is reset to main"
+    else b=none; fi
+    echo "$AGENT_ID $(date +%s) kept $b" > "$m"; tev handover_reset "" "$k backup $b"
+  done
+  return 0
+}
+team_handover_check() {  # team_handover_check <task file> <boxes ticked when the session started> : after each session
+  local k f n to; k=$(claim_key "$1"); f=.agent/progress-$k
+  case $k in 000|999) return 0 ;; esac
+  mkdir -p .agent
+  n=$(grep -cE '^[[:space:]]*- \[x\]' "$1" 2>/dev/null || true); n=${n:-0}
+  [ "$n" -gt "${2:-0}" ] && echo 1 >> "$f" || echo 0 >> "$f"   # 1 = this session ticked a box
+  [ "$(tail -n "${TEAM_HANDOVER_SESSIONS:-3}" "$f" | grep -c '^0$')" -ge "${TEAM_HANDOVER_SESSIONS:-3}" ] || return 0
+  to=$(waiting_bigger_agent); [ -n "$to" ] || return 0
+  mkdir -p "$TEAM/handed"; echo "$AGENT_ID $(date +%s) pending" > "$TEAM/handed/$k"
+  release_claim "$1"; rm -f "$f"
+  tev handover "$1" "to agent $to: ${TEAM_HANDOVER_SESSIONS:-3} sessions without a newly ticked box"
+  log "team: $1 handed over to agent $to (${TEAM_HANDOVER_SESSIONS:-3} sessions in a row without a newly ticked box, and agent $to is waiting)"
+  team_handover_finish
 }
 team_prompt() {  # the team part of the session prompt
   local t a txt
