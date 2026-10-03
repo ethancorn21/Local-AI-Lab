@@ -19,14 +19,15 @@ The ONLY memory you have is these files and git history. If you do not write it 
 
 ## Session protocol (every session)
 
-1. **Orient.** Read everything marked **read** above, in that order. Then read the code you need.
+1. **Orient.** Read everything marked **read** above, in that order. Then read the code you need, starting with any
+   `Re-read:` items in the hand-over: look for bugs with fresh eyes, fix what you find, and remove the item.
 2. **Check for dead ends.** Before choosing an approach, search `DECISIONS.md` for it; for code a finished task
    touched, grep `DECISIONS-archive.md` too. Never retry an approach listed as failed unless you write down what is
    different this time.
 3. **Do ONE step**: the smallest next step that moves the task forward. If the task turns out too big to finish in
    a few sessions, splitting it (see Tasks) is the step. Check facts by running code instead of reasoning about
    them (a value, what a function returns, how a float rounds, what a regex matches): `node -e`, `python3 -c` or a
-   quick test answers in seconds what working it out in your head takes minutes to guess. If the step changes
+   throwaway script answers in seconds what working it out in your head takes minutes to guess. If the step changes
    existing code, follow Changing existing code below.
 4. **Verify.** Run the tests (`npm test` or the project's test command). The moment an approach fails, append it to
    `DECISIONS.md`: if the session is cut short, anything not written down is lost.
@@ -43,8 +44,10 @@ The next agent has to change what you write. Keep it easy:
   Length is the warning sign: a function over about 50 lines is almost always doing several jobs.
 - **One place for each piece of knowledge.** Before copying code or a rule, use or extract the one that exists.
   Only merge code that would change for the same reason: two things that merely look alike stay separate.
-- **Tests check behavior, not internals.** Test what code returns or does, not its constants or private helpers,
-  so it can be reshaped without rewriting tests.
+- **No unit tests.** Tests drive the app the way its user does, through its public entry point (the page in a
+  browser, the command line, the HTTP API), and check what comes out. Never import a function or module to test it
+  on its own. When code feels like it needs a unit test, have it re-read instead: add
+  `Re-read: <file>:<function> - <what to check>` to your hand-over, and the next agent reviews it with fresh eyes.
 - **Comments say why the code is the way it is.** Task history belongs in commits and `DECISIONS.md`.
 
 ### Changing existing code: refactor first, then add
@@ -60,7 +63,8 @@ Then, in this order:
 1. **Refactor** the code your change goes into (split a function by job, extract a helper or module, rename) without
    changing what it does. Your new feature is not part of this.
 2. **Prove nothing changed.** Run the tests: the same tests pass as before, and no assertion was edited or deleted.
-   If that code has no test, first write one for what it does now and see it pass, then refactor.
+   If no test covers what that code does, first write one through the public entry point for what it does now and
+   see it pass, then refactor.
 3. **Commit the refactor alone**: `<task id>: refactor <what> - to make room for <change>`. That can be the whole step.
 4. **Add your change** to the new shape, in its own commit.
 
