@@ -3,7 +3,7 @@
 #   agent-team init <name> [ids...]   set up ~/projects/<name> (a folder with a GOAL.md) for a team (default ids: a b)
 #   agent-team start <name>           start every agent's loop in the background
 #   agent-team stop <name> [--now]    stop them (after the current sessions, or now)
-#   agent-team restart <name>         after a harness change: let current sessions finish, then start all again
+#   agent-team restart <name>         after a harness change: running agents finish their session, then start again
 #   agent-team status <name>          who works on what, waits, merges and conflicts
 # Layout: ~/projects/<name> is the main checkout (branch main: finished, merged work; nobody works in it), each agent
 # works in ~/projects/<name>.<id> (a git worktree on branch agent/<id>). Each agent's settings (model server, Pi config
@@ -74,16 +74,20 @@ start)
 stop)   # a deliberate stop: fresh heartbeats keep each agent's claims its own (stale only after TEAM_STALE_MIN)
   for id in $(ids); do touch "$TEAM/loops/$id.beat"; echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
   ;;
-restart)   # after a harness change: every agent finishes its current session, then all start again (new driver code)
-  for id in $(ids); do agent-stop "$(wt "$id")" > /dev/null; done
-  echo "waiting for the agents' current sessions to end..."
+restart)   # after a harness change: every running agent finishes its current session, then starts again (new driver
+           # code). An agent that was stopped stays stopped: it may have been stopped on purpose.
+  run=""; for id in $(ids); do flock -n "$(wt "$id")/.agent/loop.lock" true || run="$run $id"; done
+  [ -n "$run" ] || { echo "no agent is running: agent-team start $name starts them all"; exit 1; }
+  for id in $(ids); do case " $run " in *" $id "*) ;; *) echo "agent $id: stopped, left stopped (agent-team start $name starts every agent)";; esac; done
+  for id in $run; do agent-stop "$(wt "$id")" > /dev/null; done
+  echo "waiting for the current sessions of agent(s)$run to end..."
   while :; do
-    n=0; for id in $(ids); do flock -n "$(wt "$id")/.agent/loop.lock" true || n=$((n + 1)); done
+    n=0; for id in $run; do flock -n "$(wt "$id")/.agent/loop.lock" true || n=$((n + 1)); done
     [ "$n" -eq 0 ] && break; sleep 20
   done
   rm -f "$TEAM/STOP"
-  for id in $(ids); do touch "$TEAM/loops/$id.beat"; done   # each agent's claims stay its own while the loops start
-  for id in $(ids); do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
+  for id in $run; do touch "$TEAM/loops/$id.beat"; done   # each agent's claims stay its own while the loops start
+  for id in $run; do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
   ;;
 status)
   [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project"; exit 1; }

@@ -54,7 +54,7 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 - The human's tasks need a fully green suite. The agent's own tasks may finish with tests that were already failing when the task was first handed out, never with new failures. This lets a subtask that fixes part of a sibling's broken tests be accepted.
 - If the agent removes one of the human's acceptance boxes, the claim is rejected and flagged. A `## Proposed changes` section is the legitimate way to say a criterion is wrong.
 - Driver notes in DECISIONS.md stay short (first 8 failing tests plus a pointer to the full list in `.agent/reports/`).
-- A task still unfinished after 8 sessions is logged as STALLED (and every 4 sessions after).
+- A task still unfinished after 8 sessions is logged as STALLED (and every 4 sessions after). Sessions count from the task's last accepted done, so a re-plan starts again from 0 (as does the 5-session split nudge).
 
 ### Hangs (since 2026-09-30)
 
@@ -84,7 +84,7 @@ that limit; the effort A/B lost two sessions in a row this way). Three layers no
 
 A project can be a folder with nothing but a `GOAL.md`. The driver copies in the template files and creates the git repository, then writes task 000: turn `GOAL.md` into `PLAN.md` (approach, architecture, tech choices with reasons, assumptions, out of scope, and which task delivers each point of the goal) and a task queue with testable acceptance criteria. The driver accepts the plan only if `PLAN.md` and at least one task exist and the test command works. From then on the agent owns the plan and its tasks; `GOAL.md` stays the human's.
 
-- **Goal changed:** when `GOAL.md` differs from the version last planned against, the driver reopens task 000 with the diff (before the next session starts), so the agent updates the plan and the queue first.
+- **Goal changed:** when `GOAL.md` differs from the version last planned against, the driver reopens task 000 with the diff (before the next session starts), so the agent updates the plan and the queue first. If the plan was finished, the older change notes in 000 are dropped (they are planned in; `git log -p GOAL.md` has them); an unfinished plan keeps them.
 - **Goal check:** an empty queue does not end the loop. Task 999 checks the project against `GOAL.md` point by point, with evidence, into `GOAL-CHECK.md`, and adds tasks for anything missing. The loop stops after a check that adds nothing, or after `GOAL_CHECKS` (3) rounds for the same goal.
 - **Test command** is re-checked before every test run (planning may add a `package.json`).
 - 000 and 999 are written by the driver and registered as the human's, so their acceptance boxes cannot be changed by the agent.
@@ -339,6 +339,10 @@ human, fixed in the driver with a test, and deployed the same day.
 | A merge conflict on a test file | b added the file to its `Touches:` mid-task, after a had claimed a task on it; the overlap check runs only at claim time | Caught by the merge step as designed. Idea, not built: warn both agents when a task's files grow into another agent's task |
 | The second goal-check round spun every 2 s (1,500 events) | The claim check above refused the goal check the driver had just reopened | 000/999 exempt; refused claims on that path wait a cycle |
 | The same spin again on the other agent an hour later | That agent's loop still ran the old code, and the watcher had not been re-armed | `agent-team restart` after every harness change; the watcher stays armed |
+| The goal check ran 19 rounds without stopping | Every round the agent ticked every box and wrote "all met", but left the first line `Status: in-progress` | The driver closes 000 or 999 when every box is ticked, then verifies as usual |
+| Sessions hit the context window again and again; DECISIONS.md was 76 KB | Entries of open tasks were never archived, and the goal check adds one per round | An open task keeps its newest 3 entries. The same fix found the archiver losing archived goal-check entries |
+| a spent 8 sessions on a task that needed another of its own tasks first | The dependency check only looked at the other agent's tasks | An agent's own tasks wait for their `Depends on:` too; the prompt says to add the dependency and end the session instead of building stand-ins |
+| STALLED alert at 12 sessions on a re-plan that was 4 sessions old, and the planner was told to split itself | The count covered every session the task ever had, across three earlier plans; the planning file also carried all four GOAL.md diffs (29 KB) | Count since the last accepted done; a finished plan drops its old change notes on reopen (29 KB to 11 KB). `analysis/tests/test_replan.sh` |
 
 **Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40
 tasks, 98 agent commits; no task was lost or done twice in the end, and every conflict went back to the agent with the

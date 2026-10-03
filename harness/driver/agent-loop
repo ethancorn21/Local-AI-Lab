@@ -163,6 +163,12 @@ goal_changed() {
 import re, sys
 path, diff, when = sys.argv[1], open(sys.argv[2]).read(), sys.argv[3]
 t = open(path).read()
+# A plan that was finished has every earlier change planned in: drop those notes (they only cost the next session
+# context). An unfinished plan keeps them, since its last change may not be planned in yet.
+if re.match(r"\s*Status:\s*done", t, re.I) and "## GOAL.md changed" in t:
+    t = re.sub(r"(?ms)^## GOAL\.md changed .*?(?=^## |\Z)", "", t)
+    t = re.sub(r"(?m)^(## Notes\n)", r"\1- Earlier GOAL.md changes are planned in already: `git log -p GOAL.md` has them.\n", t, count=1) \
+        if "Earlier GOAL.md changes" not in t else t
 t = re.sub(r"^Status:.*", "Status: in-progress", t, count=1)
 t = re.sub(r"(?m)^- \[x\]", "- [ ]", t)
 note = (f"## GOAL.md changed ({when})\nThe human changed GOAL.md. Update PLAN.md and the task queue to match: add tasks, "
@@ -251,6 +257,12 @@ harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
 
 status_of() { head -1 "$1" | sed -E 's/^Status:[[:space:]]*//I' | tr -d '[:space:]' | tr 'A-Z' 'a-z'; }
 task_id() { basename "$1" .md | cut -d- -f1; }
+# Sessions a task has run since it last finished (0 after an accepted done): a reopened task, such as a re-plan after
+# a GOAL.md change, starts again from 0 for the split nudge and the STALLED flag.
+task_runs() {
+  jq -s --arg t "$1" 'reduce (.[] | select(.task == $t)) as $e (0;
+    if $e.status_after == "done" and $e.verify != "rejected" then 0 else . + 1 end)' "$LEDGER" 2>/dev/null || echo 0
+}
 # Subtasks of task 025 are tasks/025a-*.md, 025b-*.md (and theirs 025aa-*.md). A task with unfinished subtasks waits for
 # them whatever its own status says (the agent may forget to set `split`); once all are done or dropped it is workable
 # again, so its own acceptance boxes get checked.
@@ -675,7 +687,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     PROMPT="$PROMPT All subtasks of this task are finished: check its own acceptance boxes, tick the ones you verify, and set it done, or add subtasks for what is still missing."
   else
     # A task that keeps going session after session is too big for one step at a time: say so (AGENTS.md, Tasks).
-    runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
+    runs=$(task_runs "$task")
     [ "$runs" -ge 5 ] && PROMPT="$PROMPT This task has taken $runs sessions so far: if what remains is more than a few sessions of work, split it into subtasks first (AGENTS.md, Tasks)."
   fi
   [ -n "${TEAM_DIR:-}" ] && PROMPT="$PROMPT$(team_prompt)"
@@ -855,7 +867,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
      handover_in_task: $handover_in_task, handover_guard: $handover_guard,
      session_error: (if $session_error == "" then null else $session_error end), harness_id: $harness_id, harness: $harness}' >> "$LEDGER"
   # A task that keeps running without finishing is flagged for the humans (the split nudge in the prompt starts at 5).
-  runs=$(jq -r --arg t "$task" 'select(.task == $t) | .iter' "$LEDGER" 2>/dev/null | wc -l)
+  runs=$(task_runs "$task")
   if [ "$(status_of "$task")" != done ] && [ "$runs" -ge "$STALL_SESSIONS" ] && [ $(( (runs - STALL_SESSIONS) % 4 )) -eq 0 ]; then
     log "STALLED: $task has run $runs sessions without finishing"
     [ -n "${TEAM_DIR:-}" ] && tev stalled "$task" "$runs sessions"
