@@ -44,6 +44,7 @@ CODEMAP.md merge=ours
 codemap/** merge=ours
 DECISIONS.md merge=union
 DECISIONS-archive.md merge=union
+PITFALLS.md merge=union
 EOF
   git config merge.ours.driver true
   git add .gitattributes && git commit -q -m "[driver] team project: merge rules for generated files and journals"

@@ -12,6 +12,11 @@ move: they apply beyond one task.
 
 Safety: the set of entries (exact text) before and after must be identical, or nothing is written.
 Exit codes: 0 = nothing to change, 3 = files updated, 1 = error (nothing written).
+
+decisions-archive --show <task id>... : print those tasks' entries (not PITFALL/LESSON) and the newest 3 entries
+without a task id (the driver's project-wide notes), for PROGRESS.md: in a project with PITFALLS.md the agent reads
+its own task's journal at spawn and searches DECISIONS.md for the rest. Entries over SHOW_MAX bytes are cut, with
+the grep that finds the whole entry.
 """
 import collections, datetime, glob, hashlib, os, re, sys
 
@@ -24,6 +29,7 @@ TASK_ID = re.compile(r"^## (?:\d{4}-\d{2}-\d{2}\s+)?(\d{3}[a-z]*)\b")
 TASK_FILE = re.compile(r"^(\d{3}[a-z]*)-(.+)\.md$")
 FINISHED = ("done", "dropped")
 STICKY = re.compile(r"\b(PITFALL|LESSON)\b")
+SHOW_MAX = 4096
 ARCHIVE_HEADER = """# Decisions archive
 
 Entries of finished tasks, moved here verbatim from DECISIONS.md by the driver when each task was verified done, and
@@ -93,7 +99,39 @@ def load_archive(lines):
     return sections
 
 
+def shown(entry):
+    """An entry for PROGRESS.md: its heading one level down (PROGRESS.md's own sections are `## `), cut at SHOW_MAX."""
+    head, lines, size, kept = entry[0], ["#" + entry[0]], len(entry[0]), 0
+    body = text(entry).split("\n")[1:]
+    for line in body:
+        if size + len(line) + 1 > SHOW_MAX:
+            break
+        lines.append(line)
+        size += len(line) + 1
+        kept += 1
+    if kept < len(body):
+        rest = sum(len(l) + 1 for l in body[kept:])
+        lines.append(f"... ({rest / 1024:.1f} KB more: `grep -n -A 200 -F '{head}' DECISIONS.md`)")
+    return "\n".join(lines)
+
+
+def show(tids):
+    _, entries = load_active(read(ACTIVE))
+    mine = [e for e in entries if task_of(e) in tids and not STICKY.search(e[0])]
+    notes = [e for e in entries if not task_of(e) and not STICKY.search(e[0])][-3:]
+    print("## Your task's journal\n")
+    print("Its newest `DECISIONS.md` entries, the driver's notes on it included (a rejected done claim says why here). "
+          "Search `DECISIONS.md` and `DECISIONS-archive.md` for other tasks' reasoning.\n")
+    print("\n\n".join(shown(e) for e in mine) if mine else "(no entries yet)")
+    if notes:
+        print("\n## Project-wide driver notes (newest)\n")
+        print("\n\n".join(shown(e) for e in notes))
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--show":
+        return show(set(sys.argv[2:]))
     os.chdir(sys.argv[1] if len(sys.argv) > 1 else ".")
     status, names = {}, {}
     for f in glob.glob("tasks/[0-9][0-9][0-9]*-*.md"):

@@ -33,8 +33,8 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 ## The loop, session by session
 
 1. The driver waits until the model server answers (an outage does not burn sessions), picks the next task, regenerates CODEMAP.md from the code, and records which tests are already failing when a task is first handed out.
-2. A fresh Pi session starts with a one-paragraph prompt (iteration, task file, plus nudges: split a task that has taken 5+ sessions, read DECISIONS.md to the end when it is large).
-3. The agent orients (memory files, task file, git log, the code it needs), does one step, runs the tests, writes its notes, commits, and stops.
+2. A fresh Pi session starts with a one-paragraph prompt (iteration, task file, plus nudges: split a task that has taken 5+ sessions; in the PITFALLS.md layout the planning task and the goal check are told to read PLAN.md whole, in older projects a large DECISIONS.md is to be read to the end).
+3. The agent orients (task file, PROGRESS.md, the PITFALLS.md contents block, CODEMAP.md, git log, then the code it needs; PLAN.md, DECISIONS.md and the rest of PITFALLS.md are searched, not read whole), does one step, runs the tests, writes its notes, commits, and stops.
 4. The hand-over extension watches context use: at 120k tokens it tells the agent to hand over (only memory files, task files and git work from then on, thinking capped at 2k per turn); at 142k or after 10 more turns it ends the session. Compaction is always cancelled. Near the 150k window it counts each prompt exactly with the server's tokenizer and shrinks the requested output so no request can overflow.
 5. The driver saves any uncommitted code, verifies a done claim, archives finished tasks' journal entries, audits the task queue, and writes the ledger line.
 
@@ -42,8 +42,9 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 
 | File | Holds |
 |---|---|
-| `PROGRESS.md` | Generated before every session: the tasks in flight and their hand-overs. The notes themselves live in each task file's `## Hand-over` (adopted after the A/B below); anything the agent writes to PROGRESS.md is moved there |
-| `DECISIONS.md` | The agent's journal: choices, failed attempts and why, blockers, PITFALLs (facts that stay true). Finished tasks' entries move verbatim to `DECISIONS-archive.md`; an index lists one line per archived task |
+| `PROGRESS.md` | Generated before every session: the tasks in flight and their hand-overs, and (PITFALLS.md layout) the current task's own `DECISIONS.md` entries, the driver's notes on it included, plus the newest project-wide driver notes. The notes themselves live in each task file's `## Hand-over` (adopted after the A/B below); anything the agent writes to PROGRESS.md is moved there |
+| `DECISIONS.md` | The agent's journal: choices, failed attempts and why, blockers. Finished tasks' entries move verbatim to `DECISIONS-archive.md`; an index lists one line per archived task. Searched, not read whole, in the PITFALLS.md layout |
+| `PITFALLS.md` | Lasting facts (tool quirks, library traps, traps in the code, machine limits), one curated file: four fixed sections (agent tools and harness, this machine, libraries, this codebase) with subsections, each entry a one-line fact plus `Where:` and `Symptom:` lines, the keys an agent searches with when something fails. Agents read only the generated contents block at spawn; they may merge and delete entries. `pitfalls-sync` moves PITFALL entries still written to DECISIONS.md into its Unsorted section. Projects without the file keep PITFALLs in DECISIONS.md |
 | `CODEMAP.md` | Generated before every session from each file's header comment and exports, with line ranges for functions in big files. Architecture rules above the marker line are hand-written |
 | `tasks/*.md` | The queue. Subtasks are `025a-...`, `025b-...`; a task with unfinished subtasks waits for them, then comes back for its own boxes |
 | git log | What was done, one commit per step |
@@ -308,7 +309,7 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   session, first thing in its prompt.
 - **Merge:** an accepted task goes into `main` under a lock: merge `main` into the branch, re-run the tests if `main`
   brought anything, then fast-forward `main`. A conflict or a new test failure reopens the task with the reason.
-- **Memory for several writers:** DECISIONS.md and its archive merge with git's union strategy (both sides' entries
+- **Memory for several writers:** DECISIONS.md, its archive and PITFALLS.md merge with git's union strategy (both sides' entries
   kept); PROGRESS.md and CODEMAP are regenerated in every checkout (`merge=ours`); hand-over notes live in the task
   files, which only the claiming agent edits.
 - **Who owns what:** the human's tasks are those present at team set-up (000) plus the goal check (999); tasks that
@@ -364,6 +365,7 @@ human, fixed in the driver with a test, and deployed the same day.
 | a spent 8 sessions on a task that needed another of its own tasks first | The dependency check only looked at the other agent's tasks | An agent's own tasks wait for their `Depends on:` too; the prompt says to add the dependency and end the session instead of building stand-ins |
 | Agent b idle for hours after the re-plan | The plan put a 19-file task first in a chain; b takes at most 8 files, and the plan check only looked for shared files | The agent that takes a too-big task splits it, and the parts go into main at once (above) |
 | The goal check ran six sessions while three tasks were still being built | A 999 left open by an earlier round has `Depends on: none`, so the idle fast agent took it | 999 waits until every other task is done in main |
+| DECISIONS.md kept passing 93 KB; a session read up to 63k tokens before working (median 32k at the first real tool call) | PITFALL entries were never archived and could never be rewritten: 77 of them were 87% of the file (64 KB), growing ~30 KB per day of building; one 22 KB planning entry made the 94 KB peak. Every session also read DECISIONS.md (60 of 60) and PLAN.md (44 of 60, 18.9k tokens) whole. Checked against the logs: task 221 had task 212's gunicorn PITFALL in front of it in 16 of 19 sessions and never used it | PITFALLs move to their own curated, searchable PITFALLS.md (contents block read at spawn); the agent gets its own task's journal in PROGRESS.md and searches DECISIONS.md and PLAN.md (000 and 999 read PLAN.md whole). Spawn reads on frontpage: 14.3k tokens instead of 63.5k |
 | b spent 10 sessions on 220 (0 of 7 boxes, the last four cut off at the window) while a waited | Nothing moved a stuck task from the small agent to the big one; the third time after 205 and 215 | Hand-over after 3 sessions without a ticked box while a bigger agent waits (above) |
 | a sat 25 min on a request from the day before, while the task it needed was being handed to it | The request (non-blocking, about a task finished since) was never closed, and the wait for the human never looked for team work | Team agents wait the team way while others work; accepted tasks withdraw their requests |
 | Both agents idle with four tasks left | a split 221 into 221a-d and wrote "Depends on: 221" (the parent) into 221a; the parent waits for its subtasks, and an agent holding only its own claims never reached the deadlock check | A dependency on the own parent is void; only another agent's claim means "wait" |

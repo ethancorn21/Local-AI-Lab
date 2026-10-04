@@ -10,7 +10,7 @@ DECISIONS-archive.md (search it with grep) and lists the task in an index at the
     - Attempt 1: tried A -> failed because B
     - Attempt 2: tried C -> failed because D
 
-    ## <date> <task id> PITFALL: <the trap, stated as a fact>
-    Stays true after this task: a tool quirk, an environment limit, a trap in the code. Never archived.
+A fact that stays true after this task (a tool quirk, an environment limit, a trap in the code) is not a journal
+entry: it goes to PITFALLS.md.
 
 The task id is the task file's number, with its letters for a subtask (e.g. 025a).
