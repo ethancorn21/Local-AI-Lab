@@ -7,12 +7,15 @@ merge and delete entries (git keeps the history). This keeps the file searchable
 - PITFALL/LESSON entries still written to DECISIONS.md move to the `## Unsorted` section, text unchanged (the heading
   goes from `## ` to `#### `), for an agent to file under its section. They used to stay in DECISIONS.md forever: 77
   of them were 87% of frontpage's 74 KB DECISIONS.md, which every session read whole (2026-10-04).
+- An entry PITFALLS.md already has, or had (git history: an agent merged or deleted it), is not added again, only
+  removed from DECISIONS.md: in a team project git's union merge of DECISIONS.md brings back entries the other side
+  deleted (frontpage 2026-10-04: 33 and 29 of the 77 just moved came back in the two checkouts).
 - The fixed top sections exist: a missing one is added back, empty.
 - The contents block is regenerated: each section with its entry count (subsections by name), and how many entries
   lack a `Where:` or `Symptom:` line, the keys an agent searches with.
 Exit codes: 0 = nothing to change, 3 = files updated, 1 = error (nothing written).
 """
-import os, re, sys
+import os, re, subprocess, sys
 
 ACTIVE, PITFALLS = "DECISIONS.md", "PITFALLS.md"
 FIXED = ["Agent tools and harness", "This machine and its environment", "Libraries and frameworks", "This codebase"]
@@ -43,6 +46,22 @@ def split_decisions(lines):
         else:
             prefix.append(line)
     return prefix, entries
+
+
+def known_entries(text):
+    """-> {heading: body} of PITFALLS.md now, plus every heading it ever had (git history), body None for those."""
+    known = {}
+    try:
+        log = subprocess.run(["git", "log", "-p", "--format=", "--", PITFALLS], capture_output=True, text=True,
+                             timeout=60).stdout
+        for line in log.split("\n"):
+            if line.startswith("+#### "):
+                known.setdefault(line[6:].rstrip(), None)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for _, _, e in entries(text.split("\n")):
+        known[e[0][5:].rstrip()] = "\n".join(e[1:]).strip("\n")
+    return known
 
 
 def drop_toc(lines):
@@ -126,8 +145,13 @@ def main():
     n_before = len(entries(lines))
 
     prefix, des = split_decisions(act_old.split("\n")) if act_old else ([], [])
-    moving = [e for e in des if STICKY.search(e[0])]
+    sticky = [e for e in des if STICKY.search(e[0])]
     keep = [e for e in des if not STICKY.search(e[0])]
+    known = known_entries(pit_old) if sticky else {}
+    body = lambda e: "\n".join(e[1:]).strip("\n")
+    # already there, or there before (merged or deleted by an agent): only leaves DECISIONS.md
+    dropped = [e for e in sticky if e[0][3:].rstrip() in known and known[e[0][3:].rstrip()] in (None, body(e))]
+    moving = [e for e in sticky if e not in dropped]
 
     names = [name for name, _ in sections(lines)]
     for name in FIXED:   # a missing fixed section comes back, before Unsorted
@@ -153,7 +177,7 @@ def main():
     lines[title_end:title_end] = [""] + toc(lines) if title_end else toc(lines)
     pit_new = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).rstrip("\n") + "\n")
     act_new = None
-    if moving:
+    if sticky:
         act_new = "\n".join(prefix).rstrip("\n") + "\n\n" + "\n".join("\n".join(e).rstrip("\n") + "\n" for e in keep)
         act_new = act_new.rstrip("\n") + "\n"
 

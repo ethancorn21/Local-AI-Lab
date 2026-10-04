@@ -77,6 +77,31 @@ $SYNC . > /dev/null
 grep -q "^## This machine and its environment" PITFALLS.md && [ "$(grep -c '^#### ' PITFALLS.md)" -eq 3 ] \
   && ok "deleted fixed section back, entries intact (3)" || bad "fixed section / entries wrong"
 
+# a team merge brings back an entry PITFALLS.md already has: it only leaves DECISIONS.md
+n0=$(grep -c '^#### ' PITFALLS.md)
+printf '\n## 2026-10-02 000 PITFALL: pip is blocked\nuse apt\n' >> DECISIONS.md
+$SYNC . > /dev/null
+! grep -q "PITFALL: pip is blocked" DECISIONS.md && [ "$(grep -c '^#### ' PITFALLS.md)" -eq "$n0" ] \
+  && ok "merged-back copy: removed from DECISIONS.md, not added twice" || bad "merged-back copy duplicated"
+# the same heading with a different body is still moved (nothing is lost)
+printf '\n## 2026-10-02 000 PITFALL: pip is blocked\nuse apt, or the project venv\n' >> DECISIONS.md
+$SYNC . > /dev/null
+[ "$(grep -c '^#### 2026-10-02 000 PITFALL: pip is blocked' PITFALLS.md)" -eq 2 ] && grep -q "or the project venv" PITFALLS.md \
+  && ok "same heading, new body: moved" || bad "changed entry lost"
+# an entry an agent deleted (git history) and a merge brought back is not added again
+git init -q . && git -c user.email=t@t -c user.name=t add -A && git -c user.email=t@t -c user.name=t commit -qm base
+python3 - <<'PY'
+t = open("PITFALLS.md").read()
+a = t.index("#### 2026-10-02 004 LESSON: sqlite DDL autocommits"); b = t.index("after the fence", a) + len("after the fence")
+open("PITFALLS.md", "w").write(t[:a] + t[b:])
+PY
+$SYNC . > /dev/null; git -c user.email=t@t -c user.name=t commit -qam "agent merged the sqlite entry away"
+n1=$(grep -c '^#### ' PITFALLS.md)
+printf '\n## 2026-10-02 004 LESSON: sqlite DDL autocommits\n```\n## not a heading, inside a fence\n```\nafter the fence\n' >> DECISIONS.md
+$SYNC . > /dev/null
+! grep -q "LESSON: sqlite" DECISIONS.md && ! grep -q "LESSON: sqlite" PITFALLS.md && [ "$(grep -c '^#### ' PITFALLS.md)" -eq "$n1" ] \
+  && ok "entry deleted by an agent, brought back by a merge: not added again" || bad "deleted entry came back"
+
 # --show: the task's own journal for PROGRESS.md
 $ARCH --show 004a 004 > show.txt
 grep -q "^### 2026-10-02 004 DECISION: store api" show.txt && grep -q "^### 2026-10-03 004a DECISION: part one" show.txt \
