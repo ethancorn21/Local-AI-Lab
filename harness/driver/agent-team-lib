@@ -356,15 +356,18 @@ team_prompt() {  # the team part of the session prompt
 TEAM_PLAN_CRITERIA='- [ ] Every task file besides 000 and 999 has a `Depends on:` line (the numbers of the tasks that must be finished first, or `none`) and a `Touches:` line (the files and directories the task will create or change)
 - [ ] The work is split into modules that two agents can build at the same time: tasks that could run at once touch different files, and PLAN.md shows the order as waves (all tasks of a wave can run at once, and most waves have two or more tasks)
 - [ ] Tests never bind a fixed network port (use port 0) or write outside the project and the system temp dir: two checkouts of this project run their tests at the same time'
-TEAM_PLAN_NOTE='- Two agents build this project at the same time, each in its own checkout; a task goes to one agent once all its `Depends on:` tasks are finished, and never while the other agent works on a task that touches the same files. Put shared foundations first (project skeleton, data model, the interfaces between modules), so the later tasks can go ahead independently. A subtask that needs the result of another task says so in its own `Depends on:` line. Avoid hotspot files: when many tasks would edit the same file (README, a central config module, the sample config), give each module its own file or section, or make those edits once in an early task; the driver rejects a plan where more than 3 open tasks change one file. List only real dependencies: tasks that touch the same files are already kept apart.'
-open_touches() {  # "<path> <task id>" for every Touches path of every open task (not 000/999)
-  local f
+TEAM_PLAN_NOTE='- Two agents build this project at the same time, each in its own checkout; a task goes to one agent once all its `Depends on:` tasks are finished, and never while the other agent works on a task that touches the same files. Put shared foundations first (project skeleton, data model, the interfaces between modules), so the later tasks can go ahead independently. A subtask that needs the result of another task says so in its own `Depends on:` line. Avoid hotspot files: when many tasks would edit the same file (README, a central config module, the sample config), give each module its own file or section, or make those edits once in an early task; the driver replays the schedule and sends the plan back once if shared files make tasks wait that their dependencies would let run at once. List only real dependencies: tasks that touch the same files are already kept apart.'
+team_plan_schedule() {  # plan-schedule's input: "<id> TAB <deps> TAB <ids it shares files with> TAB <touches>" per open task
+  local f g c files=()
   for f in tasks/[0-9]*.md; do
     case $f in tasks/000-*|tasks/999-*) continue ;; esac
-    case $(status_of "$f") in done|dropped) continue ;; esac
-    touches_of "$f" | sed "s#\$# $(task_id "$f")#"
+    case $(status_of "$f") in done|dropped|split) continue ;; esac
+    files+=("$f")
   done
-  return 0
+  for f in "${files[@]}"; do
+    c=""; for g in "${files[@]}"; do [ "$f" != "$g" ] && overlap "$f" "$g" && c+=" $(task_id "$g")"; done
+    printf '%s\t%s\t%s\t%s\n' "$(task_id "$f")" "$(deps_of "$f" | tr '\n' ' ')" "$c" "$(touches_of "$f" | tr '\n' ' ')"
+  done
 }
 team_plan_check() {  # extra checks of the planning task's done claim in team mode
   local f r=""
@@ -374,10 +377,21 @@ team_plan_check() {  # extra checks of the planning task's done claim in team mo
     grep -qiE '^Touches:' "$f" || r+="    $f has no \`Touches:\` line"$'\n'
   done
   [ -n "$r" ] && printf '%s\n%s' "- Team project: every task needs \`Depends on:\` and \`Touches:\` lines:" "$r"
-  # Hotspots: a file that many open tasks change forces them into a line (no two agents on the same files), so the
-  # queue runs one task at a time however it is drawn in waves. frontpage 2026-10-02: config.py, README.md and the
-  # sample config in most tasks left the second agent idle.
-  local h; h=$(open_touches | awk '{n[$1]++; t[$1]=t[$1] " " $2} END {for (p in n) if (n[p] > 3) printf "    %s is changed by %d open tasks:%s\n", p, n[p], t[p]}')
-  [ -n "$h" ] && printf '%s\n%s' "- Team project: files that more than 3 open tasks change make the agents wait for each other; give each module its own file or section for these, or make the shared changes in one early task:" "$h"
+  # Shared files: the scheduler never runs two tasks that share a file, so what matters is whether that makes the plan
+  # slower than its dependencies already do; plan-schedule replays it. (frontpage 2026-10-04: a per-file count, more
+  # than 3 open tasks per file, ignored the dependencies and rejected a plan the shared files did not slow at all, 16
+  # sessions in a row.) Its advice sends a plan back once per GOAL.md version, so planning never spins on it; tasks
+  # that can never start (dependency cycle) always send it back.
+  local adv rc key mark=$TEAM/plan-advised
+  adv=$(team_plan_schedule | plan-schedule "$(ls "$TEAM/agents" 2>/dev/null | wc -l)"); rc=$?
+  case $rc in
+    0) ;;
+    4) printf '%s\n' "$adv" ;;
+    3) key=$(cat GOAL.md 2>/dev/null | sha256sum | cut -c1-12)
+       if [ "$(cat "$mark" 2>/dev/null)" != "$key" ]; then echo "$key" > "$mark"; printf '%s\n' "$adv"
+       else log "plan accepted with the schedule advice already given once for this GOAL.md: $(head -1 <<<"$adv" | cut -c16-200)" > /dev/null
+       fi ;;
+    *) log "WARNING: plan-schedule failed (rc $rc) - the plan was not checked for shared files" > /dev/null ;;
+  esac
   return 0
 }

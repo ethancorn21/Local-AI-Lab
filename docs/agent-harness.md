@@ -303,8 +303,11 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   task is accepted (answering one would reopen the finished task).
 - **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
   `Touches:` on every task, a plan in waves of tasks that can run at once, tests that never bind a fixed port (two
-  checkouts run their tests at the same time), and no hotspot files: a plan where more than 3 open tasks change the
-  same file is rejected, naming the file and the tasks.
+  checkouts run their tests at the same time), and no hotspot files that slow the team: `plan-schedule` replays the
+  scheduler with the team's agents, with and without the shared-file rule, and when shared files make the plan
+  clearly slower than its dependencies already do it names the files and the tasks they held back. That advice sends a
+  plan back once per GOAL.md version (a second claim is accepted and logged), so planning cannot spin on it; tasks that
+  can never start (a dependency cycle) always send it back.
 - **Sync:** before every session the driver merges `main` into the agent's branch. A conflict is handed to the next
   session, first thing in its prompt.
 - **Merge:** an accepted task goes into `main` under a lock: merge `main` into the branch, re-run the tests if `main`
@@ -353,7 +356,7 @@ human, fixed in the driver with a test, and deployed the same day.
 | What happened | Cause | Fix |
 |---|---|---|
 | Agent b idle for most of a re-plan | Planning is one agent's job, and two GOAL.md changes meant two planning passes | By design; plans are now cheaper to keep parallel (next rows) |
-| After the plan, b waited again: 7 of 9 tasks hung off one task | Hotspot files: `config.py`, `README.md` and the sample config were in almost every task, so the tasks lined up | Plans with a file in more than 3 open tasks are rejected |
+| After the plan, b waited again: 7 of 9 tasks hung off one task | Hotspot files: `config.py`, `README.md` and the sample config were in almost every task, so the tasks lined up | Plans with a file in more than 3 open tasks are rejected (replaced 2026-10-04, next row) |
 | An agent re-took a task the other had just finished | Its checkout synced a moment before the other agent's merge; the claim was free | Claims are checked against main |
 | After a restart the agents swapped tasks (b took a's half-done task, a took b's) | A claim was tied to a loop's process id; a restarted loop looked like a crashed one | Heartbeat-based claims (above) |
 | b spent three sessions on a 14-file task without writing anything | Orientation plus reading 14 files filled its 114k window before the hand-over could finish | Per-agent task size limit; hand-over for b at 75k (llama.cpp ignores the hand-over turn's 2k thinking cap) |
@@ -365,6 +368,7 @@ human, fixed in the driver with a test, and deployed the same day.
 | a spent 8 sessions on a task that needed another of its own tasks first | The dependency check only looked at the other agent's tasks | An agent's own tasks wait for their `Depends on:` too; the prompt says to add the dependency and end the session instead of building stand-ins |
 | Agent b idle for hours after the re-plan | The plan put a 19-file task first in a chain; b takes at most 8 files, and the plan check only looked for shared files | The agent that takes a too-big task splits it, and the parts go into main at once (above) |
 | The goal check ran six sessions while three tasks were still being built | A 999 left open by an earlier round has `Depends on: none`, so the idle fast agent took it | 999 waits until every other task is done in main |
+| The planning task ran 16 sessions in a row, each done claim rejected for hotspot files, while b sat idle | The per-file count ignored `Depends on:`: this round's UI tasks share `feed.html`, `styles.css` and the browser tests, but in a dependency line behind an early shared-changes task (the rule's own advice), so the shared files cost nothing: replaying the schedule, 8 rounds either way. Every re-plan still counted 4-6 tasks per file | `plan-schedule` replays the scheduler and advises only when shared files really slow the plan; the advice sends a plan back once per GOAL.md version. The frontpage plan passes |
 | DECISIONS.md kept passing 93 KB; a session read up to 63k tokens before working (median 32k at the first real tool call) | PITFALL entries were never archived and could never be rewritten: 77 of them were 87% of the file (64 KB), growing ~30 KB per day of building; one 22 KB planning entry made the 94 KB peak. Every session also read DECISIONS.md (60 of 60) and PLAN.md (44 of 60, 18.9k tokens) whole. Checked against the logs: task 221 had task 212's gunicorn PITFALL in front of it in 16 of 19 sessions and never used it | PITFALLs move to their own curated, searchable PITFALLS.md (contents block read at spawn); the agent gets its own task's journal in PROGRESS.md and searches DECISIONS.md and PLAN.md (000 and 999 read PLAN.md whole). Spawn reads on frontpage: 14.3k tokens instead of 63.5k |
 | b spent 10 sessions on 220 (0 of 7 boxes, the last four cut off at the window) while a waited | Nothing moved a stuck task from the small agent to the big one; the third time after 205 and 215 | Hand-over after 3 sessions without a ticked box while a bigger agent waits (above) |
 | a sat 25 min on a request from the day before, while the task it needed was being handed to it | The request (non-blocking, about a task finished since) was never closed, and the wait for the human never looked for team work | Team agents wait the team way while others work; accepted tasks withdraw their requests |

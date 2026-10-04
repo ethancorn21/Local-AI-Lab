@@ -13,6 +13,7 @@ DRIVER=${1:-$HERE/../../harness/driver}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 H=$T/home; PR=$H/projects; mkdir -p "$H/bin" "$H/.npm-global/bin" "$H/.agent-kit/agents" "$PR"
 for f in agent-loop agent-team-lib agent-team task-audit codemap-gen decisions-archive; do cp "$DRIVER/$f" "$H/bin/"; done
+for f in plan-schedule pitfalls-sync; do [ -f "$DRIVER/$f" ] && cp "$DRIVER/$f" "$H/bin/"; done
 for f in agent-start agent-stop; do sudo cat "/home/agent/bin/$f" > "$H/bin/$f"; done
 cp "$HERE/stubpi-team" "$H/.npm-global/bin/pi"; chmod +x "$H/bin/"* "$H/.npm-global/bin/pi"
 sudo cp -r /home/agent/.agent-kit/template "$H/.agent-kit/" && sudo chown -R "$(id -u)" "$H/.agent-kit/template"

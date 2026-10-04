@@ -226,7 +226,7 @@ harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
   HARNESS=$(jq -n -S -c \
       --arg driver "$DRIVER_SHA" \
       --arg archiver "$(cat "$(command -v decisions-archive)" $(command -v pitfalls-sync) 2>/dev/null | keep)" \
-      --arg task_tools "$(cat "$(command -v task-audit)" "$(command -v codemap-gen)" 2>/dev/null | keep)" \
+      --arg task_tools "$(cat "$(command -v task-audit)" "$(command -v codemap-gen)" $(command -v plan-schedule) 2>/dev/null | keep)" \
       --arg extensions "$([ -d "$pc/extensions" ] && for f in $(find "$pc/extensions" -type f | sort); do
                             echo "== ${f#"$pc"/}"; cat "$f"; done | keep)" \
       --arg agents_md "$([ -f AGENTS.md ] && keep < AGENTS.md)" \

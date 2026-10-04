@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""plan-schedule [agents] < plan : would shared files slow this team plan down? Replays the scheduler.
+
+stdin, one line per open task, written by agent-team-lib's team_plan_schedule with the driver's own deps_of,
+touches_of and overlap (so the replay can never disagree with the real scheduler about what "shares a file" means):
+    <id> TAB <its Depends on ids> TAB <ids of the tasks it shares files with> TAB <its Touches paths>
+The scheduler gives each free agent the lowest-numbered task whose dependencies are finished and that shares no file
+with a running task. The replay counts rounds (one task per agent per round), with and without the shared-file rule:
+a file many tasks share only costs time when it holds back tasks their dependencies would let run at once.
+(frontpage 2026-10-04: a per-file count, "more than 3 open tasks change one file", ignored the dependencies and
+rejected 16 plans in a row that the shared files did not slow at all: 8 rounds either way.)
+Exit 0: shared files cost little or nothing. Exit 3: they make the plan clearly slower than its dependencies
+already do; the advice is on stdout. Exit 4: some tasks can never start (they wait on each other); stdout names them.
+Exit 1: error.
+"""
+import re, sys
+
+
+def norm(dep):
+    return f"{int(dep):03d}" if dep.isdigit() else dep
+
+
+def parse(lines):
+    tasks = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        f = (line.rstrip("\n").split("\t") + ["", "", ""])[:4]
+        tid = f[0].strip()
+        parent = re.match(r"\d+", tid).group(0)
+        # a subtask's dependency on its own parent is void (the parent waits for its subtasks), as in unmet_deps
+        deps = {norm(d) for d in f[1].split() if not (tid != parent and d.isdigit() and int(d) == int(parent))}
+        tasks[tid] = {"deps": deps, "shares": set(f[2].split()), "touches": f[3].split()}
+    for t in tasks.values():   # dependencies outside the open plan are finished (or are 000/999)
+        t["deps"] &= set(tasks)
+    return tasks
+
+
+def replay(tasks, agents, shared_rule):
+    """-> (rounds, never-started task ids, {(waiting task, task it waited for): rounds})"""
+    done, rounds, held = set(), 0, {}
+    while len(done) < len(tasks):
+        running, waited = [], set()
+        for _ in range(agents):
+            for tid in sorted(tasks):
+                if tid in done or tid in running or not tasks[tid]["deps"] <= done:
+                    continue
+                blocker = next((r for r in running if r in tasks[tid]["shares"]), None)
+                if shared_rule and blocker:
+                    waited.add((tid, blocker))
+                    continue
+                running.append(tid)
+                break
+        if not running:
+            return rounds, sorted(set(tasks) - done), held
+        rounds += 1
+        done |= set(running)
+        for pair in waited:   # once per round, however many agents looked at it
+            held[pair] = held.get(pair, 0) + 1
+    return rounds, [], held
+
+
+def shared_paths(a, b):
+    out = [x for x in a["touches"] for y in b["touches"] if x == y or x.startswith(y + "/") or y.startswith(x + "/")]
+    return sorted(set(out))
+
+
+def main():
+    agents = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() and int(sys.argv[1]) > 0 else 2
+    tasks = parse(sys.stdin)
+    if not tasks:
+        return 0
+    free, stuck, _ = replay(tasks, agents, False)
+    if stuck:
+        print("- Team project: these tasks can never start, their `Depends on:` lines wait on each other: "
+              + ", ".join(f"{t} (waits on {' '.join(sorted(tasks[t]['deps']))})" for t in stuck))
+        return 4
+    ruled, _, held = replay(tasks, agents, True)
+    if ruled < free + max(2, -(-free // 4)):   # within 2 rounds or a quarter: the shared files cost little
+        return 0
+    worst = sorted(held.items(), key=lambda kv: -kv[1])[:5]
+    files = {}
+    for (t, b), n in held.items():
+        for p in shared_paths(tasks[t], tasks[b]):
+            files[p] = files.get(p, 0) + n
+    print(f"- Team project: shared files make tasks wait that their dependencies would let run at once. Replaying the "
+          f"schedule with {agents} agents, the {len(tasks)} open tasks take {ruled} rounds, {free} without the "
+          f"shared-file rule (a round is one task per agent).")
+    print("    files that held tasks back: " + ", ".join(f"{p} ({n})" for p, n in sorted(files.items(), key=lambda kv: -kv[1])[:6]))
+    print("    held back most: " + ", ".join(f"{t} by {b} ({n} round{'s' * (n != 1)})" for (t, b), n in worst))
+    print("    Give those modules their own files or sections, or make the shared edits in an early task the others "
+          "depend on. The driver sends a plan back for this once per GOAL.md version.")
+    return 3
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"plan-schedule: {exc}", file=sys.stderr)
+        sys.exit(1)
