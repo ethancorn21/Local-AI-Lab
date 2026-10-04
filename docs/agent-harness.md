@@ -374,6 +374,15 @@ tasks, 98 agent commits; no task was lost or done twice in the end, and every co
 reason. Agent b (the 5060 Ti at about a quarter of the 3090 Ti's speed) merged 7 of the ~42 accepted tasks: the
 smaller card helps on parallel waves and small tasks, and waits on long chains.
 
+**Second day (2026-10-03, review 3 plus the no-unit-tests trial):** two re-plans, 16 tasks, finished 01:14 the next
+night with the goal check judging all nine GOAL points met. The driver changes above came out of that day: re-plan
+session counts, the split rule, the hand-over rule (it then moved 226 and 100 from b to a by itself), the goal check
+waiting for the queue, no waiting on a stale request or on one's own claims. All unit-test files were removed (the
+human's decision): the suite went from about 470 tests to 326 end-to-end, integration, golden and speed tests (12,064
+lines against 8,138 of application code). One product bug escaped the tests: the match cache was never backfilled
+for items from before it existed, so the real database took 2.4 s per page while the speed test (a freshly filled
+database) passed. Measured on the live preview, filed as a task with the evidence, fixed: 0.14-0.16 s per page.
+
 ## Do-later list
 
 - When the second 3090 Ti arrives: rerun the quantization comparison as a **capability** test. The 2026-09-27 sweep measured only how closely each quant's predictions match 8-bit (KL divergence, perplexity) and speed; those are proxies. With 48 GB the 8-bit model fits entirely on GPU, so run the same agentic tasks with hidden tests under Q4, Q6 and Q8 and compare task success, sessions per task, rejected claims and tool errors.
