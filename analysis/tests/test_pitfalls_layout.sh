@@ -27,6 +27,7 @@ python3 -m http.server --bind 127.0.0.1 "$MS" --directory "$T/srv" > /dev/null 2
   sed -i '1a printf "\\n## 2026-09-27 001 PITFALL: the fake suite reads failing.txt\\nWhere: fake-test.sh\\nSymptom: tests fail\\n" >> DECISIONS.md' .stub/1.sh
   timeout 600 agent-loop "$P" > /dev/null 2>&1 )
 kill $SRV 2>/dev/null
+[ -n "${KEEP_PROJ:-}" ] && rm -rf "$KEEP_PROJ" && cp -a "$P" "$KEEP_PROJ"   # for memory-layout-check.py
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 cd "$P"
 ! grep -q "PITFALL" DECISIONS.md && grep -q "^#### 2026-09-26 000 PITFALL: pip is blocked" PITFALLS.md \
