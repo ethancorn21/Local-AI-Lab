@@ -3,10 +3,17 @@
 
 Shows the agent's thinking (dim; Ctrl-T hides it), its answers (light markdown, code blocks highlighted) and each tool
 call the way Claude Code does: edits as coloured diffs with line numbers, written files with syntax highlighting,
-command output trimmed to its first lines. The bottom row is a status bar: context used, generation speed and session
-time, from the model server's own metrics.
+command output trimmed to its first lines. What the driver writes to the loop log (saved work, merges, new tasks,
+waits) appears in between, so the view never goes quiet without saying why.
 
-Talking to the agent (--follow on a terminal): type on the input line above the status bar.
+Layout, like Claude Code: finished lines go into the terminal's normal output, so scrollback and following the bottom
+work as they do for any command. Under them a footer is redrawn in place: the line being streamed, an activity row
+(what runs right now: a command with its latest output line, a tool call being written, thinking, the driver between
+sessions, a stopped loop), the message line and the status bar (context, speed and session time, from the model
+server's own metrics). There is no scroll region: with one, macOS Terminal stopped following the output and left
+stale rows behind on resize.
+
+Talking to the agent (--follow on a terminal): type on the message line above the status bar.
   Enter  sends the message. Pi hands it to the model after its current turn: the response being generated and its
          tool calls finish first, which can take a few minutes when it is deep in thought.
   Esc    with a message typed: stops the running session now; the loop's next session starts with your message.
@@ -16,8 +23,9 @@ driver puts any left over into the next session's prompt.
 
 Usage: pi-live --follow <project>    follow the newest .agent/sessions/iter-*.jsonl, switching as sessions start
        pi-live                       read events from stdin (view only)
-Env: LLM_URL (default http://127.0.0.1:8080); AGENT_WATCH_BG light|dark: the terminal's background, for the syntax
-and diff colours (default light); AGENT_WATCH_COLOR=1 forces colours when stdout is not a terminal.
+Env: LLM_URL (default: the LLM_URL in the project's .agent/team.env, so each team agent shows its own server, else
+http://127.0.0.1:8080); AGENT_WATCH_BG light|dark: the terminal's background, for the syntax and diff colours
+(default light); AGENT_WATCH_COLOR=1 forces colours when stdout is not a terminal.
 """
 import codecs
 import glob
@@ -32,6 +40,7 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 import urllib.request
 
 try:
@@ -56,44 +65,101 @@ RST, BOLD, DIM, ITAL = sgr(0), sgr(1), sgr(2), sgr(3)
 RED, GREEN, YEL, CYAN, GREY = sgr(31), sgr(32), sgr(33), sgr(36), sgr(90)
 ADD_BG, DEL_BG = (sgr(48, 5, 22), sgr(48, 5, 52)) if BG == "dark" else (sgr(48, 5, 194), sgr(48, 5, 224))
 DOT, ELBOW = "⏺", "⎿"
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 FORMATTER = Terminal256Formatter(style="monokai" if BG == "dark" else "xcode") if highlight else None
 ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")   # every control character but tab and newline
+LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) (.*)$")
 DIFF_LINES, WRITE_LINES, OUTPUT_LINES = 40, 12, 6
 
-lock = threading.Lock()
-ui = {"rows": 0, "cols": 80, "input": "", "thinking": True, "label": "", "t0": time.time(), "status": "",
-      "composing": None, "project": None}
+lock = threading.RLock()   # re-entrant: Ctrl-C can land while the main thread holds it
+ui = {"cols": 80, "input": "", "thinking": True, "label": "", "t0": time.time(), "phase": "", "sprint": "",
+      "composing": None, "project": None, "task_id": "", "session_file": None, "ended": None, "loop_on": True,
+      "sess_on": True, "loop_last": None}
 INTERACTIVE = False
-
-
-TAIL = ["\n\n"]   # last two visible characters written, so blocks get exactly one blank line between them
-
-
-def out(s):
-    with lock:
-        sys.stdout.write(s)
-        sys.stdout.flush()
-        plain = ANSI.sub("", s)
-        if plain:
-            TAIL[0] = (TAIL[0] + plain)[-2:]
-
-
-def gap():
-    """Start a new block: exactly one blank line after whatever came before."""
-    t = TAIL[0]
-    out("" if t == "\n\n" else "\n" if t.endswith("\n") else "\n\n")
-
-
-def visible(s):
-    return len(ANSI.sub("", s))
-
-
-def clip(plain, n):
-    return plain if len(plain) <= n else plain[: max(0, n - 1)] + "…"
 
 
 def k(n):
     return f"{n / 1000:.1f}k"
+
+
+def dur(s):
+    s = max(0, int(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600}h"
+
+
+def cells(s):
+    """Terminal columns taken by plain text: wide (East Asian) characters take two, combining marks none."""
+    if s.isascii():
+        return len(s)
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def clip(plain, n):
+    """At most n columns of plain text, '…' marking the cut."""
+    if cells(plain) <= n:
+        return plain
+    kept, w = "", 0
+    for c in plain:
+        w += cells(c)
+        if w > n - 1:
+            break
+        kept += c
+    return kept + "…"
+
+
+def tail(plain, n):
+    """The last n columns of plain text, '…' marking the cut."""
+    if cells(plain) <= n:
+        return plain
+    kept, w = "", 0
+    for c in reversed(plain):
+        w += cells(c)
+        if w > n - 1:
+            break
+        kept = c + kept
+    return "…" + kept
+
+
+def wrap1(line, width):
+    """(first row, rest) of a line wider than width columns, cut at the last space that fits."""
+    w, cut, space = 0, len(line), -1
+    for i, c in enumerate(line):
+        w += cells(c)
+        if w > width:
+            cut = i
+            break
+        if c == " ":
+            space = i
+    if space > 0:
+        return line[:space], line[space + 1:]
+    return line[:cut], line[cut:]
+
+
+def clean(v):
+    """The agent's text made safe to print: escape sequences and control characters dropped (a stray cursor move
+    would break the footer), tabs as four spaces."""
+    if isinstance(v, str):
+        return v if v.isprintable() else CTRL.sub("", ANSI.sub("", v)).replace("\t", "    ")
+    if isinstance(v, dict):
+        return {key: clean(x) for key, x in v.items()}
+    if isinstance(v, list):
+        return [clean(x) for x in v]
+    return v
+
+
+def pid_alive(name):
+    try:
+        os.kill(int(open(os.path.join(ui["project"], ".agent", name)).read().strip()), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------- syntax highlighting
@@ -121,43 +187,115 @@ def hl(line, lx, bg=""):
     return bg + highlight(line, lx, FORMATTER).rstrip("\n")   # the 256-colour formatter only resets the foreground
 
 
-# ---------------------------------------------------------------- bottom rows: input line + status bar
+# ---------------------------------------------------------------- the screen: finished lines, then the footer
 
-def setup_region():
-    if not TTY:
-        return
-    size = shutil.get_terminal_size()
-    ui["rows"], ui["cols"] = size.lines, size.columns
-    bottom = ui["rows"] - (2 if INTERACTIVE else 1)
-    sys.stdout.write(f"\033[1;{bottom}r\033[{bottom};1H")
-    sys.stdout.flush()
+TAIL = ["\n\n"]   # last two visible characters written, so blocks get exactly one blank line between them
 
 
-def draw_bottom():
-    if not TTY:
-        return
-    rows, cols = ui["rows"], ui["cols"]
-    s = ""
+class Screen:
+    """Finished lines go into the terminal's normal output. The footer under them is whole rows, each narrower than
+    the terminal so none wraps, and is erased (cursor up, clear to the end of the screen) and redrawn around every
+    write. All writing happens in flush(), under the lock, one write per redraw."""
+
+    def __init__(self):
+        self.pending, self.drawn, self.kind = [], [], None
+
+    def add(self, s, kind="agent"):
+        with lock:
+            self.pending.append(s)
+            plain = ANSI.sub("", s)
+            if plain:
+                TAIL[0] = (TAIL[0] + plain)[-2:]
+                self.kind = kind
+
+    def erase(self, cols):
+        """Back to the footer's first row and clear from there; rows wider than a narrowed terminal were re-wrapped."""
+        h = sum(max(1, -(-cells(ANSI.sub("", r)) // cols)) for r in self.drawn)
+        return ("\r" + (f"\033[{h - 1}A" if h > 1 else "") + "\033[J") if self.drawn else ""
+
+    def flush(self):
+        with lock:
+            text = "".join(self.pending)
+            self.pending = []
+            if not TTY:
+                if text:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                return
+            cols = shutil.get_terminal_size().columns
+            rows = footer(cols)
+            if not text and rows == self.drawn and cols == ui["cols"]:
+                return
+            if text and not TAIL[0].endswith("\n"):   # the footer starts on a row of its own
+                text += "\n"
+                TAIL[0] = TAIL[0][-1] + "\n"
+            sys.stdout.write("\033[?2026h" + self.erase(cols) + text + "\r\n".join(rows) + "\033[?2026l")
+            sys.stdout.flush()
+            self.drawn, ui["cols"] = rows, cols
+
+    def close(self):
+        """Leave the finished lines and remove the footer."""
+        with lock:
+            self.flush()
+            if TTY:
+                sys.stdout.write(self.erase(ui["cols"]) + "\033[?2026l\033[?2004l\033[?25h" + RST)
+                sys.stdout.flush()
+            self.drawn = []
+
+
+SCREEN = Screen()
+out = SCREEN.add
+
+
+def gap():
+    """Start a new block: exactly one blank line after whatever came before."""
+    t = TAIL[0]
+    out("" if t == "\n\n" else "\n" if t.endswith("\n") else "\n\n")
+
+
+def footer(cols):
+    w = cols - 1
+    rows = []
+    live = R.live(w)
+    if live:
+        rows.append(live)
+    rows.append(GREY + clip(activity(), w) + RST)
     if INTERACTIVE:
         if ui["input"]:
-            shown = ui["input"].replace("\n", "⏎")
-            room = cols - 5
-            if len(shown) > room:
-                shown = "…" + shown[-(room - 1):]
-            line = f"{BOLD}›{RST} {shown}\033[7m \033[0m"
+            shown = CTRL.sub("", ui["input"].replace("\n", "⏎").replace("\t", " "))
+            rows.append(f"{BOLD}›{RST} {tail(shown, w - 3)}\033[7m \033[0m")
         else:
             hint = (f"› message the agent: type, Enter sends (read after its current step) · Esc stops the session "
                     f"and sends now · Ctrl-T thinking {'on' if ui['thinking'] else 'off'} · Ctrl-C quits")
-            line = GREY + clip(hint, cols - 1) + RST
-        s += f"\033[{rows - 1};1H\033[2K{line}"
-    bar = ui["status"]
-    if visible(bar) > cols - 2:
-        bar = clip(ANSI.sub("", bar), cols - 2)
-    s += f"\033[{rows};1H\033[2K\033[7m\033[1m {bar} \033[K\033[0m"
-    with lock:
-        sys.stdout.write("\0337" + s + "\0338")
-        sys.stdout.flush()
+            rows.append(GREY + clip(hint, w) + RST)
+    rows.append(f"\033[7m\033[1m {clip(status(), w - 2)} \033[0m")
+    return rows
 
+
+def activity():
+    """One line on what is happening right now."""
+    now = time.time()
+    spin = SPIN[int(now * 5) % len(SPIN)]
+    last = ui["loop_last"]
+    news = f" · {last[1]} ({dur(now - last[0])} ago)" if last else ""
+    if ui["project"] and not ui["loop_on"]:
+        return f"■ loop stopped{news}"
+    if ui["project"] and not ui["sess_on"]:
+        return f"{spin} between sessions{news}"
+    return f"{spin} {R.doing(now)}"
+
+
+def status():
+    now = time.time()
+    parts = [p for p in (ui["label"], ui["sprint"], ui["phase"]) if p]
+    if not ui["project"] or ui["sess_on"]:
+        parts.append(f"session {dur(now - ui['t0'])}")
+    elif ui["ended"]:
+        parts.append(f"session ended {dur(now - ui['ended'])} ago")
+    return " | ".join(parts)
+
+
+# ---------------------------------------------------------------- status: model server, loop state, sprint
 
 VLLM_LAST = [None]   # (time, generation_tokens_total) for the vLLM rate
 
@@ -217,38 +355,26 @@ def sprint_line():
 
 def status_loop():
     state = {}
-    setup_region()
     while True:
-        try:
-            phase = llama_phase(state)
+        try:   # this thread keeps the footer alive: nothing may end it
+            try:
+                ui["phase"] = llama_phase(state)
+            except Exception:
+                ui["phase"] = vllm_phase()
+            if ui["project"]:
+                ui["loop_on"], ui["sess_on"] = pid_alive("loop.pid"), pid_alive("pi.pid")
+                if ui["session_file"]:
+                    ui["ended"] = os.path.getmtime(ui["session_file"])
+                if time.time() - state.get("sprint_t", 0) > 15:   # merges move it; a few seconds of lag is fine
+                    state["sprint_t"] = time.time()
+                    ui["sprint"] = sprint_line()
+            SCREEN.flush()
         except Exception:
-            phase = vllm_phase()
-        if ui["composing"]:
-            name, chars = ui["composing"]
-            phase += f" | writing a {name} call ({k(chars)} chars)"
-        if time.time() - state.get("sprint_t", 0) > 15:   # merges move it; a few seconds of lag is fine
-            state["sprint_t"] = time.time()
-            ui["sprint"] = sprint_line()
-        mins, secs = divmod(int(time.time() - ui["t0"]), 60)
-        sprint = f" | {ui['sprint']}" if ui.get("sprint") else ""
-        ui["status"] = f"{ui['label']}{sprint} | {phase} | session {mins}m{secs:02d}s"
-        size = shutil.get_terminal_size()
-        if (size.lines, size.columns) != (ui["rows"], ui["cols"]):
-            setup_region()
-        draw_bottom()
+            pass
         time.sleep(1)
 
 
 # ---------------------------------------------------------------- talking to the agent
-
-def session_running():
-    try:
-        pid = int(open(os.path.join(ui["project"], ".agent/pi.pid")).read().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
-
 
 def send(msg, now):
     d = os.path.join(ui["project"], ".agent", "inbox")
@@ -259,10 +385,10 @@ def send(msg, now):
         fh.write(msg + "\n")
     os.rename(tmp, os.path.join(d, name))
     if now:
-        note = "stopping this session; the next one starts with your message" if session_running() \
+        note = "stopping this session; the next one starts with your message" if pid_alive("pi.pid") \
             else "no session is running: the next one starts with your message"
     else:
-        note = "queued: the agent reads it after its current step" if session_running() \
+        note = "queued: the agent reads it after its current step" if pid_alive("pi.pid") \
             else "no session is running: the next one starts with your message"
     R.interject(f"{YEL}{BOLD}» you:{RST}{YEL} {msg}{RST}\n  {GREY}{note}{RST}")
 
@@ -329,7 +455,7 @@ def input_loop(fd):
                     j += 1
                 add(bytes([c]) + buf[:j])
                 buf = buf[j:]
-        draw_bottom()
+        SCREEN.flush()
 
 
 # ---------------------------------------------------------------- rendering Pi's events
@@ -374,8 +500,8 @@ def tool_header(name, args):
     return f"{BOLD}{name}{RST}({clip(json.dumps(a), 120)})"
 
 
-def result_text(e):
-    content = (e.get("result") or {}).get("content") or []
+def result_text(e, key="result"):
+    content = (e.get(key) or {}).get("content") or []
     return "".join(c.get("text", "") for c in content if isinstance(c, dict))
 
 
@@ -433,27 +559,51 @@ def render_result(name, args, e):
 
 
 class Renderer:
+    """Pi's events -> finished lines (Screen.add) plus the unfinished one, which the footer shows (live())."""
+
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.mode = None          # thinking / thinking-hidden / text / None
+        self.mode = None          # thinking / text / None
         self.text, self.fence, self.first_line = "", None, True
-        self.t_think, self.user_msgs, self.tools, self.last_header = 0.0, 0, {}, None
+        self.pend, self.think_rows, self.ended = "", 0, False
+        self.t_think, self.user_msgs, self.last_header, self.t_event = 0.0, 0, None, time.time()
+        self.tools = {}           # running tools: toolCallId -> [name, args, started, latest output line]
 
     def interject(self, s):
-        """A line from the viewer itself (the human's message, a toggle) in the middle of the stream."""
-        self.end_stream()
+        """A line from the viewer itself (the human's message, a toggle) in the middle of the stream. The line being
+        streamed stays in the footer and carries on below it."""
         out(s + "\n")
 
     def end_stream(self):
-        if self.mode == "text" and self.text:
-            self.flush_text(final=True)
-        if self.mode in ("thinking", "thinking-hidden"):
-            out(RST + ("" if TAIL[0].endswith("\n") else "\n"))
+        if self.mode == "thinking":
+            self.commit_think(final=True)
         elif self.mode == "text":
-            out(RST)
+            self.flush_text(final=True)
         self.mode = None
+
+    def think_row(self, text):
+        if not self.think_rows and not text.strip():   # blank lines before the first words
+            return
+        out(f"{GREY}{ITAL}{'  ' if self.think_rows else '✻ '}{text}{RST}\n")
+        self.think_rows += 1
+
+    def commit_think(self, final=False):
+        """Print the finished rows of the thinking stream, wrapped at word boundaries to the terminal's width; the
+        unfinished row stays for the footer."""
+        width = max(20, ui["cols"] - 3)
+        while self.pend:
+            line, nl, rest = self.pend.partition("\n")
+            if cells(line) > width:
+                head, more = wrap1(line, width)
+                self.think_row(head)
+                self.pend = more + nl + rest
+            elif nl or final:
+                self.think_row(line)
+                self.pend = rest
+            else:
+                break
 
     def flush_text(self, final=False):
         while "\n" in self.text or (final and self.text):
@@ -461,58 +611,82 @@ class Renderer:
             self.text = rest
             if self.first_line and not line.strip():   # leading blank lines of an answer
                 continue
-            if self.first_line:
-                gap()
-                self.last_header = None
             shown, self.fence = md(line, self.fence)
             prefix = f"{DOT} " if self.first_line else "  "
             self.first_line = False
             out(prefix + shown + RST + "\n")
 
+    def start_text(self):
+        self.end_stream()
+        gap()
+        self.mode, self.text, self.first_line, self.fence, self.last_header = "text", "", True, None, None
+
+    def live(self, width):
+        """The row being streamed, for the footer."""
+        if self.mode == "thinking" and self.pend and ui["thinking"]:
+            return f"{GREY}{ITAL}{'  ' if self.think_rows else '✻ '}{self.pend}{RST}"
+        if self.mode == "text" and self.text.strip():
+            return f"{DOT if self.first_line else ' '} " + md(tail(self.text, width - 2), self.fence)[0] + RST
+        return ""
+
+    def doing(self, now):
+        quiet = now - self.t_event
+        quiet = f" · no new output for {dur(quiet)}" if quiet > 10 else ""
+        if self.tools:
+            name, args, t, line = next(iter(self.tools.values()))
+            s = f"running {ANSI.sub('', tool_header(name, args))} · {dur(now - t)}"
+            s += f" (+{len(self.tools) - 1} more)" if len(self.tools) > 1 else ""
+            return s + (f" · {line}" if line else "")
+        c = ui["composing"]
+        if c:   # vLLM sends a long argument in a few big chunks: the count can sit still while the model writes
+            return f"writing a {c[0]} call ({k(c[1])} chars so far){quiet}"
+        if self.mode == "thinking":
+            return f"thinking · {dur(now - self.t_think)}" + ("" if ui["thinking"] else " (hidden: Ctrl-T shows it)")
+        if self.mode == "text":
+            return "answering"
+        if self.ended:
+            return "session finished: the driver takes over"
+        if re.search(r"\bgen(erating)?\b", ui["phase"]):   # generating, yet nothing streams: a tool call held back
+            return f"the model is writing its next tool call (shown when complete){quiet}"
+        if "reading prompt" in ui["phase"]:
+            return f"the model is reading the prompt{quiet}"
+        return f"waiting for the model{quiet}"
+
     def event(self, e):
         t = e.get("type")
+        self.t_event = time.time()
         if t == "message_update":
             d = e.get("assistantMessageEvent") or {}
             dt = d.get("type")
             if dt == "thinking_start":
                 self.end_stream()
-                self.t_think = time.time()
-                self.last_header = None
                 gap()
-                if ui["thinking"]:
-                    self.mode = "thinking"
-                    out(f"{GREY}{ITAL}✻ ")
-                else:
-                    self.mode = "thinking-hidden"
-                    out(f"{GREY}✻ Thinking…")
+                self.mode, self.t_think, self.pend, self.think_rows, self.last_header = "thinking", time.time(), "", 0, None
             elif dt == "thinking_delta" and self.mode == "thinking":
-                out(GREY + ITAL + d.get("delta", ""))
-            elif dt == "thinking_end":
-                if self.mode == "thinking-hidden":
-                    out(f" {int(time.time() - self.t_think)}s{RST}\n")
-                    self.mode = None
-                else:
-                    self.end_stream()
+                if ui["thinking"]:
+                    self.pend += d.get("delta", "")
+                    self.commit_think()
+                elif self.pend:   # just hidden: keep what was already shown
+                    self.commit_think(final=True)
+            elif dt == "thinking_end" and self.mode == "thinking":
+                self.commit_think(final=True)
+                if not self.think_rows:
+                    out(f"{GREY}✻ Thought for {dur(time.time() - self.t_think)}{RST}\n")
+                self.mode = None
             elif dt == "text_start":
-                self.end_stream()
-                self.mode, self.text, self.first_line, self.fence = "text", "", True, None
+                self.start_text()
             elif dt == "text_delta":
                 if self.mode != "text":
-                    self.end_stream()
-                    self.mode, self.text, self.first_line, self.fence = "text", "", True, None
+                    self.start_text()
                 self.text += d.get("delta", "")
                 self.flush_text()
             elif dt == "text_end":
                 self.flush_text(final=True)
                 self.mode = None
             elif dt == "toolcall_start":
-                ui["composing"] = ["tool", 0]
+                ui["composing"] = [d.get("toolName") or "tool", 0]
             elif dt == "toolcall_delta" and ui["composing"]:
                 ui["composing"][1] += len(d.get("delta", ""))
-                part = d.get("partial") or {}
-                calls = [c for c in (part.get("content") or []) if isinstance(c, dict) and c.get("type") == "toolCall"]
-                if calls and calls[-1].get("name"):
-                    ui["composing"][0] = calls[-1]["name"]
             elif dt == "toolcall_end":
                 ui["composing"] = None
         elif t == "message_end" and (e.get("message") or {}).get("role") == "user":
@@ -532,15 +706,20 @@ class Renderer:
         elif t == "tool_execution_start":
             self.end_stream()
             ui["composing"] = None
-            self.tools[e.get("toolCallId")] = (e.get("toolName"), e.get("args") or {})
+            self.tools[e.get("toolCallId")] = [e.get("toolName"), e.get("args") or {}, time.time(), ""]
             gap()
             out(f"{CYAN}{DOT}{RST} {tool_header(e.get('toolName'), e.get('args'))}\n")
             self.last_header = e.get("toolCallId")
             if e.get("toolName") == "ask_human":
                 req = str((e.get("args") or {}).get("request", "")).splitlines()
                 out("".join(f"  {YEL}│ {l}{RST}\n" for l in req[:12]))
+        elif t == "tool_execution_update":   # a command's output so far: its latest line goes on the activity row
+            tool = self.tools.get(e.get("toolCallId"))
+            lines = [l.strip() for l in result_text(e, "partialResult").splitlines() if l.strip()]
+            if tool and lines:
+                tool[3] = lines[-1]
         elif t == "tool_execution_end":
-            name, args = self.tools.pop(e.get("toolCallId"), (e.get("toolName"), {}))
+            name, args = self.tools.pop(e.get("toolCallId"), [e.get("toolName"), {}])[:2]
             if self.last_header != e.get("toolCallId"):   # tools ran in parallel: say which one this result is
                 gap()
                 out(f"{GREY}{DOT}{RST} {GREY}{ANSI.sub('', tool_header(name, args))}{RST}\n")
@@ -551,71 +730,172 @@ class Renderer:
             out(f"{YEL}[{t}] {e.get('reason') or e.get('errorMessage') or ''}{RST}\n")
         elif t == "agent_end":
             self.end_stream()
+            self.ended = True
 
 
 R = Renderer()
 
 
+# ---------------------------------------------------------------- following a project
+
+def log_start(path, n):
+    """Byte offset in the loop log just after session n's 'iteration n:' line, so the view starts with everything
+    the driver logged since; without one, its last ten lines."""
+    data = open(path, "rb").read()
+    i = data.rfind(f" iteration {n}: ".encode()) if n else -1
+    if i >= 0:
+        j = data.find(b"\n", i)
+        return len(data) if j < 0 else j + 1
+    return len(data) - sum(len(l) for l in data.splitlines(keepends=True)[-10:])
+
+
 def follow(project):
-    """Yield event lines from the newest session file, replaying it from the start, then switch when a newer one
-    appears. The status label comes from the loop log."""
-    current, fh = None, None
+    """Yield the events of the newest session file (replaying it from the start), the driver's new loop-log lines
+    as {"type": "_loop"}, and None when there is nothing new. A newer session file is taken only once the current
+    one is read to its end, and a line still being written waits for its newline."""
+    log_path = os.path.join(project, ".agent/loop.log")
+    current, n, fh, buf, log, log_buf = None, 0, None, "", None, b""
     while True:
-        files = sorted(glob.glob(os.path.join(project, ".agent/sessions/iter-*.jsonl")))
-        if files and files[-1] != current:
-            current = files[-1]
-            fh = open(current)
-            n = int(os.path.basename(current)[5:9])
-            task = ""
-            try:
-                for l in open(os.path.join(project, ".agent/loop.log")):
-                    if f"iteration {n}:" in l:
-                        task = l.split(f"iteration {n}: ", 1)[-1].split(" (harness")[0].strip()
-            except OSError:
-                pass
-            m = re.match(r"tasks/(\d+[a-z]*)-(.+)\.md$", task)
-            short = f"task {m.group(1)} ({m.group(2).replace('-', ' ')})" if m else task
-            ui["task_id"] = m.group(1) if m else ""
-            ui["label"] = f"session {n} | {short}"
-            ui["t0"] = os.path.getmtime(os.path.join(project, ".agent/loop.log"))
-            ui["sprint"] = sprint_line()
-            R.end_stream()
-            R.reset()
-            out(f"\n{BOLD}── session {n} · {short}{' · ' + ui['sprint'] if ui['sprint'] else ''} ──{RST}\n")
         line = fh.readline() if fh else ""
         if line:
-            yield line
-        else:
-            time.sleep(0.2)
+            buf += line
+            if buf.endswith("\n"):
+                text, buf = buf, ""
+                try:
+                    yield clean(json.loads(text))
+                except json.JSONDecodeError:
+                    pass
+            continue
+        files = sorted(glob.glob(os.path.join(project, ".agent/sessions/iter-*.jsonl")))
+        if fh is None and files:   # first the newest session, so the log can start where that session started
+            current = files[-1]
+            fh = open(current, errors="replace")
+            n = int(os.path.basename(current)[5:9])
+            yield {"type": "_session", "path": current, "n": n}
+            continue
+        if log is None and os.path.exists(log_path):
+            log = open(log_path, "rb")
+            log.seek(log_start(log_path, n))
+        if log:
+            if os.path.getsize(log_path) < log.tell():   # rewritten
+                log.seek(0)
+            for raw in iter(log.readline, b""):
+                log_buf += raw
+                if not log_buf.endswith(b"\n"):
+                    break
+                text, log_buf = log_buf.decode("utf-8", "replace").rstrip("\n"), b""
+                yield {"type": "_loop", "line": clean(text)}
+        files = sorted(glob.glob(os.path.join(project, ".agent/sessions/iter-*.jsonl")))   # again: lines came first
+        if files and files[-1] != current:
+            current, buf = files[-1], ""
+            fh = open(current, errors="replace")
+            n = int(os.path.basename(current)[5:9])
+            yield {"type": "_session", "path": current, "n": n}
+            continue
+        yield None
+        time.sleep(0.2)
+
+
+def start_session(path, n):
+    project = ui["project"]
+    task, t0 = "", os.path.getmtime(path)
+    try:
+        for l in open(os.path.join(project, ".agent/loop.log"), errors="replace"):
+            if f"iteration {n}:" in l:
+                task = l.split(f"iteration {n}: ", 1)[-1].split(" (harness")[0].strip()
+                try:
+                    t0 = time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S"))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    m = re.match(r"tasks/(\d+[a-z]*)-(.+)\.md$", task)
+    short = f"task {m.group(1)} ({m.group(2).replace('-', ' ')})" if m else task
+    ui.update(task_id=m.group(1) if m else "", label=f"session {n} | {short}", t0=t0, session_file=path,
+              ended=os.path.getmtime(path), loop_on=pid_alive("loop.pid"), sess_on=pid_alive("pi.pid"))
+    ui["sprint"] = sprint_line()
+    R.end_stream()
+    R.reset()
+    gap()
+    out(f"{BOLD}── session {n} · {short}{' · ' + ui['sprint'] if ui['sprint'] else ''} ──{RST}\n")
+
+
+def loop_line(line):
+    m = LOG_LINE.match(line)
+    if m:
+        try:
+            ts = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            ts = time.time()
+        ui["loop_last"] = (ts, m.group(2))
+    if re.search(r" iteration \d+: ", line):   # the session header says it
+        return
+    if SCREEN.kind != "loop":
+        gap()
+    colour = YEL if re.search(r"\b(WARNING|ERROR|STUCK|stalled|rejected)\b", line) else GREY
+    out(f"{colour}◆ {m.group(1) + ' ' + m.group(2) if m else line}{RST}\n", kind="loop")
+
+
+def team_url(project):
+    """A team agent's model server: the LLM_URL line in its worktree's .agent/team.env."""
+    try:
+        for l in open(os.path.join(project, ".agent/team.env")):
+            m = re.match(r"\s*(?:export\s+)?LLM_URL=['\"]?([^'\"\s]+)", l)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def stdin_events():
+    for line in sys.stdin:
+        try:
+            yield clean(json.loads(line))
+        except json.JSONDecodeError:
+            pass
 
 
 def main():
-    global INTERACTIVE
-    source = sys.stdin
+    global INTERACTIVE, BASE
+    source = stdin_events()
     old = None
+    ui["cols"] = shutil.get_terminal_size().columns
     if len(sys.argv) == 3 and sys.argv[1] == "--follow":
         ui["project"] = os.path.realpath(sys.argv[2])
+        if "LLM_URL" not in os.environ:
+            BASE = team_url(ui["project"]) or BASE
         source = follow(ui["project"])
         INTERACTIVE = TTY and sys.stdin.isatty()
+    if TTY:
+        sys.stdout.write("\033[?25l" + ("\033[?2004h" if INTERACTIVE else ""))   # hide the cursor; bracketed paste
     if INTERACTIVE:
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         tty.setcbreak(fd)
-        out("\033[?2004h")   # bracketed paste: a pasted newline does not send the message
         threading.Thread(target=input_loop, args=(fd,), daemon=True).start()
     if TTY:
         threading.Thread(target=status_loop, daemon=True).start()
+    last = 0.0
     try:
-        for line in source:
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            R.event(e)
+        for e in source:
+            if e is not None:
+                with lock:   # the footer reads the renderer's state from the other threads
+                    t = e.get("type")
+                    if t == "_session":
+                        start_session(e["path"], e["n"])
+                    elif t == "_loop":
+                        loop_line(e["line"])
+                    else:
+                        R.event(e)
+                if time.time() - last < 0.05:   # catching up: redraw at most 20 times a second
+                    continue
+            SCREEN.flush()
+            last = time.time()
+        R.end_stream()
     finally:
         if old:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-            out("\033[?2004l")
 
 
 if __name__ == "__main__":
@@ -624,5 +904,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        if TTY:
-            sys.stdout.write("\033[r" + RST + "\n")
+        R.end_stream()
+        SCREEN.close()
