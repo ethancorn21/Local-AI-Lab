@@ -707,6 +707,9 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   harness_stamp
   log "iteration $i: $task (harness $HARNESS_ID)"
   codemap_sync "before iteration $i"
+  # PITFALLS.md's contents block is what the agent reads first: a merge of main (team mode) can bring entries the
+  # block does not count yet (frontpage 2026-10-04: "Unsorted 78" after another agent had sorted 21 of them).
+  pitfalls_sync "before iteration $i"
   task_baseline "$task"
   if [ "$HANDOVER_MODE" = task ]; then
     progress_overview "$task"

@@ -62,9 +62,13 @@ def files(proj):
         say("PASS" if "PITFALLS.md merge=union" in open(ga).read() else "FAIL", "union merge rule for PITFALLS.md")
 
 
+MEMREAD = re.compile(r"(AGENTS|PROGRESS|PLAN|DECISIONS|CODEMAP|PITFALLS)\.md|tasks/|git log")
+
+
 def reads(path, task):
-    """-> (contents block read, [rule breaks], searches) for one session log."""
-    contents, breaks, searches = False, [], 0
+    """-> (contents block read, [whole reads at spawn: rule breaks], searches, [whole reads later, e.g. before an
+    edit]) for one session log. Spawn ends at the first tool call that is not about a memory file."""
+    contents, breaks, searches, later, spawn = False, [], 0, [], True
     planner = bool(re.match(r"tasks/(000|999)-", task or ""))
     plan_whole = False
     for line in open(path, errors="replace"):
@@ -73,22 +77,26 @@ def reads(path, task):
         e = json.loads(line)
         a, name = e.get("args") or {}, e.get("toolName")
         cmd, p = str(a.get("command", "")), str(a.get("path", ""))
+        if spawn and not MEMREAD.search(json.dumps(a)):
+            spawn = False
         if "contents:end" in cmd or (name == "read" and p.endswith("PITFALLS.md") and a.get("limit") and int(a["limit"]) <= 80):
             contents = True
             continue
         for f in ("DECISIONS.md", "PITFALLS.md", "PLAN.md"):
             whole = (name == "read" and p.endswith(f) and not a.get("limit")) or \
-                    (name == "bash" and re.search(rf"\bcat\s+[^|;&]*{re.escape(f)}(\s|$)", cmd) and "|" not in cmd)
+                    (name == "bash" and re.search(rf"\bcat\s+(?!>)[^|;&>]*{re.escape(f)}(\s|$)", cmd) and "|" not in cmd)
             if (name == "bash" and f in cmd and re.search(r"\b(grep|rg|awk)\b", cmd)) or (name == "read" and p.endswith(f) and a.get("limit")):
                 searches += 1
             if whole:
                 if f == "PLAN.md" and planner:
                     plan_whole = True
-                else:
+                elif spawn:
                     breaks.append(f"whole read of {f}")
+                else:
+                    later.append(f)
     if planner and not plan_whole:
         breaks.append("planning/goal task did not read PLAN.md whole")
-    return contents, sorted(set(breaks)), searches
+    return contents, sorted(set(breaks)), searches, later
 
 
 def logs(proj):
@@ -128,8 +136,10 @@ def logs(proj):
     say("FAIL" if wrong_task else "PASS", f"journal entries all belonged to the session's task" + (f" (not in {wrong_task[:8]})" if wrong_task else ""))
     read_toc = sum(1 for r in rows if r[2])
     say("PASS" if read_toc == len(rows) else "WARN", f"contents block read in {read_toc}/{len(rows)} sessions")
-    broke = [(it, b) for it, _, _, b, _ in rows if b]
-    say("WARN" if broke else "PASS", f"sessions reading whole what they should search: {len(broke)}/{len(rows)}"
+    broke = [(it, b) for it, _, _, b, _, _ in rows if b]
+    late = sum(len(r[5]) for r in rows)
+    say("PASS", f"whole reads after spawn (usually before an edit of that file): {late} in {len(rows)} sessions")
+    say("WARN" if broke else "PASS", f"sessions reading at spawn whole what they should search: {len(broke)}/{len(rows)}"
         + "".join(f"\n       iteration {it}: {', '.join(b)}" for it, b in broke[:10]))
     say("PASS", f"searches of DECISIONS/PITFALLS/PLAN: {sum(r[4] for r in rows)} in {len(rows)} sessions")
     cut = first["start"]
