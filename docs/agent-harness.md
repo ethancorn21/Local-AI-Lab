@@ -351,6 +351,8 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   where the session started plus one commit with the notes, stamped with what they were built on ("written 2 step(s)
   before it could start; built on: 230 (being built by agent a), 242 (not started yet, prep notes)"); code, task files
   and memory files the session touched never reach main, not even in history; the notes go into main at once;
+  at 60% of the hand-over limit without notes, wrapup tells the session to write what it has now and go on (b's
+  first 231 prep read ~90k tokens, then its single final write was cut off by the output limit: 27 minutes, no notes);
   `ask_human` refuses during prep (a question would ping the human and hold the task); prep sessions do not count as
   sessions of the task (split nudge, STALLED flag, hand-over rule) and do not touch the no-progress counter. Two prep
   sessions without notes and a task is not prepared again. The notes belong to the task, not to the agent: whoever

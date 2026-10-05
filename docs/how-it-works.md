@@ -205,6 +205,10 @@ busy 92%. So an agent that has nothing to build does not wait; it **prepares** a
   acceptance box; the tests; risks and open questions. The driver stamps the notes with what they were built on
   ("written 2 steps before the task could start; built on: 230 (being built by agent a), 242 (not started, prep
   notes)"), so whoever uses them knows how much to trust them.
+- **Notes early.** Once a prep session has used 60% of its hand-over limit without a notes file, the harness tells it
+  to write what it has and commit, then keep improving the notes. (The first live day lost a 27-minute prep: the
+  agent read for the whole session, then tried to write everything in one last step at the edge of its window and was
+  cut off. The prompt had asked it to write early; prose did not hold, code does.)
 - **Only notes survive.** A prep session may change nothing else: afterwards the driver resets its branch to where it
   started plus one commit with the notes, which go into `main` at once. It cannot ask the human anything (questions go
   into the notes), and it does not count as a session of the task.

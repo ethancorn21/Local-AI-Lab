@@ -8,7 +8,11 @@
  *  - hard stop: MAX_TURNS turns after the steer, or context >= HARD, abort and exit; the driver commits leftovers
  *  - driver signal (prep sessions): when the driver writes .agent/wrapup-now (the task being prepared can be built now,
  *    or other work is free), the same steer, tool limit and hard stop apply, with DRIVER_TURNS turns
- *  - a prep session (WRAPUP_PREP_FILE set) hands over into its notes file, not the task's hand-over
+ *  - a prep session (WRAPUP_PREP_FILE set) hands over into its notes file, not the task's hand-over; and once its
+ *    context reaches PREP_CHECKPOINT with no notes file yet, it is told to write what it has now and go on (agent b,
+ *    2026-10-05: read ~90k tokens for 231, then tried to write all its notes in one last call at the window's edge;
+ *    llama.cpp ignores the hand-over thinking cap, the call was cut off by the output limit, and 27 minutes left
+ *    nothing - "write it early" in the prompt did not hold)
  * Markers go to stderr as "[wrapup] ..." so the driver can record them in the ledger.
  * Limits sized for the 150k vLLM window from measured hand-overs (iters 100-199: median 11.4k tokens from steer to
  * end, p90 20.4k, max 27.9k; the notes are committed in the first few of those): 120k soft / 142k hard. Hand-over
@@ -35,6 +39,7 @@ const MAX_TURNS = Number(process.env.WRAPUP_MAX_TURNS ?? 10);
 const HANDOVER_THINKING = Number(process.env.WRAPUP_HANDOVER_THINKING ?? 2048);
 const PREP_FILE = process.env.WRAPUP_PREP_FILE ?? "";   // a prep session: these notes are its only output
 const DRIVER_TURNS = Number(process.env.WRAPUP_DRIVER_TURNS ?? 4);
+const PREP_CHECKPOINT = Number(process.env.WRAPUP_PREP_CHECKPOINT_TOKENS ?? Math.round(SOFT * 0.6));
 
 const message = (tokens: number) =>
 	`[harness] CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token hand-over limit. ` +
@@ -104,6 +109,7 @@ export default function (pi: ExtensionAPI) {
 	let turnsSinceSteer = 0;
 	let stopping = false;
 	let turnLimit = MAX_TURNS;
+	let checkpointed = false;
 	// In the TUI (loop viewer) stderr would draw over the screen: the driver passes a marker file instead.
 	const mark = (msg: string) => {
 		const line = `[wrapup] ${msg}`;
@@ -195,6 +201,17 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (tokens >= HARD) return stop(ctx, `tokens=${tokens} before any hand-over`);
 			const continuing = (event.message?.content ?? []).some((c: any) => c?.type === "toolCall");
+			if (PREP_FILE && !checkpointed && continuing && tokens >= PREP_CHECKPOINT && tokens < SOFT &&
+				!existsSync(join(process.cwd(), PREP_FILE))) {
+				checkpointed = true;
+				mark(`prep-checkpoint tokens=${tokens}`);
+				pi.sendUserMessage(`[harness] PREP CHECKPOINT: this session's context is at ${tokens} tokens and ${PREP_FILE} ` +
+					`does not exist yet. Write it now with what you have (assumptions, plan, tests, open questions; mark what ` +
+					`you have not checked yet) and commit it: git add ${PREP_FILE} && git commit -m "prep: first notes". Then ` +
+					`go on and improve it with edits. Keep it short enough to read in one go (about 15 KB at most): whoever ` +
+					`builds the task reads all of it.`, { deliverAs: "steer" });
+				return;
+			}
 			if (tokens >= SOFT && continuing) steer(tokens); // a turn without tool calls is the agent finishing anyway
 		} catch (err) {
 			mark(`error ${err}`);

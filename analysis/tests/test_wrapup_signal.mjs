@@ -19,6 +19,16 @@ if (process.env.CASE) {   // child: one case
 	const pi = { on: (e, f) => { on[e] = f; }, sendUserMessage: (m) => sent.push(m) };
 	(await import(pathToFileURL(ext).href)).default(pi);
 	let aborted = 0;
+	if (process.env.CASE === "checkpoint") {   // context past the checkpoint, no notes file yet; then with one
+		const ctxc = { getContextUsage: () => ({ tokens: 1000 }), abort: () => { aborted++; }, shutdown: () => {} };
+		const turn = { message: { content: [{ type: "toolCall" }] } };
+		const out = {};
+		if (process.env.NOTES_EXIST) { mkdirSync("tasks/prep", { recursive: true }); writeFileSync("tasks/prep/231.md", "x"); }
+		await on.turn_end(turn, ctxc); out.sent1 = [...sent];
+		await on.turn_end(turn, ctxc); out.sent2 = [...sent];
+		out.codeRead = await on.tool_call({ toolName: "read", input: { path: "src/app.py" } });
+		console.log(JSON.stringify(out)); process.exit(0);
+	}
 	const ctx = { getContextUsage: () => ({ tokens: 1000 }), abort: () => { aborted++; }, shutdown: () => {} };
 	const out = {};
 	await on.agent_start?.({}, ctx);
@@ -48,4 +58,11 @@ check(p.notesEdit === undefined && p.codeRead?.block === true && p.gitShow === u
 check(p.abortAfter1 === 0 && p.abortAfter2 === 1, "the session ends after WRAPUP_DRIVER_TURNS (2) turns");
 const n = run({ WRAPUP_HANDOVER: "task" });
 check(n.sent.length === 0 && n.signalLeft && n.codeRead === undefined && n.abortAfter2 === 0, "not a prep session: the signal is ignored");
+const c = run({ CASE: "checkpoint", WRAPUP_PREP_FILE: "tasks/prep/231.md", WRAPUP_PREP_CHECKPOINT_TOKENS: "500", WRAPUP_HANDOVER: "task" });
+check(c.sent1.length === 1 && c.sent1[0].includes("PREP CHECKPOINT") && c.sent1[0].includes("tasks/prep/231.md"), "prep checkpoint: past it with no notes file, the agent is told to write what it has now");
+check(c.sent2.length === 1 && c.codeRead === undefined, "the checkpoint is said once and limits no tools (the session goes on)");
+const e = run({ CASE: "checkpoint", NOTES_EXIST: "1", WRAPUP_PREP_FILE: "tasks/prep/231.md", WRAPUP_PREP_CHECKPOINT_TOKENS: "500", WRAPUP_HANDOVER: "task" });
+check(e.sent1.length === 0, "notes already written: no checkpoint");
+const t = run({ CASE: "checkpoint", WRAPUP_PREP_CHECKPOINT_TOKENS: "500", WRAPUP_HANDOVER: "task" });
+check(t.sent1.length === 0, "not a prep session: no checkpoint");
 process.exit(fail);
