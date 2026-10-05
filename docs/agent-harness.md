@@ -264,7 +264,7 @@ behave the same). One model copy per card: two agents sharing one card measured 
 
 **Layout.** `~/projects/<name>` is the main checkout: branch `main`, finished and merged work only; nobody works in it.
 Each agent works in its own git worktree, `~/projects/<name>.<id>`, on branch `agent/<id>`. The worktree's
-`.agent/team.env` holds that agent's settings (model server, Pi config directory, hand-over limits, task size limit),
+`.agent/team.env` holds that agent's settings (model server, Pi config directory, hand-over limits, task size limit, speed),
 copied from `~/.agent-kit/agents/<id>.env` at set-up (a later change to that file must be made in the worktree too).
 The driver reads it whenever it starts there, so `agent-start <name>.b` or a telecloak start runs agent b correctly.
 
@@ -318,10 +318,36 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
 - **Who owns what:** the human's tasks are those present at team set-up (000) plus the goal check (999); tasks that
   arrive through merges stay the agents'. New top-level tasks get numbers from the creating agent's range (a: 200-499,
   b: 500-799), so two branches cannot create the same number.
-- **Idle and stop:** an agent with nothing to take waits (it syncs every minute) while another agent holds work. When
+- **Idle and stop:** an agent with nothing to take prepares a task (below), or waits (it syncs every minute) while another agent holds work. When
   nobody holds anything, the first running agent runs the goal check; if that adds nothing it writes STOP and the
   others stop. Open tasks that nobody can start because their dependencies cannot be met (a planning mistake) are
   logged as a deadlock and the first one is taken anyway. A refused claim on that path waits a cycle: it never spins.
+- **Who takes what: the critical path first** (2026-10-04). A task's rank is the longest chain of open tasks waiting
+  on it, itself included (`plan-schedule --ranks`). Agents take the highest rank first, so long chains start early;
+  a slower agent (`TEAM_SPEED` in its env file: a = 4, b = 1, a second 3090 would be 4) takes the lowest rank first
+  while a faster agent runs, i.e. tasks nothing waits on, so the fast agents never wait for the slow card. With two
+  fast agents both take the long chains; alone, or with equal speeds, an agent takes the longest chain itself. The
+  plan check's replay uses the same order. Before, every agent took the lowest number: on frontpage that would next
+  have handed b the module split six tasks wait on (replayed: a idle 5 of 15 task lengths instead of 3 of 13).
+- **Prep while idle** (2026-10-04). An agent with nothing to take does not just wait: it prepares a task that starts
+  soon. Target: an open, unclaimed task not prepared yet and not too big for this agent, waiting only on tasks being
+  built or startable now; the longest chain behind it first. None while planning runs (the plan may change every
+  task). The session's prompt is its own: write `tasks/prep/<id>.md` (assumptions about what each dependency will
+  provide, each marked "seen on its branch" or "inferred", the plan per acceptance box, the tests, risks and open
+  questions), reading the dependencies' work in progress on their branches, read only. Enforced by the driver, not
+  asked: a prep lock per task (one writer); afterwards the branch is reset to where the session started plus one
+  commit with the notes (code, task files, memory files the session touched never reach main, not even in history);
+  the notes go into main at once; `ask_human` refuses during prep (a question would ping the human and hold the
+  task); prep sessions do not count as sessions of the task (split nudge, STALLED flag, hand-over rule) and do not
+  touch the no-progress counter. Two prep sessions without notes and a task is not prepared again.
+- **Real work beats prep: the cut and the hand-off.** During a prep session the driver checks every 20 s: once the
+  task can be built (its dependencies are in main, or another agent claimed it), or any task is free for this agent,
+  it writes `.agent/wrapup-now`, and the wrapup extension steers the session the way it does at the context limit:
+  write the notes now, only notes and git from here, the session ends at most `WRAPUP_DRIVER_TURNS` (4) turns later.
+  An agent that claims a task still being prepared waits for the notes (at most `TEAM_PREP_HANDOFF_S`, 300 s), syncs,
+  and starts from them; its first session's prompt says: read the notes, check each assumption against main, fix
+  the plan where they are wrong, say which were wrong in the hand-over. The latency of a cut is the model turn in
+  progress (a steer is delivered after it) plus writing the notes.
 - **Python packages:** each checkout has its own `.venv`, built by the driver from the pinned, hashed
   `requirements.txt` before every test run, so both agents test against the same packages.
 - **The prompt** tells each agent it is in a team, what the other agent is working on and touching, its task-number
@@ -343,7 +369,17 @@ again on the current driver code), and per agent the usual `agent-watch <name>.<
   never held at once, every task done in main, the goal check and a clean stop, only 000/999 the human's;
 - a second round: GOAL.md changes after the team finished, the lead re-plans and runs a second goal check, clean stop;
 - an undeclared shared file caught as a merge conflict, explained, resolved, both tasks in main;
-- a restart: b holds 001, a holds 002, both stopped mid-task, a starts first; each takes back its own task.
+- a restart: b holds 001, a holds 002, both stopped mid-task, a starts first; each takes back its own task;
+- prep and the hand-off: b (slow, 1-file limit) cannot take 001, so it prepares 002 while a builds 001; the prep is
+  cut when 001 is merged, the notes go into main, a claims 002, waits for them (1 s) and starts from them; nothing
+  else of the prep session reaches main, not even in history.
+`analysis/tests/test_team_prep.sh` (real repo and worktrees, about 1 minute) covers pick order (fast, slow, alone,
+equal speeds), the prep target rules, the lock and its takeover, keep-only-the-notes, the cut (dependencies merged;
+other work free), the hand-off (including notes published between the claimer's sync and its claim), the prompt
+pointer, and the planning task never taken again from a checkout that is only behind main.
+`analysis/tests/test_wrapup_signal.mjs` loads the real wrapup extension against a mock Pi: the driver signal steers a
+prep session once into its notes file, tools are limited afterwards, the session ends after the turn limit, and the
+signal is ignored outside prep.
 Each fix below came with a scenario that fails on the code before the fix. The single-agent scenario gives identical
 logs, history and task files with the old and the new driver (`analysis/tests/test_single_regression.sh`), and
 `analysis/tests/test_venv.sh` checks the virtualenv handling against real PyPI (including a tampered hash).
@@ -375,6 +411,10 @@ human, fixed in the driver with a test, and deployed the same day.
 | Both agents idle with four tasks left | a split 221 into 221a-d and wrote "Depends on: 221" (the parent) into 221a; the parent waits for its subtasks, and an agent holding only its own claims never reached the deadlock check | A dependency on the own parent is void; only another agent's claim means "wait" |
 | STALLED alert at 12 sessions on a re-plan that was 4 sessions old, and the planner was told to split itself | The count covered every session the task ever had, across three earlier plans; the planning file also carried all four GOAL.md diffs (29 KB) | Count since the last accepted done; a finished plan drops its old change notes on reopen (29 KB to 11 KB). `analysis/tests/test_replan.sh` |
 
+| Agent b idle 56% of its running time (Oct 2-4: 6.4 h during planning, 5.9 h during goal checks, 13.0 h waiting on dependencies, claims or tasks too big for it); a busy 92% | One agent plans and one checks the goal (by design); between those, every open task hung off one task a was building (230 in the 10-04 plan), and nothing gave a waiting agent anything else to do | Prep while idle, the cut and the hand-off, critical-path picking (above). Planning and goal checks still idle the other cards: a streamed plan is on the do-later list |
+| Lowest number first would hand the slow card a task six others wait on | The pick ignored the graph and the speed difference | Critical-path picking with per-agent speeds |
+| The team test planned twice (first run of the pick-order change) | 000 and 999 skip the done-in-main claim check (the driver reopens them); a checkout that synced just before the other agent's merge saw 000 open. The slower rank-ordered pick widened that old window | Claiming 000 or 999 from a checkout behind main syncs first and looks again; a scenario reproduces it |
+
 **Result:** about 6,000 lines of application code and 9,400 lines of tests (a browser end-to-end test included), 40
 tasks, 98 agent commits; no task was lost or done twice in the end, and every conflict went back to the agent with the
 reason. Agent b (the 5060 Ti at about a quarter of the 3090 Ti's speed) merged 7 of the ~42 accepted tasks: the
@@ -393,6 +433,13 @@ database) passed. Measured on the live preview, filed as a task with the evidenc
 
 - When the second 3090 Ti arrives: rerun the quantization comparison as a **capability** test. The 2026-09-27 sweep measured only how closely each quant's predictions match 8-bit (KL divergence, perplexity) and speed; those are proxies. With 48 GB the 8-bit model fits entirely on GPU, so run the same agentic tasks with hidden tests under Q4, Q6 and Q8 and compare task success, sessions per task, rejected claims and tool errors.
 
+- **Streamed plan** (operator, 2026-10-04: "that is how we cut it down by a lot"). Planning is the biggest single-agent
+  stretch left (frontpage Oct 2-4: 6 plans, 7.5 h, b idle 14% of its running time; goal checks another 13%). The
+  planner publishes each finished wave-1 task to main as soon as it is written (the way split parts are published),
+  so the other agents build wave 1 while it plans the rest; the plan check moves to whatever is published. With two
+  3090s and the 5060 Ti, every planning hour idles two cards.
+- **A bigger model for planning and goal checks** (operator, 2026-10-04, once the agents are mature): both 3090s
+  serving one larger, more capable model (tensor parallel) for the single-agent phases, where judgment matters most.
 - Kickoff flow for new projects: from a one-line idea the agent writes the design doc and proposes the task queue; the operator approves the acceptance criteria.
 - Harness bake-off on replayed tasks with hidden tests: Pi vs Oh My Pi (hash-anchored edits, language-server tools), possibly others.
 - `sim_view` tool: run the game simulation for N ticks from a seed and return an image (map, paths, entities), so the agent can see emergent bugs. The model has vision; the agent almost never uses it.

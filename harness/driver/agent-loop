@@ -261,7 +261,7 @@ task_id() { basename "$1" .md | cut -d- -f1; }
 # a GOAL.md change, starts again from 0 for the split nudge and the STALLED flag.
 task_runs() {
   jq -s --arg t "$1" 'reduce (.[] | select(.task == $t)) as $e (0;
-    if $e.status_after == "done" and $e.verify != "rejected" then 0 else . + 1 end)' "$LEDGER" 2>/dev/null || echo 0
+    if $e.kind == "prep" then . elif $e.status_after == "done" and $e.verify != "rejected" then 0 else . + 1 end)' "$LEDGER" 2>/dev/null || echo 0
 }
 # Subtasks of task 025 are tasks/025a-*.md, 025b-*.md (and theirs 025aa-*.md). A task with unfinished subtasks waits for
 # them whatever its own status says (the agent may forget to set `split`); once all are done or dropped it is workable
@@ -284,6 +284,9 @@ workable() {  # workable <file> in-progress|open
 next_task() {
   local f
   for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" in-progress && { echo "$f"; return; }; done
+  if [ -n "${TEAM_DIR:-}" ] && [ -z "${TEAM_IGNORE:-}" ]; then   # a team takes the critical path first (agent-team-lib)
+    for f in $(team_pick_order); do workable "$f" open && { echo "$f"; return; }; done; return
+  fi
   for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" open && { echo "$f"; return; }; done
 }
 # New tasks, changed human criteria and proposals go to the loop log (task-audit prints one line per finding).
@@ -633,6 +636,81 @@ verify_done() {
 # Start-up: save anything an interrupted session left behind, and audit tasks already marked done:
 # checkboxes per task, the test suite ONCE (a suite failure can't be pinned on one task, so it is logged, not reopened).
 commit_leftovers "uncommitted work found at loop start"
+# One agent session: iteration $i on $task with $PROMPT, in the viewer's tmux window or headless. Sets rc (124 = timeout).
+run_session() {
+  if [ "$VIEWER" = tui ]; then
+    # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
+    # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
+    sess=${AGENT_TMUX%%:*}; win=${AGENT_TMUX#*:}; sdir=".agent/sessions/iter-$n4.d"
+    # the done-signal is per project: two loops on the same iteration number must not wake each other (a shared
+    # "agent-done-N" ended both agents' sessions whenever either finished)
+    chan="agent-done-$(printf '%s' "$P" | cksum | cut -d' ' -f1)-$i"
+    printf '%s' "$PROMPT" > .agent/prompt.txt; rm -f .agent/rc
+    # Targets are explicit: "=name" is an exact session match and "name:" a session. Run from inside tmux, a bare
+    # "-t name" is first read as a window of the CURRENT session, prefix-matched ("tt" hit a window "tt-loop"), and the
+    # agent window was never created while the loop waited ITER_TIMEOUT for a session that had not started.
+    tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -n "$win"
+    tmux list-windows -t "=$sess:" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "=$sess:" -n "$win"
+    tmux set-option -w -t "=$sess:$win" remain-on-exit on   # keep the last screen up between iterations
+    if ! tmux respawn-window -k -t "=$sess:$win" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' WRAPUP_PREP_FILE='${PREP_FILE:-}' PI_LOOP_PREP='${PREP:-}' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"; then
+      log "ERROR: could not start the agent in tmux window $AGENT_TMUX - stopping (nothing ran this iteration)"; exit 1
+    fi
+    tmux display -p -t "=$sess:$win" '#{pane_pid}' > .agent/pi.pid
+    timeout $((ITER_TIMEOUT + 120)) tmux wait-for "$chan"   # bounded: a killed window cannot hang the loop
+    rc=$(cat .agent/rc 2>/dev/null || echo 1)
+    f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
+    if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi
+  elif [ "$AGENT_CMD" = omp ]; then
+    hooks=(); for x in "$HOME"/.pi/agent/extensions/*.ts; do hooks+=(--hook "$x"); done
+    PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" PI_LOOP_PREP="${PREP:-}" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
+      --session-dir ".agent/sessions/iter-$n4.d" "${hooks[@]}" "$PROMPT" \
+      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
+    spid=$!; echo $spid > .agent/pi.pid
+    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
+    wait $spid
+    rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  else
+    PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" PI_LOOP_PREP="${PREP:-}" \
+      timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
+      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
+    spid=$!; echo $spid > .agent/pi.pid
+    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
+    wait $spid
+    rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  fi
+  rm -f .agent/pi.pid
+}
+# A prep session (team mode, agent-team-lib "Prep"): notes for a task that starts soon. Its own prompt, no task step:
+# no test baseline, hand-over, verification, merge or session counts; only tasks/prep/<id>.md is kept and published.
+prep_iteration() {  # prep_iteration <task file>
+  local h0 t0 s0 t1 s1 wpid bytes
+  task=$1; n4=$(printf %04d "$i"); PREP_FILE=$(prep_file "$task")
+  harness_stamp
+  log "iteration $i: prep for $task (harness $HARNESS_ID)"
+  codemap_sync "before iteration $i"
+  pitfalls_sync "before iteration $i"
+  rm -f .agent/wrapup-now .agent/stalled
+  h0=$(git rev-parse HEAD)
+  PROMPT=$(team_prep_prompt "$task" "$i")
+  t0=$(date -Iseconds); s0=$(date +%s)
+  team_prep_watch "$task" 9>&- & wpid=$!
+  run_session
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  t1=$(date -Iseconds); s1=$(date +%s)
+  [ "$rc" -eq 124 ] && log "iteration $i (prep) hit the ${ITER_TIMEOUT}s timeout"
+  rm -f .agent/stalled
+  team_prep_finish "$task" "$h0"
+  bytes=$(stat -c %s "$PREP_FILE" 2>/dev/null || echo 0)
+  archive_sync "after iteration $i"
+  jq -n -c --argjson iter "$i" --arg task "$task" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \
+      --argjson rc "$rc" --argjson bytes "$bytes" --arg harness_id "$HARNESS_ID" --argjson harness "$HARNESS" '
+    {iter: $iter, task: $task, kind: "prep", start: $start, end: $end, agent_secs: $agent_secs, rc: $rc,
+     timed_out: ($rc == 124), status_after: null, verify: null, prep_bytes: $bytes, harness_id: $harness_id,
+     harness: $harness}' >> "$LEDGER"
+  PREP_FILE=""
+}
 [ -n "${TEAM_DIR:-}" ] && team_handover_finish   # a hand-over marked while this loop was stopped
 # team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
 if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
@@ -668,7 +746,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   goal_changed
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
-  # mean wait; otherwise the goal check, then stop.
+  # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
+  PREP=""
   while :; do
     WAITING=$(waiting_tasks)
     task=$(answered_first)
@@ -680,13 +759,17 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     # takes freed work within a minute (frontpage 2026-10-03: a stale non-blocking request held agent a here while
     # the task it needed was being handed to it).
     if [ -n "$(asks_with open)" ]; then
-      if [ -n "${TEAM_DIR:-}" ] && [ -n "$(others_tasks)" ]; then team_wait; continue; fi
+      if [ -n "${TEAM_DIR:-}" ] && [ -n "$(others_tasks)" ]; then
+        task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
+        team_wait; continue
+      fi
       wait_for_human; continue
     fi
     if [ -n "${TEAM_DIR:-}" ]; then   # wait for the other agents, or (lead agent, nobody holding work) check the goal
       decision=$(team_idle_decision)
       case $decision in
-        wait) team_wait; continue ;;
+        wait) task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
+              team_wait; continue ;;
         stop) log "team: stopping - $(cat "$TEAM/STOP" 2>/dev/null)"; task=""; break ;;
         force*) task=${decision#force }
                 log "team: DEADLOCK - open tasks wait on dependencies nobody can finish ($(team_idle_reason)); taking $task anyway"
@@ -702,6 +785,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   done
   [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
+  if [ -n "$PREP" ]; then prep_iteration "$task"; continue; fi
+  [ -n "${TEAM_DIR:-}" ] && team_prep_handoff "$task"   # another agent still preparing it: its notes first (bounded)
   before=$(agent_commits); head0=$(git rev-parse HEAD); split=""
   ticked0=$(grep -cE '^[[:space:]]*- \[x\]' "$task" 2>/dev/null || true)
   harness_stamp
@@ -731,6 +816,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   fi
   if [ -n "${TEAM_DIR:-}" ]; then
     PROMPT="$PROMPT$(team_prompt)"
+    pn=$(team_prep_note "$task"); PROMPT="$PROMPT$pn"
+    [[ $pn == " PREP NOTES:"* ]] && { tev prep_used "$task"; log "iteration $i starts from the prep notes $(prep_file "$task")"; }
     split=$(team_split_note "$task")
     [ -n "$split" ] && { PROMPT="$PROMPT$split"; log "$task is too big for another agent: this session is told to split it"; tev split_asked "$task"; }
   fi
@@ -781,49 +868,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
               done | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add')
   n4=$(printf %04d "$i")
   rm -f .agent/stalled
-  if [ "$VIEWER" = tui ]; then
-    # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
-    # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
-    sess=${AGENT_TMUX%%:*}; win=${AGENT_TMUX#*:}; sdir=".agent/sessions/iter-$n4.d"
-    # the done-signal is per project: two loops on the same iteration number must not wake each other (a shared
-    # "agent-done-N" ended both agents' sessions whenever either finished)
-    chan="agent-done-$(printf '%s' "$P" | cksum | cut -d' ' -f1)-$i"
-    printf '%s' "$PROMPT" > .agent/prompt.txt; rm -f .agent/rc
-    # Targets are explicit: "=name" is an exact session match and "name:" a session. Run from inside tmux, a bare
-    # "-t name" is first read as a window of the CURRENT session, prefix-matched ("tt" hit a window "tt-loop"), and the
-    # agent window was never created while the loop waited ITER_TIMEOUT for a session that had not started.
-    tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -n "$win"
-    tmux list-windows -t "=$sess:" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "=$sess:" -n "$win"
-    tmux set-option -w -t "=$sess:$win" remain-on-exit on   # keep the last screen up between iterations
-    if ! tmux respawn-window -k -t "=$sess:$win" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"; then
-      log "ERROR: could not start the agent in tmux window $AGENT_TMUX - stopping (nothing ran this iteration)"; exit 1
-    fi
-    tmux display -p -t "=$sess:$win" '#{pane_pid}' > .agent/pi.pid
-    timeout $((ITER_TIMEOUT + 120)) tmux wait-for "$chan"   # bounded: a killed window cannot hang the loop
-    rc=$(cat .agent/rc 2>/dev/null || echo 1)
-    f=$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)
-    if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi
-  elif [ "$AGENT_CMD" = omp ]; then
-    hooks=(); for x in "$HOME"/.pi/agent/extensions/*.ts; do hooks+=(--hook "$x"); done
-    PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
-      --session-dir ".agent/sessions/iter-$n4.d" "${hooks[@]}" "$PROMPT" \
-      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
-    spid=$!; echo $spid > .agent/pi.pid
-    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
-    wait $spid
-    rc=$?
-    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
-  else
-    PI_LOOP_ITER=$i PI_LOOP_TASK="$task" \
-      timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
-      > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
-    spid=$!; echo $spid > .agent/pi.pid
-    stall_watch "$spid" ".agent/sessions/iter-$n4.jsonl" 9>&- & wpid=$!
-    wait $spid
-    rc=$?
-    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
-  fi
-  rm -f .agent/pi.pid
+  run_session
   t1=$(date -Iseconds); s1=$(date +%s)
   HANDOVER_GUARD=false; ho_changed=null
   if [ "$HANDOVER_MODE" = task ] && [ -f "$task" ]; then

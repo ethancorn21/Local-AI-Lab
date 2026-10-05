@@ -6,6 +6,9 @@
  *  - soft limit: after a turn that ends in tool calls with context >= SOFT, steer the agent with a hand-over message
  *  - compaction is always cancelled: a summary lets the session run on with a blurred memory of its own work
  *  - hard stop: MAX_TURNS turns after the steer, or context >= HARD, abort and exit; the driver commits leftovers
+ *  - driver signal (prep sessions): when the driver writes .agent/wrapup-now (the task being prepared can be built now,
+ *    or other work is free), the same steer, tool limit and hard stop apply, with DRIVER_TURNS turns
+ *  - a prep session (WRAPUP_PREP_FILE set) hands over into its notes file, not the task's hand-over
  * Markers go to stderr as "[wrapup] ..." so the driver can record them in the ledger.
  * Limits sized for the 150k vLLM window from measured hand-overs (iters 100-199: median 11.4k tokens from steer to
  * end, p90 20.4k, max 27.9k; the notes are committed in the first few of those): 120k soft / 142k hard. Hand-over
@@ -17,7 +20,8 @@
  * WRAPUP_CLAMP_FROM.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 
 const SOFT = Number(process.env.WRAPUP_SOFT_TOKENS ?? 120000);
 const HARD = Number(process.env.WRAPUP_HARD_TOKENS ?? 142000);
@@ -29,6 +33,8 @@ const MIN_ROOM = 1024;
 const TASK_HANDOVER = process.env.WRAPUP_HANDOVER === "task";
 const MAX_TURNS = Number(process.env.WRAPUP_MAX_TURNS ?? 10);
 const HANDOVER_THINKING = Number(process.env.WRAPUP_HANDOVER_THINKING ?? 2048);
+const PREP_FILE = process.env.WRAPUP_PREP_FILE ?? "";   // a prep session: these notes are its only output
+const DRIVER_TURNS = Number(process.env.WRAPUP_DRIVER_TURNS ?? 4);
 
 const message = (tokens: number) =>
 	`[harness] CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token hand-over limit. ` +
@@ -46,9 +52,18 @@ const message = (tokens: number) =>
 	`The harness ends this session after ${MAX_TURNS} more turns regardless: anything not committed by then is saved ` +
 	`by the harness, but your notes should be committed by step 2.`;
 
+const prepMessage = (why: string) =>
+	`[harness] ${why} Stop researching now. From now on only these tools work: reading or editing task files and ` +
+	`tasks/prep/ notes, and git add/commit/status/diff/log/show.\n` +
+	`1. FIRST, in one edit or write: put everything you have into ${PREP_FILE}: assumptions, plan, tests, open ` +
+	`questions; mark what you did not get to check.\n` +
+	`2. Commit it right away: git add ${PREP_FILE} && git commit -m "prep: notes".\n` +
+	`3. End your turn with no further tool calls.\n` +
+	`The harness ends this session after a few more turns regardless.`;
+
 // After the hand-over message, tools are limited to the hand-over itself (enforced, not requested: iteration 66 kept
 // debugging failing tests for all its remaining turns and was cut off without saving its notes).
-const MEMORY_FILE = /(^|\/)(PROGRESS|DECISIONS|CODEMAP)\.md$|(^|\/)codemap\/.+\.md$|(^|\/)tasks\/[^/]+\.md$/;
+const MEMORY_FILE = /(^|\/)(PROGRESS|DECISIONS|CODEMAP)\.md$|(^|\/)codemap\/.+\.md$|(^|\/)tasks\/(prep\/)?[^/]+\.md$/;
 const READERS = /^(cat|head|tail|grep|wc|sed)\b(.*)$/;
 // Split a shell command on unquoted ; && || | and newlines. Quoted text becomes the placeholder Q, so a ';' or '>'
 // inside a commit message is not mistaken for a command separator or a redirect (iteration 81's commits were blocked
@@ -88,6 +103,7 @@ export default function (pi: ExtensionAPI) {
 	let steered = false;
 	let turnsSinceSteer = 0;
 	let stopping = false;
+	let turnLimit = MAX_TURNS;
 	// In the TUI (loop viewer) stderr would draw over the screen: the driver passes a marker file instead.
 	const mark = (msg: string) => {
 		const line = `[wrapup] ${msg}`;
@@ -99,8 +115,27 @@ export default function (pi: ExtensionAPI) {
 		steered = true;
 		turnsSinceSteer = 0;
 		mark(`steer tokens=${tokens}`);
-		pi.sendUserMessage(message(tokens), { deliverAs: "steer" });
+		pi.sendUserMessage(PREP_FILE
+			? prepMessage(`CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token limit.`)
+			: message(tokens), { deliverAs: "steer" });
 	};
+	// The driver's signal: a steer from outside the session (a prep session whose task can be built now). Delivered
+	// once a second at most, like the human's messages, and only while the agent runs (a steer needs a running agent).
+	const signal = join(process.cwd(), ".agent", "wrapup-now");
+	let running = false;
+	pi.on("agent_start", async () => { running = true; });
+	pi.on("agent_end", async () => { running = false; });
+	const iv = setInterval(() => {
+		if (!PREP_FILE || !running || steered || stopping || !existsSync(signal)) return;
+		let why = "";
+		try { why = readFileSync(signal, "utf8").trim(); unlinkSync(signal); } catch { return; }
+		steered = true;
+		turnsSinceSteer = 0;
+		turnLimit = DRIVER_TURNS;
+		mark(`driver-stop ${why.slice(0, 160)}`);
+		pi.sendUserMessage(prepMessage(`PREP ENDS NOW: ${why}.`), { deliverAs: "steer" });
+	}, 1000);
+	iv.unref?.();
 	const stop = (ctx: any, why: string) => {
 		if (stopping) return;
 		stopping = true;
@@ -155,7 +190,7 @@ export default function (pi: ExtensionAPI) {
 			const tokens = tokensNow(ctx, event);
 			if (steered) {
 				turnsSinceSteer++;
-				if (turnsSinceSteer >= MAX_TURNS || tokens >= HARD) stop(ctx, `turns=${turnsSinceSteer} tokens=${tokens}`);
+				if (turnsSinceSteer >= turnLimit || tokens >= HARD) stop(ctx, `turns=${turnsSinceSteer} tokens=${tokens}`);
 				return;
 			}
 			if (tokens >= HARD) return stop(ctx, `tokens=${tokens} before any hand-over`);

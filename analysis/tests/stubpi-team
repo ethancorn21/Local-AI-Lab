@@ -4,16 +4,28 @@
 #   999  writes GOAL-CHECK.md (everything met)
 #   any  task: writes one line per `Touches:` path; a task with a `Stub-writes:` line also overwrites that file (an
 #        undeclared shared file: the conflict case). Then ticks its boxes and sets itself done.
+#   `Stub-sleep: N` in a task file: that task's step takes N more seconds.
+#   a prep session (team mode): writes the notes file it is asked for, plus a stray code file the driver must drop.
+#        With STUB_PREP_WAIT it first waits (up to that many seconds) for the driver's cut signal, .agent/wrapup-now,
+#        the way the wrapup extension makes a real session end.
 # When the driver asks for a merge with main, the stub merges it, conflicts resolved to this side.
 [ "${1:-}" = --version ] && { echo "stub-team-pi 0"; exit 0; }
 PROMPT="${@: -1}"
 TASK=$(grep -oE 'Your task file is tasks/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^Your task file is //')
 mkdir -p .agent; printf '%s\n---\n' "$PROMPT" >> .agent/stub-prompts.txt
 sleep "${STUB_SLEEP:-3}"
+if grep -q 'in a PREP SESSION' <<<"$PROMPT"; then
+  PF=$(grep -oE 'Write tasks/prep/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^Write //')
+  for _ in $(seq 1 "${STUB_PREP_WAIT:-0}"); do [ -f .agent/wrapup-now ] && break; sleep 1; done
+  mkdir -p tasks/prep src; printf '# prep notes by agent %s\nAssumptions: none checked (stub).\n' "${AGENT_ID:-?}" > "$PF"
+  echo stray > src/prep-stray.txt
+  git add -A && git commit -q -m "prep: stub notes by agent ${AGENT_ID:-?}"; echo '{"type":"stub"}'; exit 0
+fi
 # only when the driver asks (sync conflict in the prompt, or a done claim that could not go into main), as agents are told
 if grep -q 'FIRST, before your task step' <<<"$PROMPT" || tail -6 DECISIONS.md 2>/dev/null | grep -q 'cannot go into main yet'; then
   git merge-base --is-ancestor main HEAD || git merge -q -X ours --no-edit -m "merge main (stub resolves)" main
 fi
+[ -n "$TASK" ] && ss=$(sed -n 's/^Stub-sleep:[[:space:]]*//p' "$TASK") && [ -n "$ss" ] && sleep "$ss"
 case $TASK in
   tasks/000-*)
     for f in "$STUB_FIXTURES"/*.md; do [ -e "tasks/$(basename "$f")" ] || cp "$f" tasks/; done   # a re-plan keeps the tasks it has

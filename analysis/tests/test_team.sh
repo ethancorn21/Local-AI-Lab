@@ -5,6 +5,7 @@
 # Scenario 1 (tt): planning by one agent while the other waits; parallel work; a dependency honoured (003 after 001 is
 #   in main); two tasks touching the same files never held at once (001, 004); every task done in main; the goal check
 #   and a clean stop of both loops; only 000/999 registered as the human's; no duplicate task numbers.
+# Scenario 4 (tp): prep while a dependency is built, the cut, the notes into main, the hand-off to the claimer.
 # Scenario 2 (tc): two tasks that write the same file they did not declare, at the same time: one merge conflict,
 #   caught, explained in DECISIONS.md, resolved, both tasks end up in main.
 set -u
@@ -164,5 +165,44 @@ check(any(e["event"] == "merge" and "001-slow" in e["task"] for e in ev) and any
       "both tasks merged after the restart")
 sys.exit(1 if bad else 0)
 PY
+# --- scenario 4: prep and the hand-off. b (slow, 1-file tasks) can never take 001, so while a builds it b prepares
+# 002 (the longest chain behind 001); when 001 is merged, b's prep session is cut, its notes go into main, and a,
+# claiming 002 at once, waits for them and starts from them. Only the notes survive the prep session.
+rm -f "$FX"/*.md
+task 001-base.md none "src/base/, src/base2/" $'Stub-sleep: 25\nSplit: no - test fixture'
+task 002-next.md "001" "src/next/"
+task 003-leaf.md "001" "src/leaf/"
+task 004-tail.md "002" "src/tail/"
+printf 'TEAM_SPEED=4\n' > "$H/.agent-kit/agents/a.env"; printf 'TEAM_SPEED=1\nTEAM_MAX_TOUCHES=1\n' > "$H/.agent-kit/agents/b.env"
+export STUB_SLEEP=3 STUB_PREP_WAIT=120 TEAM_PREP_POLL_S=2 TEAM_PREP_HANDOFF_POLL_S=1
+run_team tp
+unset STUB_PREP_WAIT TEAM_PREP_POLL_S TEAM_PREP_HANDOFF_POLL_S; : > "$H/.agent-kit/agents/a.env"; : > "$H/.agent-kit/agents/b.env"
+M=$PR/tp
+git -C "$M" cat-file -e main:tasks/prep/002.md 2>/dev/null && ok "tp: b's prep notes for 002 are in main" || bad "tp: no prep notes in main"
+! git -C "$M" log --all --format= --name-only main | grep -q 'prep-stray' && ok "tp: nothing else of the prep session reached main" || bad "tp: prep-stray.txt reached main"
+grep -q 'PREP NOTES: tasks/prep/002.md' "$M.a/.agent/stub-prompts.txt" "$M.b/.agent/stub-prompts.txt" 2>/dev/null && ok "tp: the session that built 002 was pointed at the notes" || bad "tp: no PREP NOTES pointer"
+jq -s -e 'map(select(.kind == "prep")) | length > 0' "$M.b/.agent/iterations.jsonl" > /dev/null 2>&1 && ok "tp: b's ledger has a prep row" || bad "tp: no prep row in b's ledger ($(ls "$M.b/.agent/" | tr '\n' ' '))"
+python3 - "$M/.agent/team/events.jsonl" <<'PY' || fail=1
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+bad = 0
+def check(cond, msg):
+    global bad
+    print(("ok   " if cond else "FAIL ") + "tp: " + msg); bad += not cond
+at = lambda e, t, a=None: next((i for i, x in enumerate(ev) if x["event"] == e and t in x["task"] and (a is None or x["agent"] == a)), None)
+check(at("claim", "/001-", "a") is not None, "a built 001 (too big for b)")
+p, m, c = at("prep_start", "/002-", "b"), at("merge", "/001-"), at("prep_cut", "/002-", "b")
+check(p is not None and m is not None and p < m, "b prepared 002 while 001 was being built")
+check(c is not None and c > m, "b's prep was cut after 001 was merged")
+check(at("prep_published", "/002-", "b") is not None, "the notes were published")
+h = [x for x in ev if x["event"] == "prep_handoff"]
+u = at("prep_used", "/002-")
+check(u is not None, "the agent that built 002 started from the notes" + (f" (hand-off: {h[0]['agent']} {h[0]['detail']})" if h else ""))
+odd = [(x["event"], x["task"]) for x in ev if x["event"] in ("prep_publish_failed", "deps_deadlock", "stale_claim", "merge_conflict")]
+check(not odd, f"no failed publish, deadlock, stale claim or conflict {odd if odd else ''}")
+sys.exit(1 if bad else 0)
+PY
+for id in a b; do grep -hE "prep|team: waited" "$M.$id/.agent/loop.log" | sed "s/^/     $id /" | tail -8; done
+
 kill $SRV 2>/dev/null
 exit $fail

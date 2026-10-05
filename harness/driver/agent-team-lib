@@ -7,6 +7,8 @@
 #                        and can be taken over, only when its agent's loop is not running AND its heartbeat is older
 #                        than TEAM_STALE_MIN (120). A restart or a short stop never looks like a crash.
 #   merge.lock           one merge into main at a time
+#   prep/<id>/owner      an idle agent is preparing that task: "<agent> <loop pid> <epoch>" (see Prep below)
+#   prep-tries/<id>      prep sessions on that task that wrote no notes (two and it is not prepared again)
 #   events.jsonl         what happened, for monitoring (agent-team status): claims, waits, merges, conflicts
 #   STOP                 written by the agent that ran the last goal check; the others stop too
 # Rules in code, not prose: a task is offered only when its `Depends on:` tasks are done in main and its `Touches:`
@@ -47,6 +49,15 @@ claim_task() {  # claim_task <task file> : take the task (atomic); fails while a
   local p; read -r o p _ <<<"$(owner_line "$k")"
   [ "${o:-}" = "$AGENT_ID" ] && [ "${p:-}" = "$$" ] && return 0
   echo "$AGENT_ID $$ $(date +%s) $P/$1" > "$d/owner"
+  # 000 and 999 skip the check below (the driver reopens them itself, in-progress), so a checkout that is only behind
+  # main could take the planning task again right after another agent finished it (team test 2026-10-04: the pick ran
+  # between this checkout's sync and the other agent's merge; the plan ran twice). Catch up with main, then look again.
+  case $1 in tasks/000-*|tasks/999-*)
+    if ! git merge-base --is-ancestor main HEAD && team_sync && [ "$(status_of "$1")" = done ]; then
+      rm -rf "${TEAM:?}/claims/$k"; tev stale_view "$1" "done in main, this checkout was behind"
+      log "team: $1 was just finished by another agent (this checkout was behind main) - not taking it"; return 1
+    fi ;;
+  esac
   # Another agent may have finished it between this checkout's last sync and the claim: it merges into main before
   # it releases, so main knows. Then this checkout is only behind: give the claim back.
   if [ -n "$(done_in_main "$1")" ]; then
@@ -352,6 +363,188 @@ team_prompt() {  # the team part of the session prompt
   [ -n "$SYNC_CONFLICT" ] && txt+=" FIRST, before your task step: merging the latest \`main\` into your branch conflicts in: $SYNC_CONFLICT. Run \`git merge main\`, resolve every conflict keeping both sides' intent (main holds the other agents' finished work), run the tests, and commit the merge."
   printf '%s' "$txt"
 }
+# Who takes what: the critical path first. A task's rank is the longest chain of open tasks that waits on it, itself
+# included; agents take the highest rank first, so long chains start early. A slower agent (TEAM_SPEED in the env
+# files, relative, default 1) takes the lowest rank first while a faster agent runs: tasks nothing waits on, so the fast
+# agents never wait for it. (frontpage 2026-10-04: lowest number first would have handed agent b, a quarter of a's
+# speed, the module split six tasks wait on, and a would have waited for b; replayed, a idles 5 of 15 task lengths
+# instead of 3 of 13.) With two fast cards and one slow one, both fast agents take the long chains.
+agent_speed() {  # agent_speed <id>
+  local v=""
+  [ "$1" = "$AGENT_ID" ] && v=${TEAM_SPEED:-}
+  [ -n "$v" ] || v=$(sed -n 's/^TEAM_SPEED=//p' "$HOME/.agent-kit/agents/$1.env" 2>/dev/null | tail -1)
+  [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] && echo "$v" || echo 1
+}
+team_is_slow() {  # a faster agent's loop runs
+  local id me; me=$(agent_speed "$AGENT_ID")
+  for id in $(live_agents); do
+    [ "$id" = "$AGENT_ID" ] && continue
+    awk -v o="$(agent_speed "$id")" -v m="$me" 'BEGIN { exit !(o > m) }' && return 0
+  done
+  return 1
+}
+team_ranks() {  # "<id> <rank>" for each open task of this checkout (000 and 999 aside)
+  local f
+  for f in tasks/[0-9]*.md; do
+    [ -f "$f" ] || continue
+    case $f in tasks/000-*|tasks/999-*) continue ;; esac
+    case $(status_of "$f") in done|dropped) continue ;; esac
+    printf '%s\t%s\n' "$(task_id "$f")" "$(deps_of "$f" | tr '\n' ' ')"
+  done | plan-schedule --ranks 2>/dev/null
+}
+rank_of() { awk -v t="$1" '$1 == t { print $2; f = 1 } END { if (!f) print 0 }' <<<"$2"; }   # rank_of <id> <team_ranks>
+team_pick_order() {  # the task files in the order this agent takes them: the planning task, then by rank
+  local f ranks o=r
+  ranks=$(team_ranks); team_is_slow && o=""
+  compgen -G 'tasks/000-*.md' || true
+  for f in tasks/[0-9]*.md; do
+    [ -f "$f" ] || continue
+    case $f in tasks/000-*) continue ;; esac
+    printf '%s %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
+  done | sort -k1,1n$o -k2,2 | cut -d' ' -f2
+}
+
+# Prep: an agent with nothing to take prepares a task that starts soon (its dependencies are being built, or could
+# start now), so whoever takes it checks a plan instead of researching from scratch (frontpage 2026-10-04: agent b had
+# waited 862 minutes over the project, and agent a spent a whole session researching 230 before writing any code).
+# Notes only, in tasks/prep/<id>.md, one writer (the lock $TEAM/prep/<id>); the driver keeps nothing else of the session
+# and puts the notes into main when it ends. The session is cut short (wrapup's driver signal) as soon as the task can
+# be built: then this agent takes it with its own notes, or an agent that claimed it waits a little for them.
+prep_file() { echo "tasks/prep/$(task_id "$1").md"; }
+prep_owner() {  # prep_owner <id> : the agent whose running loop prepares that task
+  local a p
+  [ -f "$TEAM/prep/$1/owner" ] || return 0
+  read -r a p _ < "$TEAM/prep/$1/owner" || return 0
+  kill -0 "$p" 2>/dev/null && echo "$a"; return 0
+}
+prep_lock() {  # prep_lock <task file> : take the prep lock (atomic); a lock whose loop is gone is taken over
+  local id d; id=$(task_id "$1"); d=$TEAM/prep/$id; mkdir -p "$TEAM/prep"
+  if ! mkdir "$d" 2>/dev/null; then
+    [ -z "$(prep_owner "$id")" ] || return 1
+    mv "$d" "$TEAM/prep/.stale-$id-$$-$(date +%s)" 2>/dev/null && mkdir "$d" 2>/dev/null || return 1
+  fi
+  echo "$AGENT_ID $$ $(date +%s)" > "$d/owner"; tev prep_start "$1"; return 0
+}
+prep_ready() {  # prep_ready <task file> : it can be built now, by this agent or another (prep ends)
+  local m; m=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
+  [ -n "$m" ] && [ "$(status_of "$m")" != done ] && return 0   # a re-plan started: the task may change
+  [ -n "$(done_in_main "$1")" ] && return 0
+  [ -n "$(claim_owner "$(claim_key "$1")")" ] && return 0
+  [ -z "$(team_why_not "$1")" ]
+}
+team_prep_target() {  # the task this idle agent prepares, or nothing: open, unclaimed, not prepared, not too big for
+  # this agent, waiting only on tasks that are being built or could start now; the longest chain behind it first.
+  # None while planning runs (the plan may still change every task).
+  [ "${TEAM_PREP:-1}" = 1 ] || return 0
+  local m f id d df ok r best="" br=0 ranks
+  m=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
+  [ -n "$m" ] && [ "$(status_of "$m")" != done ] && return 0
+  ranks=$(team_ranks)
+  for f in tasks/[0-9]*.md; do
+    [ -f "$f" ] || continue
+    case $f in tasks/000-*|tasks/999-*) continue ;; esac
+    [ "$(status_of "$f")" = open ] || continue
+    id=$(task_id "$f")
+    [ -f "$(prep_file "$f")" ] && continue
+    [ "$(cat "$TEAM/prep-tries/$id" 2>/dev/null || echo 0)" -lt 2 ] || continue
+    grep -qxF -- "$f" <<<"${WAITING:-}" && continue
+    [ -z "$(claim_owner "$(claim_key "$f")")" ] && [ -z "$(prep_owner "$id")" ] && [ -z "$(done_in_main "$f")" ] || continue
+    team_workable "$f" && continue   # free for this agent: it is taken, not prepared
+    if [ -n "${TEAM_MAX_TOUCHES:-}" ] && [ "$(touches_of "$f" | grep -c .)" -gt "$TEAM_MAX_TOUCHES" ]; then continue; fi
+    ok=1
+    for d in $(unmet_deps "$f"); do
+      df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
+      [ -n "$df" ] && { [ -n "$(claim_owner "$(claim_key "$df")")" ] || [ -z "$(unmet_deps "$df")" ]; } && continue
+      ok=0; break
+    done
+    [ "$ok" = 1 ] || continue
+    r=$(rank_of "$id" "$ranks")
+    [ "$r" -gt "$br" ] && { best=$f; br=$r; }
+  done
+  echo "$best"
+}
+team_prep_prompt() {  # team_prep_prompt <task file> <iteration> : the whole prompt of a prep session
+  local f=$1 id pf d df w="" wip="" o a p t
+  id=$(task_id "$f"); pf=$(prep_file "$f")
+  for d in $(unmet_deps "$f"); do
+    df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
+    w+=" $d ($(sed -n 's/^# //p' "$df" 2>/dev/null | head -1 | cut -c1-80));"
+  done
+  [ -n "$w" ] || w=" no task, but another agent's task changes the same files;"
+  for o in "$TEAM"/claims/*/owner; do
+    [ -f "$o" ] || continue
+    read -r a p _ t < "$o"; { [ "$a" != "$AGENT_ID" ] && agent_alive "$a" && [ -f "$t" ]; } || continue
+    wip+=" agent $a builds $(task_id "$t") ($(sed -n 's/^# //p' "$t" | head -1 | cut -c1-80)) on branch agent/$a;"
+  done
+  printf '%s' "You are iteration $2 of an autonomous coding loop, in a PREP SESSION: there is nothing you can build right now, so you prepare the task that starts soon, $f. It waits for:$w work in progress:${wip:- none;} Write $pf so that the agent that takes $id can check your plan and start building at once, instead of researching from scratch. Read $f, the code and tests it will change, and what its dependencies will provide: their task files, and the work in progress on their branches, read only (\`git log main..agent/<id>\`, \`git diff main...agent/<id> -- <path>\`, \`git show agent/<id>:<path>\`). $pf holds: 1. Assumptions: what each dependency will provide (names, signatures, data shapes, files), each marked \"seen on its branch\" or \"inferred from its task file\". 2. Plan: the steps, mapped to the task's acceptance boxes, with the files and functions to change. 3. Tests: the end-to-end, integration or golden tests to add or change, with their cases. 4. Risks and open questions (the human is not asked during prep: questions go here). Code sketches are welcome inside the notes. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but $pf: the driver keeps only that file. Write it early and improve it as you go, committing each time (\`git add $pf && git commit -m \"prep $id: <what>\"\`): the session is ended as soon as the task can be built. Then stop."
+}
+team_prep_watch() {  # team_prep_watch <task file> : in the background during a prep session. Real work beats prep: once
+  # the task can be built, or any task is free for this agent, wrapup's driver signal tells the session to write its
+  # notes and end (it ends a few turns later at most)
+  local f=$1 t why
+  while sleep "${TEAM_PREP_POLL_S:-20}"; do
+    team_beat
+    if prep_ready "$f"; then why="task $(task_id "$f") can be built now (its dependencies are in main, or another agent took it)"
+    else t=$(next_task); [ -n "$t" ] || continue; why="task $(task_id "$t") is free for you to build"; fi
+    echo "$why" > .agent/wrapup-now
+    log "prep $(task_id "$f"): $why - the session is told to write its notes and end"; tev prep_cut "$f" "$why"
+    return 0
+  done
+}
+team_prep_finish() {  # team_prep_finish <task file> <commit before the session> : keep only the notes, publish them to
+  # main, free the lock. Everything else the session changed is put back.
+  local f=$1 h0=$2 id pf x p
+  id=$(task_id "$f"); pf=$(prep_file "$f")
+  commit_leftovers "uncommitted work after the prep session for $id"
+  x=$(git diff --name-only "$h0" HEAD | grep -vxF -- "$pf" || true)
+  [ -n "$x" ] && { log "prep $id: put back $(wc -w <<<"$x") other changed file(s): $(echo $x | cut -c1-150)"; tev prep_reverted "$f" "$(echo $x | cut -c1-200)"; }
+  # The branch becomes where the session started plus one commit with the notes: the session's own commits never
+  # reach main, not even in its history (the branch only goes into main with this agent's next accepted task).
+  if [ "$(git rev-parse HEAD)" != "$h0" ]; then
+    local keep=""; [ -s "$pf" ] && { keep=$(mktemp); cp "$pf" "$keep"; }
+    git reset -q --hard "$h0"
+    if [ -n "$keep" ]; then mkdir -p "$(dirname "$pf")"; mv "$keep" "$pf"; git add "$pf" && git commit -q -m "[driver] prep $id: notes by agent $AGENT_ID"; fi
+  fi
+  if [ ! -s "$pf" ]; then
+    mkdir -p "$TEAM/prep-tries"; echo $(( $(cat "$TEAM/prep-tries/$id" 2>/dev/null || echo 0) + 1 )) > "$TEAM/prep-tries/$id"
+    log "prep $id: no notes written"; tev prep_empty "$f"
+  else
+    exec 8> "$TEAM/merge.lock"; flock 8
+    if git -C "$TEAM_DIR" checkout "$BRANCH" -- "$pf" && { git -C "$TEAM_DIR" diff --cached --quiet -- "$pf" || git -C "$TEAM_DIR" commit -q -m "[driver] prep notes for $id by agent $AGENT_ID" -- "$pf"; }; then
+      tev prep_published "$f" "$(wc -c < "$pf") bytes"; log "team: prep notes for $id published to main ($pf)"
+    else
+      git -C "$TEAM_DIR" reset -q -- "$pf" 2>/dev/null; git -C "$TEAM_DIR" checkout -q main -- "$pf" 2>/dev/null || rm -f "${TEAM_DIR:?}/$pf"
+      tev prep_publish_failed "$f"; log "WARNING team: could not publish $pf to main"
+    fi
+    flock -u 8
+  fi
+  rm -rf "${TEAM:?}/prep/$id"; rm -f .agent/wrapup-now
+}
+team_prep_handoff() {  # team_prep_handoff <task file> : just claimed, but another agent is still preparing it. Its session
+  # has been told to end (its watch sees the claim): the notes come first, waited for at most TEAM_PREP_HANDOFF_S.
+  local id o t0 s got pf
+  id=$(task_id "$1"); o=$(prep_owner "$id"); pf=$(prep_file "$1")
+  if [ -n "$o" ] && [ "$o" != "$AGENT_ID" ]; then
+    t0=$(date +%s); log "team: agent $o is still preparing $id - waiting up to ${TEAM_PREP_HANDOFF_S:-300}s for its notes"
+    while [ -n "$(prep_owner "$id")" ] && [ $(( $(date +%s) - t0 )) -lt "${TEAM_PREP_HANDOFF_S:-300}" ]; do team_beat; sleep "${TEAM_PREP_HANDOFF_POLL_S:-5}"; done
+    s=$(( $(date +%s) - t0 )); team_sync || true
+    got="not yet - starting without them"; [ -f "$pf" ] && got=received
+    tev prep_handoff "$1" "${s}s, notes $got"; log "team: waited ${s}s for agent $o's prep notes on $id ($got)"
+  fi
+  # notes that reached main after this checkout's last sync (published between that sync and the claim)
+  if [ ! -f "$pf" ] && git cat-file -e "main:$pf" 2>/dev/null; then team_sync || true; fi
+  return 0
+}
+team_prep_note() {  # team_prep_note <task file> : the session prompt's pointer to the task's prep notes, if it has any
+  local pf; pf=$(prep_file "$1"); [ -f "$pf" ] || pf="tasks/prep/$(claim_key "$1").md"
+  [ -f "$pf" ] || return 0
+  if [ -z "$(handover_of "$1")" ]; then
+    printf '%s' " PREP NOTES: $pf was written for this task by an agent that had no work, before the task could start. Read it first: it saves you the research. Check each of its assumptions against what main has now (the dependencies' real code), fix the plan where they are wrong, then build. Say in your hand-over which assumptions were wrong."
+  else
+    printf '%s' " Prep notes for this task: $pf."
+  fi
+}
+
 # Planning a team project: tasks must say what they need and what they touch, so the scheduler can run them in parallel.
 TEAM_PLAN_CRITERIA='- [ ] Every task file besides 000 and 999 has a `Depends on:` line (the numbers of the tasks that must be finished first, or `none`) and a `Touches:` line (the files and directories the task will create or change)
 - [ ] The work is split into modules that two agents can build at the same time: tasks that could run at once touch different files, and PLAN.md shows the order as waves (all tasks of a wave can run at once, and most waves have two or more tasks)

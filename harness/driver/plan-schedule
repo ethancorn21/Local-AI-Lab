@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """plan-schedule [agents] < plan : would shared files slow this team plan down? Replays the scheduler.
+plan-schedule --ranks < plan : "<id> <rank>" per task, the scheduler's order (agent-team-lib, team_pick_order).
 
 stdin, one line per open task, written by agent-team-lib's team_plan_schedule with the driver's own deps_of,
 touches_of and overlap (so the replay can never disagree with the real scheduler about what "shares a file" means):
     <id> TAB <its Depends on ids> TAB <ids of the tasks it shares files with> TAB <its Touches paths>
-The scheduler gives each free agent the lowest-numbered task whose dependencies are finished and that shares no file
-with a running task. The replay counts rounds (one task per agent per round), with and without the shared-file rule:
+The scheduler gives each free agent the task with the longest chain of open tasks behind it (its rank; lowest number on
+a tie) whose dependencies are finished and that shares no file with a running task. (A slower agent takes the lowest
+rank first; the replay counts agents as equal.) The replay counts rounds (one task per agent per round), with and without the shared-file rule:
 a file many tasks share only costs time when it holds back tasks their dependencies would let run at once.
 (frontpage 2026-10-04: a per-file count, "more than 3 open tasks change one file", ignored the dependencies and
 rejected 16 plans in a row that the shared files did not slow at all: 8 rounds either way.)
@@ -36,13 +38,29 @@ def parse(lines):
     return tasks
 
 
+def ranks(tasks):
+    """{id: the longest chain of open tasks that waits on it, itself included}. A cycle is cut where it closes."""
+    kids = {t: [k for k in tasks if t in tasks[k]["deps"]] for t in tasks}
+    memo = {}
+
+    def rank(t, path):
+        if t in memo:
+            return memo[t]
+        r = 1 + max((rank(k, path | {t}) for k in kids[t] if k not in path and k != t), default=0)
+        memo[t] = r
+        return r
+    return {t: rank(t, frozenset()) for t in tasks}
+
+
 def replay(tasks, agents, shared_rule):
     """-> (rounds, never-started task ids, {(waiting task, task it waited for): rounds})"""
     done, rounds, held = set(), 0, {}
+    rk = ranks(tasks)
+    order = sorted(tasks, key=lambda t: (-rk[t], t))
     while len(done) < len(tasks):
         running, waited = [], set()
         for _ in range(agents):
-            for tid in sorted(tasks):
+            for tid in order:
                 if tid in done or tid in running or not tasks[tid]["deps"] <= done:
                     continue
                 blocker = next((r for r in running if r in tasks[tid]["shares"]), None)
@@ -66,6 +84,10 @@ def shared_paths(a, b):
 
 
 def main():
+    if "--ranks" in sys.argv[1:]:
+        for tid, r in sorted(ranks(parse(sys.stdin)).items()):
+            print(tid, r)
+        return 0
     agents = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() and int(sys.argv[1]) > 0 else 2
     tasks = parse(sys.stdin)
     if not tasks:

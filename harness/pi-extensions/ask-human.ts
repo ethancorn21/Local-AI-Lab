@@ -70,6 +70,11 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_id, params: any) {
+			// A prep session prepares a task nobody has started: its questions go into the notes (the driver's prompt says
+			// so; this makes it so - a request would ping the human and hold the task).
+			if (process.env.PI_LOOP_PREP) {
+				throw new Error("prep session: the human is not asked during prep - write the question into your prep notes");
+			}
 			const request = clean(String(params.request ?? "")).trim();
 			if (request.length < 40) {
 				throw new Error("request too short: say what you need, why it blocks you, what you tried, and how you will know it is done");
