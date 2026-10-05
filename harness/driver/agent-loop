@@ -685,7 +685,7 @@ run_session() {
 # A prep session (team mode, agent-team-lib "Prep"): notes for a task that starts soon. Its own prompt, no task step:
 # no test baseline, hand-over, verification, merge or session counts; only tasks/prep/<id>.md is kept and published.
 prep_iteration() {  # prep_iteration <task file>
-  local h0 t0 s0 t1 s1 wpid bytes
+  local h0 t0 s0 t1 s1 wpid bytes basis
   task=$1; n4=$(printf %04d "$i"); PREP_FILE=$(prep_file "$task")
   harness_stamp
   log "iteration $i: prep for $task (harness $HARNESS_ID)"
@@ -693,6 +693,7 @@ prep_iteration() {  # prep_iteration <task file>
   pitfalls_sync "before iteration $i"
   rm -f .agent/wrapup-now .agent/stalled
   h0=$(git rev-parse HEAD)
+  basis=$(team_prep_basis "$task")
   PROMPT=$(team_prep_prompt "$task" "$i")
   t0=$(date -Iseconds); s0=$(date +%s)
   team_prep_watch "$task" 9>&- & wpid=$!
@@ -701,7 +702,7 @@ prep_iteration() {  # prep_iteration <task file>
   t1=$(date -Iseconds); s1=$(date +%s)
   [ "$rc" -eq 124 ] && log "iteration $i (prep) hit the ${ITER_TIMEOUT}s timeout"
   rm -f .agent/stalled
-  team_prep_finish "$task" "$h0"
+  team_prep_finish "$task" "$h0" "$basis"
   bytes=$(stat -c %s "$PREP_FILE" 2>/dev/null || echo 0)
   archive_sync "after iteration $i"
   jq -n -c --argjson iter "$i" --arg task "$task" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \

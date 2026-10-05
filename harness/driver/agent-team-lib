@@ -432,11 +432,39 @@ prep_ready() {  # prep_ready <task file> : it can be built now, by this agent or
   [ -n "$(claim_owner "$(claim_key "$1")")" ] && return 0
   [ -z "$(team_why_not "$1")" ]
 }
-team_prep_target() {  # the task this idle agent prepares, or nothing: open, unclaimed, not prepared, not too big for
-  # this agent, waiting only on tasks that are being built or could start now; the longest chain behind it first.
+prep_layers() {  # prep_layers <task file> : how many unbuilt layers stand before it can start: 1 = it waits only on
+  # tasks being built or startable now; 2 = on a task that itself waits on such work; ... (0 = no unmet dependency)
+  local d df n m=0 seen=${2:-}
+  for d in $(unmet_deps "$1"); do
+    df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
+    if [ -z "$df" ] || [[ " $seen " == *" $d "* ]]; then n=99   # unknown task or a cycle: never prepared
+    elif [ -n "$(claim_owner "$(claim_key "$df")")" ] || [ -z "$(unmet_deps "$df")" ]; then n=1
+    else n=$(( $(prep_layers "$df" "$seen $d") + 1 )); fi
+    [ "$n" -gt "$m" ] && m=$n
+  done
+  echo "$m"
+}
+# What a prep reads, against what this agent can read. The build limit (TEAM_MAX_TOUCHES, a file count) is for building,
+# where reading, edits, test output and retries share the window; prep only reads, so it is limited by the size of the
+# existing files and folders the task touches (files still to be created cost nothing), against this agent's hand-over
+# limit less spawn reads and the notes (b: 75k - 25k = 50k tokens, ~200 KB). frontpage 2026-10-04: a 24-file task was
+# 184 KB (~47k tokens), its 9- to 11-file neighbours 43-112 KB. A prep that still runs long writes its notes at the
+# hand-over limit (wrapup), so the worst case is partial notes.
+prep_read_bytes() {  # prep_read_bytes <task file>
+  local p
+  for p in $(touches_of "$1"); do
+    [ -e "$p" ] && find "$p" -type f -not -path '*/.*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -printf '%s\n'
+  done | awk '{ s += $1 } END { print s + 0 }'
+}
+prep_budget_bytes() { echo $(( ( ${WRAPUP_SOFT_TOKENS:-120000} - ${TEAM_PREP_RESERVE_TOKENS:-25000} ) * 4 )); }
+team_prep_target() {  # the task this idle agent prepares, or nothing: open, unclaimed, not prepared, small enough to read
+  # in this agent's window (above); the nearest
+  # to starting first (fewest unbuilt layers before it), then the longest chain behind it. Deeper tasks are prepared
+  # too, once nothing nearer is left: their notes build on guesses, but an idle GPU builds nothing (frontpage
+  # 2026-10-04: after preparing 242, b sat idle with 231-238 waiting behind 242 and 239 under a one-layer rule).
   # None while planning runs (the plan may still change every task).
   [ "${TEAM_PREP:-1}" = 1 ] || return 0
-  local m f id d df ok r best="" br=0 ranks
+  local m f id l r best="" bl=999 br=0 ranks
   m=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
   [ -n "$m" ] && [ "$(status_of "$m")" != done ] && return 0
   ranks=$(team_ranks)
@@ -450,33 +478,32 @@ team_prep_target() {  # the task this idle agent prepares, or nothing: open, unc
     grep -qxF -- "$f" <<<"${WAITING:-}" && continue
     [ -z "$(claim_owner "$(claim_key "$f")")" ] && [ -z "$(prep_owner "$id")" ] && [ -z "$(done_in_main "$f")" ] || continue
     team_workable "$f" && continue   # free for this agent: it is taken, not prepared
-    if [ -n "${TEAM_MAX_TOUCHES:-}" ] && [ "$(touches_of "$f" | grep -c .)" -gt "$TEAM_MAX_TOUCHES" ]; then continue; fi
-    ok=1
-    for d in $(unmet_deps "$f"); do
-      df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
-      [ -n "$df" ] && { [ -n "$(claim_owner "$(claim_key "$df")")" ] || [ -z "$(unmet_deps "$df")" ]; } && continue
-      ok=0; break
-    done
-    [ "$ok" = 1 ] || continue
+    [ "$(prep_read_bytes "$f")" -le "$(prep_budget_bytes)" ] || continue
+    l=$(prep_layers "$f"); [ "$l" -lt 99 ] || continue
     r=$(rank_of "$id" "$ranks")
-    [ "$r" -gt "$br" ] && { best=$f; br=$r; }
+    if [ "$l" -lt "$bl" ] || { [ "$l" -eq "$bl" ] && [ "$r" -gt "$br" ]; }; then best=$f; bl=$l; br=$r; fi
   done
   echo "$best"
 }
+team_prep_basis() {  # team_prep_basis <task file> : one line, what the notes are built on (prompt and the notes' stamp)
+  local d df o l t out=""
+  l=$(prep_layers "$1")
+  for d in $(unmet_deps "$1"); do
+    df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1); t=$(sed -n 's/^# //p' "$df" 2>/dev/null | head -1 | cut -c1-70)
+    o=$(claim_owner "$(claim_key "${df:-x}")")
+    if [ -n "$o" ]; then out+=" $d ($t: being built by agent $o, branch agent/$o);"
+    elif [ -z "$(unmet_deps "${df:-x}")" ]; then out+=" $d ($t: not started, can start now);"
+    elif git cat-file -e "main:tasks/prep/$d.md" 2>/dev/null || [ -f "tasks/prep/$d.md" ]; then out+=" $d ($t: not started yet, prep notes tasks/prep/$d.md);"
+    else out+=" $d ($t: not started yet, no notes);"; fi
+  done
+  [ -n "$out" ] || out=" no task, but another agent's task changes the same files;"
+  printf '%s' "$l step(s) before it could start; built on:$out"
+}
 team_prep_prompt() {  # team_prep_prompt <task file> <iteration> : the whole prompt of a prep session
-  local f=$1 id pf d df w="" wip="" o a p t
-  id=$(task_id "$f"); pf=$(prep_file "$f")
-  for d in $(unmet_deps "$f"); do
-    df=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
-    w+=" $d ($(sed -n 's/^# //p' "$df" 2>/dev/null | head -1 | cut -c1-80));"
-  done
-  [ -n "$w" ] || w=" no task, but another agent's task changes the same files;"
-  for o in "$TEAM"/claims/*/owner; do
-    [ -f "$o" ] || continue
-    read -r a p _ t < "$o"; { [ "$a" != "$AGENT_ID" ] && agent_alive "$a" && [ -f "$t" ]; } || continue
-    wip+=" agent $a builds $(task_id "$t") ($(sed -n 's/^# //p' "$t" | head -1 | cut -c1-80)) on branch agent/$a;"
-  done
-  printf '%s' "You are iteration $2 of an autonomous coding loop, in a PREP SESSION: there is nothing you can build right now, so you prepare the task that starts soon, $f. It waits for:$w work in progress:${wip:- none;} Write $pf so that the agent that takes $id can check your plan and start building at once, instead of researching from scratch. Read $f, the code and tests it will change, and what its dependencies will provide: their task files, and the work in progress on their branches, read only (\`git log main..agent/<id>\`, \`git diff main...agent/<id> -- <path>\`, \`git show agent/<id>:<path>\`). $pf holds: 1. Assumptions: what each dependency will provide (names, signatures, data shapes, files), each marked \"seen on its branch\" or \"inferred from its task file\". 2. Plan: the steps, mapped to the task's acceptance boxes, with the files and functions to change. 3. Tests: the end-to-end, integration or golden tests to add or change, with their cases. 4. Risks and open questions (the human is not asked during prep: questions go here). Code sketches are welcome inside the notes. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but $pf: the driver keeps only that file. Write it early and improve it as you go, committing each time (\`git add $pf && git commit -m \"prep $id: <what>\"\`): the session is ended as soon as the task can be built. Then stop."
+  local f=$1 id pf l basis deep=""
+  id=$(task_id "$f"); pf=$(prep_file "$f"); basis=$(team_prep_basis "$f"); l=${basis%% *}
+  [ "$l" -ge 2 ] 2>/dev/null && deep=" This task is $l steps from starting: tasks it waits on are not built yet, so what they will provide is a guess. Work from their task files, their prep notes where they have them, and the work in progress they in turn wait on, and mark those assumptions \"inferred\". Plan at the level that will survive: behaviour, interfaces, tests; name files and lines only where they will not move (a task that splits or moves modules changes them)."
+  printf '%s' "You are iteration $2 of an autonomous coding loop, in a PREP SESSION: there is nothing you can build right now, so you prepare a task that starts later, $f. It is ${basis/; built on:/. It waits for:}$deep Write $pf so that the agent that takes $id can check your plan and start building at once, instead of researching from scratch. Read $f, the code and tests it will change, and what its dependencies will provide: their task files and prep notes, and work in progress on other agents' branches, read only (\`git log main..agent/<id>\`, \`git diff main...agent/<id> -- <path>\`, \`git show agent/<id>:<path>\`). $pf holds: 1. Assumptions: what each dependency will provide (names, signatures, data shapes, files), each marked \"seen on its branch\", \"seen in main\" or \"inferred\". 2. Plan: the steps, mapped to the task's acceptance boxes, with the files and functions to change. 3. Tests: the end-to-end, integration or golden tests to add or change, with their cases. 4. Risks and open questions (the human is not asked during prep: questions go here). Code sketches are welcome inside the notes. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but $pf: the driver keeps only that file. Write it early and improve it as you go, committing each time (\`git add $pf && git commit -m \"prep $id: <what>\"\`): the session is ended as soon as the task can be built or other work is free. Then stop."
 }
 team_prep_watch() {  # team_prep_watch <task file> : in the background during a prep session. Real work beats prep: once
   # the task can be built, or any task is free for this agent, wrapup's driver signal tells the session to write its
@@ -491,9 +518,9 @@ team_prep_watch() {  # team_prep_watch <task file> : in the background during a 
     return 0
   done
 }
-team_prep_finish() {  # team_prep_finish <task file> <commit before the session> : keep only the notes, publish them to
-  # main, free the lock. Everything else the session changed is put back.
-  local f=$1 h0=$2 id pf x p
+team_prep_finish() {  # team_prep_finish <task file> <commit before the session> [basis] : keep only the notes, stamped
+  # with what they were built on, publish them to main, free the lock. Everything else the session changed is put back.
+  local f=$1 h0=$2 basis=${3:-} id pf x p
   id=$(task_id "$f"); pf=$(prep_file "$f")
   commit_leftovers "uncommitted work after the prep session for $id"
   x=$(git diff --name-only "$h0" HEAD | grep -vxF -- "$pf" || true)
@@ -501,7 +528,11 @@ team_prep_finish() {  # team_prep_finish <task file> <commit before the session>
   # The branch becomes where the session started plus one commit with the notes: the session's own commits never
   # reach main, not even in its history (the branch only goes into main with this agent's next accepted task).
   if [ "$(git rev-parse HEAD)" != "$h0" ]; then
-    local keep=""; [ -s "$pf" ] && { keep=$(mktemp); cp "$pf" "$keep"; }
+    local keep=""
+    if [ -s "$pf" ]; then
+      keep=$(mktemp)
+      { [ -n "$basis" ] && printf '> Prep notes by agent %s, %s, written %s\n> Check every assumption against main before building on it.\n\n' "$AGENT_ID" "$(date '+%F %H:%M')" "$basis"; cat "$pf"; } > "$keep"
+    fi
     git reset -q --hard "$h0"
     if [ -n "$keep" ]; then mkdir -p "$(dirname "$pf")"; mv "$keep" "$pf"; git add "$pf" && git commit -q -m "[driver] prep $id: notes by agent $AGENT_ID"; fi
   fi

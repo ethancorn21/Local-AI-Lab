@@ -330,16 +330,26 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
   plan check's replay uses the same order. Before, every agent took the lowest number: on frontpage that would next
   have handed b the module split six tasks wait on (replayed: a idle 5 of 15 task lengths instead of 3 of 13).
 - **Prep while idle** (2026-10-04). An agent with nothing to take does not just wait: it prepares a task that starts
-  soon. Target: an open, unclaimed task not prepared yet and not too big for this agent, waiting only on tasks being
-  built or startable now; the longest chain behind it first. None while planning runs (the plan may change every
-  task). The session's prompt is its own: write `tasks/prep/<id>.md` (assumptions about what each dependency will
-  provide, each marked "seen on its branch" or "inferred", the plan per acceptance box, the tests, risks and open
-  questions), reading the dependencies' work in progress on their branches, read only. Enforced by the driver, not
-  asked: a prep lock per task (one writer); afterwards the branch is reset to where the session started plus one
-  commit with the notes (code, task files, memory files the session touched never reach main, not even in history);
-  the notes go into main at once; `ask_human` refuses during prep (a question would ping the human and hold the
-  task); prep sessions do not count as sessions of the task (split nudge, STALLED flag, hand-over rule) and do not
-  touch the no-progress counter. Two prep sessions without notes and a task is not prepared again.
+  later. Target: any open, unclaimed task not prepared yet, nearest to starting first (fewest unbuilt layers before
+  it: 1 = it waits only on work being built or startable now, 2 = on a task that itself waits on such work, ...),
+  then the longest chain behind it. Deeper tasks are prepared once nothing nearer is left: their notes build on
+  guesses, but an idle GPU builds nothing (first live day: after preparing 242, b sat idle with six small tasks
+  waiting two to six layers out). Size: prep only reads, so its limit is what it reads, not the build limit's file
+  count: the existing files and folders the task touches must fit the agent's hand-over limit less 25k tokens for
+  spawn reads and notes (b: ~200 KB; a 24-file module split measured 184 KB); a prep that still runs long writes its
+  notes at the hand-over limit. None while planning runs (the plan may change every task). The session's prompt is its
+  own: write `tasks/prep/<id>.md` (assumptions about what each dependency will provide, each marked "seen on its
+  branch", "seen in main" or "inferred", the plan per acceptance box, the tests, risks and open questions), reading
+  the dependencies' task files, their prep notes and work in progress on other agents' branches, read only; a task
+  two or more layers out is told it builds on guesses and to plan at the level that survives (behaviour, interfaces,
+  tests). Enforced by the driver, not asked: a prep lock per task (one writer); afterwards the branch is reset to
+  where the session started plus one commit with the notes, stamped with what they were built on ("written 2 step(s)
+  before it could start; built on: 230 (being built by agent a), 242 (not started yet, prep notes)"); code, task files
+  and memory files the session touched never reach main, not even in history; the notes go into main at once;
+  `ask_human` refuses during prep (a question would ping the human and hold the task); prep sessions do not count as
+  sessions of the task (split nudge, STALLED flag, hand-over rule) and do not touch the no-progress counter. Two prep
+  sessions without notes and a task is not prepared again. The notes belong to the task, not to the agent: whoever
+  takes the task gets them (the fast agent usually takes the critical path, the one who prepared it may not build it).
 - **Real work beats prep: the cut and the hand-off.** During a prep session the driver checks every 20 s: once the
   task can be built (its dependencies are in main, or another agent claimed it), or any task is free for this agent,
   it writes `.agent/wrapup-now`, and the wrapup extension steers the session the way it does at the context limit:

@@ -26,8 +26,9 @@ task 103-mid open 102 "src/m.py"
 task 104-end open 103 "src/e.py"
 task 105-side open none "src/s.py"                     # rank 2: 105 -> 106
 task 106-after-side open 105 "src/a.py"
-task 107-big open 102 "src/b1.py, src/b2.py, src/b3.py"   # too big for b (3 files > 2)
-echo base > src/x.py
+task 107-big open 102 "src/b1.py, src/b2.py, src/b3.py"   # too big for b to build (3 files > 2) and to read (25 KB)
+task 108-wide open 102 "src/x.py, src/y.py, src/z.py"     # too big for b to build (3 files), small to read: b prepares it
+echo base > src/x.py; echo y > src/y.py; echo z > src/z.py; head -c 25000 /dev/zero | tr '\0' x > src/b1.py
 git add -A && git commit -q -m init
 git worktree add -q "$P.a" -b agent/a && git worktree add -q "$P.b" -b agent/b
 mkdir -p "$P/.agent/team/claims" "$P/.agent/team/loops"
@@ -40,7 +41,7 @@ fns() {  # the definition of one function of agent-loop (one line or a block)
 }
 as() {  # as <agent> <commands> : in that agent's checkout, with its identity and the driver's helpers
   ( cd "$P.$1" && export TEAM_DIR=$P AGENT_ID=$1 HOME TEAM_SPEED; TEAM_SPEED=$([ "$1" = a ] && echo 4 || echo 1)
-    [ "$1" = b ] && export TEAM_MAX_TOUCHES=2
+    [ "$1" = b ] && export TEAM_MAX_TOUCHES=2 WRAPUP_SOFT_TOKENS=30000   # b reads at most (30000 - 25000) * 4 = 20 KB in prep
     eval "$(for f in status_of task_id handover_of pending_subtasks workable next_task commit_leftovers; do fns $f; done)"
     log() { echo "LOG $AGENT_ID $*" >> "$T/log"; }
     . "$D/agent-team-lib"; eval "$2" )
@@ -61,11 +62,20 @@ sed -i 's/^TEAM_SPEED=.*/TEAM_SPEED=1/' "$HOME/.agent-kit/agents/b.env"
 claim a 102 102-root.md; claim b 105 105-side.md
 [ "$(as b team_prep_target)" = tasks/103-mid.md ] && ok "prep target: 103 (waits only on 102, which a builds; longest chain)" || bad "target: $(as b team_prep_target)"
 mkdir -p "$P.b/tasks/prep"; echo notes > "$P.b/tasks/prep/103.md"
-t=$(as b team_prep_target); [ "$t" = tasks/106-after-side.md ] && ok "103 prepared: next 106 (104 skipped: 103 is neither being built nor startable)" || bad "after 103 prepared: $t"
+t=$(as b team_prep_target); [ "$t" = tasks/106-after-side.md ] && ok "103 prepared: nearest first, 106 (1 step) before 104 (2 steps)" || bad "after 103 prepared: $t"
 echo notes > "$P.b/tasks/prep/106.md"
-t=$(as b team_prep_target); [ -z "$t" ] && ok "b: 107 (3 files) is too big for it, nothing left" || bad "b too-big: $t"
+t=$(as b team_prep_target); [ "$t" = tasks/108-wide.md ] && ok "108: over b's build limit (3 files > 2) but small to read, so b prepares it" || bad "wide target: $t"
+echo notes > "$P.b/tasks/prep/108.md"
+t=$(as b team_prep_target); [ "$t" = tasks/104-end.md ] && ok "nothing nearer left: 104, two steps out (waits on 103, which waits on 102)" || bad "deeper target: $t"
+[ "$(as b 'prep_layers tasks/104-end.md')" = 2 ] && [ "$(as b 'prep_layers tasks/103-mid.md')" = 1 ] && ok "layers: 103 = 1, 104 = 2" || bad "layers: 103 $(as b 'prep_layers tasks/103-mid.md'), 104 $(as b 'prep_layers tasks/104-end.md')"
+basis=$(as b 'team_prep_basis tasks/104-end.md')
+[[ $basis == "2 step(s) before it could start; built on: 103 (103-mid: not started yet, prep notes tasks/prep/103.md);" ]] && ok "basis names the unbuilt dependency and its prep notes" || bad "basis: $basis"
+as b 'team_prep_prompt tasks/104-end.md 9' | grep -q 'This task is 2 steps from starting' && ok "deep prep prompt: says it builds on guesses, plan at the level that survives" || bad "no deep-prep wording"
+! as b 'team_prep_prompt tasks/103-mid.md 9' | grep -q 'steps from starting' && ok "one step out: no deep-prep wording" || bad "deep wording on a 1-step task"
+echo notes > "$P.b/tasks/prep/104.md"
+t=$(as b team_prep_target); [ -z "$t" ] && ok "b: 107 (25 KB to read, over its 20 KB prep budget) is left, nothing else" || bad "b too-big: $t"
 t=$(as a 'mkdir -p tasks/prep; echo n > tasks/prep/103.md; echo n > tasks/prep/106.md; team_prep_target; rm -rf tasks/prep')
-[ "$t" = tasks/107-big.md ] && ok "a (no size limit): 107 is its target" || bad "a target: $t"
+[ "$t" = tasks/107-big.md ] && ok "a (bigger window): 107 is its target" || bad "a target: $t"
 rm -rf "$P.b/tasks/prep"
 claim a 103 103-mid.md
 t=$(as b team_prep_target); [ "$t" = tasks/104-end.md ] && ok "a claims 103: 104 (waits only on work in progress) is b's target" || bad "with 103 claimed: $t"
@@ -73,7 +83,7 @@ unclaim 103
 sed -i '1s/.*/Status: open/' "$P/tasks/000-plan.md"
 [ -z "$(as b team_prep_target)" ] && ok "planning open in main: no prep (the plan may change every task)" || bad "prep during planning: $(as b team_prep_target)"
 sed -i '1s/.*/Status: done/' "$P/tasks/000-plan.md"
-grep -q . <<<"$(as b 'team_prep_prompt tasks/103-mid.md 7')" && as b 'team_prep_prompt tasks/103-mid.md 7' | grep -q 'agent a builds 102 (102-root) on branch agent/a' \
+grep -q . <<<"$(as b 'team_prep_prompt tasks/103-mid.md 7')" && as b 'team_prep_prompt tasks/103-mid.md 7' | grep -q '102 (102-root: being built by agent a, branch agent/a)' \
   && as b 'team_prep_prompt tasks/103-mid.md 7' | grep -q 'Write tasks/prep/103.md' && ok "prep prompt: names the notes file and the branch the dependency is built on" || bad "prompt: $(as b 'team_prep_prompt tasks/103-mid.md 7' | cut -c1-200)"
 
 # --- lock ---
@@ -91,12 +101,14 @@ mkdir -p tasks/prep; printf '# prep 103\nassumption: r.py exports root()\n' > ta
 echo changed > src/x.py; echo new > src/new.py; echo "agent edit" >> tasks/103-mid.md; echo "progress" > PROGRESS.md
 git add -A && git commit -q -m "prep 103: notes (and things it should not have)"
 echo "uncommitted" >> src/x.py
-as b "team_prep_finish tasks/103-mid.md $h0"
+as b "team_prep_finish tasks/103-mid.md $h0 '1 step(s) before it could start; built on: 102 (102-root: being built by agent a, branch agent/a);'"
 [ "$(git diff --name-only "$h0" HEAD)" = tasks/prep/103.md ] && ok "only tasks/prep/103.md changed on b's branch (code, task file, PROGRESS.md put back)" || bad "branch diff: $(git diff --name-only "$h0" HEAD | tr '\n' ' ')"
 [ "$(git rev-list --count "$h0..HEAD")" = 1 ] && [ "$(git log -1 --format=%s)" = "[driver] prep 103: notes by agent b" ] \
   && ok "the branch: one commit with the notes on top of the session start (the session's own commits are gone)" || bad "branch history: $(git log --oneline "$h0..HEAD" | tr '\n' '|')"
 [ "$(cat src/x.py)" = base ] && [ ! -e src/new.py ] && [ -z "$(git status --porcelain)" ] && ok "worktree clean, src/x.py back to base, src/new.py gone" || bad "worktree: $(git status --porcelain | tr '\n' ' ')"
 git -C "$P" cat-file -e main:tasks/prep/103.md 2>/dev/null && [ -z "$(git -C "$P" status --porcelain)" ] && ok "notes published to main, main clean" || bad "notes not in main"
+git -C "$P" show main:tasks/prep/103.md | head -1 | grep -q '^> Prep notes by agent b, .*, written 1 step(s) before it could start; built on: 102 (102-root: being built by agent a' \
+  && git -C "$P" show main:tasks/prep/103.md | grep -q '^# prep 103' && ok "notes stamped with what they were built on, the agent's text kept" || bad "stamp: $(git -C "$P" show main:tasks/prep/103.md | head -2 | tr '\n' '|')"
 ! git -C "$P" cat-file -e main:src/new.py 2>/dev/null && ok "no code went into main" || bad "code in main"
 [ ! -d "$P/.agent/team/prep/103" ] && [ "$(ev prep_published)" -ge 1 ] && ok "lock freed, prep_published logged" || bad "lock/event"
 as b 'prep_lock tasks/106-after-side.md'; h0=$(git rev-parse HEAD)
