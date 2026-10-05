@@ -241,7 +241,7 @@ The driver handles the routine failures itself and reports the rest:
 | A task runs 8 sessions without finishing | Flagged STALLED (and every 4 sessions after) |
 | Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
-| An agent needs something only a person can do | It files a request (`ask_human`); its task waits, the others continue, and the human gets an encrypted message on their phone |
+| An agent needs something only a person can do | It files a request (`ask_human`); its task waits, the others continue (a team agent with nothing else to build prepares upcoming tasks meanwhile), and the human gets one encrypted message on their phone, with a reminder every 6 hours |
 
 A watcher reads the team's event log and alerts on conflicts, deadlocks, stale claims, an agent held up 20+ minutes by
 a dependency, and loops that died. The human hears about exceptions, requests and finished work; routine progress

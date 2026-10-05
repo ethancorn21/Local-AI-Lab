@@ -8,6 +8,7 @@
 #   - the cut: once the task can be built (or other work is free) the session is signalled to end
 #   - the hand-off: an agent that claims a task being prepared waits for the notes, and gets them
 #   - the planning task is not taken again from a checkout that is only behind main (the slower pick widened that race)
+#   - the doorbell rings once per set of open requests (a team agent comes back to that wait after every prep session)
 # Real git repo and worktrees; agents a and b are this shell's functions run with different AGENT_IDs. Run on the VM.
 set -u
 D=${1:-$(cd "$(dirname "$0")/../../harness/driver" && pwd)}
@@ -42,7 +43,7 @@ fns() {  # the definition of one function of agent-loop (one line or a block)
 as() {  # as <agent> <commands> : in that agent's checkout, with its identity and the driver's helpers
   ( cd "$P.$1" && export TEAM_DIR=$P AGENT_ID=$1 HOME TEAM_SPEED; TEAM_SPEED=$([ "$1" = a ] && echo 4 || echo 1)
     [ "$1" = b ] && export TEAM_MAX_TOUCHES=2 WRAPUP_SOFT_TOKENS=30000   # b reads at most (30000 - 25000) * 4 = 20 KB in prep
-    eval "$(for f in status_of task_id handover_of pending_subtasks workable next_task commit_leftovers; do fns $f; done)"
+    eval "$(for f in status_of task_id handover_of pending_subtasks workable next_task commit_leftovers ask_field asks_with inbox_pending wait_for_human; do fns $f; done)"
     log() { echo "LOG $AGENT_ID $*" >> "$T/log"; }
     . "$D/agent-team-lib"; eval "$2" )
 }
@@ -127,7 +128,7 @@ as b 'prep_lock tasks/104-end.md'; mkdir -p "$P.b/.agent"; rm -f "$P.b/.agent/wr
 sleep 3; [ ! -f "$P.b/.agent/wrapup-now" ] && ok "no signal while 104 waits on 103" || bad "signalled too early: $(cat "$P.b/.agent/wrapup-now")"
 sed -i '1s/.*/Status: done/' "$P/tasks/102-root.md" "$P/tasks/103-mid.md"; git -C "$P" commit -qam "102, 103 done"; unclaim 102
 for _ in $(seq 1 8); do [ -f "$P.b/.agent/wrapup-now" ] && break; sleep 1; done
-grep -q 'task 104 can be built now' "$P.b/.agent/wrapup-now" 2>/dev/null && ok "dependencies in main: the prep session is signalled to end" || bad "no signal: $(cat "$P.b/.agent/wrapup-now" 2>/dev/null)"
+grep -qE 'task 104 (can be built now|is free for you to build)' "$P.b/.agent/wrapup-now" 2>/dev/null && ok "dependencies in main: the prep session is signalled to end" || bad "no signal: $(cat "$P.b/.agent/wrapup-now" 2>/dev/null)"
 wait $w 2>/dev/null; rm -f "$P.b/.agent/wrapup-now"; rm -rf "$P/.agent/team/prep/104"
 # other work free for this agent ends prep too (real work beats prep)
 sed -i '1s/.*/Status: open/' "$P/tasks/102-root.md" "$P/tasks/103-mid.md"; git -C "$P" commit -qam "reopen"; claim a 102 102-root.md
@@ -170,4 +171,16 @@ as b 'claim_task tasks/000-plan.md' && [ "$(head -1 "$P.b/tasks/000-plan.md")" =
 rm -rf "$P/.agent/team/claims/000"
 as b 'claim_task tasks/000-plan.md' && ok "a re-plan reopened in an up-to-date checkout is taken" || bad "re-plan refused (up to date)"
 rm -rf "$P/.agent/team/claims/000"
+
+# --- the doorbell: once per set of open requests, not on every return to the wait ---
+mkdir -p "$P.a/.agent/asks" "$T/bin"; printf 'status: open\nblocking: yes\ntask: tasks/101-leaf.md\n' > "$P.a/.agent/asks/001.md"
+printf '#!/bin/sh\necho rang >> %s/rings\necho rang\n' "$T" > "$T/bin/ring-doorbell"; chmod +x "$T/bin/ring-doorbell"
+wfh() { touch "$P.a/.agent/PAUSE"; as a "PATH=$T/bin:\$PATH ASK_REMIND_HOURS=6 WAITING=; wait_for_human" > /dev/null; rm -f "$P.a/.agent/PAUSE"; }
+wfh; wfh
+[ "$(wc -l < "$T/rings")" = 1 ] && ok "back to the wait for the same request: the doorbell rang once" || bad "rings for one request: $(wc -l < "$T/rings")"
+printf 'status: open\nblocking: yes\ntask: tasks/105-side.md\n' > "$P.a/.agent/asks/002.md"; wfh
+[ "$(wc -l < "$T/rings")" = 2 ] && ok "a new request: it rings again" || bad "rings after a new request: $(wc -l < "$T/rings")"
+echo "001.md 002.md" > /dev/null; sed -i '2s/.*/0/' "$P.a/.agent/asks-rung"; wfh
+[ "$(wc -l < "$T/rings")" = 3 ] && ok "after ASK_REMIND_HOURS: a reminder" || bad "no reminder: $(wc -l < "$T/rings")"
+rm -rf "$P.a/.agent/asks" "$P.a/.agent/asks-rung"
 exit $fail

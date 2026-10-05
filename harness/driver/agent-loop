@@ -389,9 +389,15 @@ answered_first() {
 }
 # Nothing to work on while requests are open: wait for a new answer, or a message when a task could take it.
 wait_for_human() {
-  local t0 last now a0
+  local t0 last now a0 key rung
   a0=$(asks_with answered)
-  log "nothing to work on until the human answers: open request(s) $(echo $(asks_with open)) - waiting (agent-talk to answer); $(ring-doorbell)"
+  # The doorbell rings once per set of open requests, then every ASK_REMIND_HOURS: a team agent comes back to this wait
+  # after every prep session and would otherwise ring each time.
+  key=$(echo $(asks_with open)); rung="doorbell already rang for these"
+  if [ "$(sed -n 1p .agent/asks-rung 2>/dev/null)" != "$key" ] || [ $(( $(date +%s) - $(sed -n 2p .agent/asks-rung 2>/dev/null || echo 0) )) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
+    rung=$(ring-doorbell); printf '%s\n%s\n' "$key" "$(date +%s)" > .agent/asks-rung
+  fi
+  log "nothing to work on until the human answers: open request(s) $key - waiting (agent-talk to answer); $rung"
   t0=$(date +%s); last=$t0
   while [ "$(asks_with answered)" = "$a0" ] && [ -n "$(asks_with open)" ] && ! { [ -n "$WAITING" ] && inbox_pending; }; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
@@ -760,9 +766,11 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     # takes freed work within a minute (frontpage 2026-10-03: a stale non-blocking request held agent a here while
     # the task it needed was being handed to it).
     if [ -n "$(asks_with open)" ]; then
-      if [ -n "${TEAM_DIR:-}" ] && [ -n "$(others_tasks)" ]; then
+      # a team agent prepares upcoming work before it waits for the human (2026-10-05: agent a sat in this wait on a
+      # request about 230 while b only prepared, held no task, and a had prep work it could do)
+      if [ -n "${TEAM_DIR:-}" ]; then
         task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
-        team_wait; continue
+        if [ -n "$(others_tasks)" ]; then team_wait; continue; fi
       fi
       wait_for_human; continue
     fi
