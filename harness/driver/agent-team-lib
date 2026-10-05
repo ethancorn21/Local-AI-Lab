@@ -17,6 +17,13 @@
 TEAM=${TEAM_DIR:-}/.agent/team
 BRANCH=agent/${AGENT_ID:-}
 [ -n "${TEAM_DIR:-}" ] && mkdir -p "$TEAM/claims" "$TEAM/loops"   # (agent-team init loads this only for the plan text)
+# Timing tests run alone across the checkouts (pylib/agent_testlock.py): every pytest of this loop, its sessions
+# included, loads the plugin; a run with a *perf* test file locks tests.lock exclusively, any other run shared.
+if [ -n "${TEAM_DIR:-}" ] && [ -f "$HOME/.agent-kit/pylib/agent_testlock.py" ] && [[ ,${PYTEST_PLUGINS:-}, != *,agent_testlock,* ]]; then
+  export AGENT_TEST_LOCK=$TEAM/tests.lock
+  export PYTHONPATH=$HOME/.agent-kit/pylib${PYTHONPATH:+:$PYTHONPATH}
+  export PYTEST_PLUGINS=agent_testlock${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}
+fi
 
 tev() {  # tev <event> [task] [detail] : one line in the team's event log
   jq -n -c --arg t "$(date -Iseconds)" --arg a "$AGENT_ID" --arg e "$1" --arg task "${2:-}" --arg d "${3:-}" \

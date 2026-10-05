@@ -306,6 +306,14 @@ The driver reads it whenever it starts there, so `agent-start <name>.b` or a tel
 - **Open requests in a team:** an agent with an open request waits for the human only when no other agent holds work;
   otherwise it waits the team way and takes freed work within a minute. A task's open requests are withdrawn when the
   task is accepted (answering one would reopen the finished task).
+- **Timing tests run alone (2026-10-05):** the checkouts share one VM, so a timing test (frontpage's 0.5 s page
+  budget) measured while another checkout ran its suite failed for reasons outside the code (task 230 blocked, request
+  003). Team mode loads `pylib/agent_testlock.py` (installed in `~/.agent-kit/pylib/`) into every pytest run of the
+  agents and their drivers (`PYTEST_PLUGINS` + `PYTHONPATH`, so any interpreter and any way of starting pytest). After
+  collection, a run that includes a test file with `perf` in its name (`AGENT_TEST_LOCK_EXCLUSIVE`) takes the team's
+  `tests.lock` exclusively and every other run takes it shared: ordinary runs still overlap, a timing run waits for
+  them and they wait for it. Waiting is printed in the test output and gives up after 600 s (`AGENT_TEST_LOCK_WAIT`;
+  the driver's suite timeout is 900 s), running anyway with a warning.
 - **Planning makes this possible:** in a team project the planning task (000) also requires `Depends on:` and
   `Touches:` on every task, a plan in waves of tasks that can run at once, tests that never bind a fixed port (two
   checkouts run their tests at the same time), and no hotspot files that slow the team: `plan-schedule` replays the
