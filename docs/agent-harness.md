@@ -6,21 +6,26 @@ This note is the reference for starting a new Claude Code chat about the agent: 
 
 ## What changed since the first build
 
-- GPU: RTX 4080 SUPER replaced by an RTX 3090 Ti 24 GB (a second 3090 Ti and an RTX 5060 Ti 16 GB are coming).
+- GPU: RTX 4080 SUPER replaced by an RTX 3090 Ti 24 GB; an RTX 5060 Ti 16 GB runs a second agent since 2026-10-02, and a
+  used RTX 3090 for a third is on the way.
 - Model server: llama.cpp replaced by vLLM (the HyperQwen build), about 100 tok/s instead of ~42, 150k context.
 - Harness: many additions to the Pi-based loop (below). The biggest change in approach: the harness is designed around how the agent actually behaves, measured from its session logs, instead of instructions that try to make it behave.
+- Team mode (2026-10-02): several agents build one project at once, one per GPU, each on its own git branch, with
+  critical-path scheduling and prep sessions for idle agents (2026-10-04). A plain-language walk through all of it:
+  [How the harness works](how-it-works.md).
 
 ## Architecture
 
 | Part | What it is | Notes |
 |---|---|---|
-| AI box | i9-14900KF, RTX 3090 Ti 24 GB, Ubuntu, headless | CPU power-limited to 125 W (RAPL PL1/PL2), GPU capped at 350 W, both applied at boot before the model server starts. Temperature log every 15 s with an automatic safety stop of the model server on sustained overheating. |
+| AI box | i9-14900KF, RTX 3090 Ti 24 GB + RTX 5060 Ti 16 GB, Ubuntu, headless | CPU power-limited to 125 W (RAPL PL1/PL2), GPU capped at 350 W, both applied at boot before the model server starts. Temperature log every 15 s with an automatic safety stop of the model server on sustained overheating. |
 | Model | Qwen3.8-27B, 4-bit (W4A16 AutoRound) | Hybrid: most layers are linear attention (DeltaNet), 16 are full attention, so context memory grows slowly. 4-bit costs about 1.3% perplexity against 8-bit. |
 | Model server | vLLM with the HyperQwen patches, in Docker, bound to localhost only | MTP speculative decoding (3 draft tokens, 69% accepted, about 3.1 tokens per step), prefix caching (94% of prompt tokens served from cache), vision enabled, 150k context, 200k tokens of context memory (KV cache) in total. |
 | Harness VM | Ubuntu VM in an untrusted, isolated VLAN | Reaches the model servers only through SSH tunnels (one per model port) whose key can forward only the listed ports. The agent's own machine: it may install packages and research the web. |
 | Agent harness | Pi coding agent 0.87.1 | Extensions add the hand-over, the status footer, the thinking budget and the web tools. Thinking effort: xhigh (fixed, see decisions). |
-| Loop driver | `agent-loop`, plain bash, no model | Picks tasks, launches one fresh Pi session per step, verifies done claims, archives the journal, records every session in a ledger. |
-| Viewer | Pi's own terminal UI in a tmux window | Context use, speed (from the model server's metrics), iteration, task, elapsed time in the footer. |
+| Second model server | llama.cpp on the RTX 5060 Ti | The same model (IQ4_XS), 114k context, ~28 tok/s: the second agent of team mode. |
+| Loop driver | `agent-loop` (one per agent) and `agent-team-lib`, plain bash, no model | Picks tasks, launches one fresh Pi session per step, verifies done claims, merges verified work into `main`, schedules the team, archives the journal, records every session in a ledger. |
+| Viewer | `agent-watch` (headless loops) | A Claude Code-style live view of a session: transcript, activity row, context use, speed, sprint progress; typing messages the agent. |
 
 ## Design principles
 
