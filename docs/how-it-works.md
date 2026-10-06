@@ -2,9 +2,10 @@
 
 A plain-language guide to the lab's coding-agent harness: what the pieces are, what happens from a one-page goal to
 finished software, how several agents share one project, and which decisions are fixed rules and which are left to
-the agent. It is written to be read top to bottom by someone new to the project. The detailed reference (every rule
-with the incident that caused it, measurements, experiments) is [agent-harness.md](agent-harness.md); the hardware and
-model serving are in [ai-lab.md](ai-lab.md). Terms in **bold** are explained in the [glossary](#glossary) at the end.
+the agent. It is written to be read top to bottom by someone new to the project. The precise rules, each with its
+reason, are in [agent-harness.md](agent-harness.md); what was measured is in [experiments.md](experiments.md); the
+hardware and model serving are in [ai-lab.md](ai-lab.md). Terms in **bold** are explained in the
+[glossary](#glossary) at the end.
 
 ## The short version
 
@@ -52,6 +53,11 @@ Why a script and not a model in the middle: a model that has lost track of what 
 notice. A bash `if` on a test exit code cannot be talked into "basically passing". Every rule that mattered was first
 tried as an instruction in the agents' prompt; the session logs showed the agents ignoring the prose ones, so they were
 moved into code, where they held (see design principle 1 in [agent-harness.md](agent-harness.md#design-principles)).
+
+Why a cloud model designs but does not build: design, good task breakdowns and the harness rules decide whether a long
+project goes well, and a frontier model is much better at those. But it is rate-limited and not free. The typing,
+testing and debugging, which is most of the work, is done by the local model around the clock for the cost of
+electricity.
 
 ## A project from start to finish
 
@@ -245,9 +251,9 @@ The driver handles the routine failures itself and reports the rest:
 | A task runs 8 sessions without finishing | Flagged STALLED (and every 4 sessions after) |
 | Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
-| An agent needs something only a person can do | It files a request (`ask_human`); its task waits, the others continue (a team agent with nothing else to build prepares upcoming tasks meanwhile), and the human gets one encrypted message on their phone, with a reminder every 6 hours. Hardware, credentials, money, accounts or anything outside the VM (`human_only`) wait for the human however long it takes |
-| A loop starts on a GPU another project's loop is using | One project per GPU: the other loop is paused (it finishes its current session, then stops) and the new one starts after it. The newest start wins; agents of one team share their GPUs |
-| The human does not answer a request in time | Every other request must name the option the agent would pick. Once the loop has had nothing else to build for 2 hours (`ASK_AUTO_MIN`), it answers the request itself: go ahead with that recommendation. The human gets a notice and can still override it; the override reaches the agent as a message |
+| An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets an encrypted message on their phone |
+| Nobody answers for 2 hours and there is nothing else to build | The agent goes ahead with its recommendation; the human is told and can still override. Things only a person can do (hardware, credentials, money, accounts) keep waiting |
+| A loop starts on a GPU another project is using | The other project's loop finishes its current session and stops; the newest start wins |
 
 A watcher reads the team's event log and alerts on conflicts, deadlocks, stale claims, an agent held up 20+ minutes by
 a dependency, and loops that died. The human hears about exceptions, requests and finished work; routine progress
@@ -293,10 +299,11 @@ dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 t
 
 ## Where to read more
 
-- [architecture.md](architecture.md): why the work is split between architect, script and agents.
-- [agent-harness.md](agent-harness.md): every rule with the incident behind it, measurements, experiments,
-  decisions (including what was decided against), commands.
+- [agent-harness.md](agent-harness.md): every rule with its reason, the harness's tests, decisions (including what
+  was decided against), commands.
+- [experiments.md](experiments.md): what was measured and what it decided.
 - [ai-lab.md](ai-lab.md): hardware, model serving, network and security, changelog.
+- [history/](history/): the first build, team mode's first run, the detailed changelog.
 - Code: [harness/driver/](../harness/driver/) (driver), [harness/pi-extensions/](../harness/pi-extensions/) (agent-side
   extensions), [harness/template/AGENTS.md](../harness/template/AGENTS.md) (the rules every agent reads),
   [analysis/tests/](../analysis/tests/) (stub-agent tests for the driver).
