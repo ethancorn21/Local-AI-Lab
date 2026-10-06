@@ -60,6 +60,7 @@ RAM, a lot on a 32 GB box. Swift ran at about 104 tok/s on the same vLLM. No Hyp
 | Swift 1.5, vLLM, bare `</think>` | 8 | 5/6 | 3/8 | 315k | 5 | 50 min |
 | 27B, vLLM, bare `</think>` (production today) | 4 | 1/6 | 3/8 | 333k | 7 | ~56 min (est.) |
 | **27B, vLLM, wrap-up ending** | **10** | **4/6** | **6/8** | **237k** | **0** | **~40 min (est.)** |
+| 27B, vLLM, wrap-up, 32k thinking cap (production since 2026-10-05) | 10 | 5/6 | 5/8 | 437k | 0 | 102 min, shared with an agent (not solo) |
 
 Per task (A = algorithmic, P = practical; task names withheld with the set):
 
@@ -69,6 +70,7 @@ Per task (A = algorithmic, P = practical; task names withheld with the set):
 | Swift, bare | P | P | P | . | P | P | . | . | . | P | P | . | . | P |
 | 27B, bare | P | . | . | . | . | . | . | . | P | P | P | . | . | . |
 | 27B, wrap-up | P | . | P | P | . | P | . | P | P | P | . | P | P | P |
+| 27B, wrap-up, 32k | P | P | P | P | . | P | . | . | P | P | P | . | P | P |
 
 ### LiveCodeBench v6 and probes
 
@@ -106,6 +108,13 @@ unaffected. Tested on both servers with a 200-token budget: the thinking ends wi
 clean code block. With the clean ending in place, the cap went from 16k to 32k thinking tokens (the human: ending
 the thinking that early cripples the model), and Pi's per-response `maxTokens` from 32k to 49k so the answer keeps
 room after a full budget. In the agent loop the 16k cap fired in about 9% of sessions.
+
+**32k cap, measured (2026-10-06):** the same held-out set with the production settings (32k thinking cap, wrap-up
+ending, 49k per answer) passed 10 of 14, the same total as with the 16k cap (5/6 algorithmic instead of 4/6, 5/8
+practical instead of 6/8: different tasks flipped both ways, within the noise of one attempt each), for 437k output
+tokens instead of 237k. 12 of the 14 answers thought until the 32k cap, and the wrap-up ending closed every one
+cleanly (no answer at the length limit). On this set the larger cap bought no extra passes for 1.8x the tokens; the
+human's reason for it (an early end cripples the model on long agent sessions) is not what this set measures.
 
 ## Reading
 
