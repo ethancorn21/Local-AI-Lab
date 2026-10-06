@@ -25,6 +25,13 @@ by the same driver, Pi and extensions; only Pi's default model differs (own conf
   AB_SCHEDULE=KIT/schedule-moe.json run.py go probes | status
 For the MoE arm, vllm.csv holds the arm's own server (llama.cpp metrics, same columns) and vllm-3090.csv the
 production server's activity, for the record. The auto-responder's classifier stays on the production model.
+
+Strata arm (2026-10-05): "strata" = Qwen3.8-Flash-Next (125B MoE, 6B active) IQ2_XS on the Strata engine, on the
+RTX 3090 Ti in place of vLLM (same port, so the same tunnel), thinking xhigh (its template's levels match the 27B's).
+vLLM is down for these runs, so the classifier moves to the same 27B on the RTX 5060 Ti (llama.cpp, port 8082):
+  run.py plan-strata  -> KIT/schedule-strata.json (ids s001-s024, same task order)
+  AB_CLASSIFIER_URL=http://127.0.0.1:8082 AB_SCHEDULE=KIT/schedule-strata.json run.py go probes | status
+vllm.csv then holds Strata's /metrics (JSON: live state, totals) in the same columns.
 """
 import json
 import os
@@ -44,13 +51,16 @@ FAKEBIN = f"{AB}/fakebin"
 LAUNCH = os.environ.get("AB_LAUNCH", f"{AB}/ab-launch")   # override only for plumbing tests
 VLLM = "http://127.0.0.1:8080"
 MOE = "http://127.0.0.1:8082"
+STRATA = os.environ.get("AB_STRATA_URL", VLLM)            # Strata takes vLLM's port while it runs
+CLASSIFIER = os.environ.get("AB_CLASSIFIER_URL", VLLM)    # the auto-responder's classifier (27B, thinking off)
 SCHEDULE = os.environ.get("AB_SCHEDULE", f"{KIT}/schedule.json")
 PROBES = {"p_contra": "fwtop", "p_missing": "anon", "p_ambig": "daily", "p_wrongref": "sshtools", "c_sums": "sumcheck",
           "c_failcount": "failcount"}
 EFFORTS = ["xhigh", "medium"]
 ARMS = {"xhigh": {"thinking": "xhigh", "server": VLLM, "launch": LAUNCH},
         "medium": {"thinking": "medium", "server": VLLM, "launch": LAUNCH},
-        "moe": {"thinking": "xhigh", "server": MOE, "launch": f"{AB}/ab-launch-moe"}}
+        "moe": {"thinking": "xhigh", "server": MOE, "launch": f"{AB}/ab-launch-moe"},
+        "strata": {"thinking": "xhigh", "server": STRATA, "launch": f"{AB}/ab-launch-strata"}}
 PROBE_REPS, PROJECT_REPS = 4, 3
 LIMITS = {"probe": {"max_iters": 6, "goal_checks": 0, "hard_hours": 1.5},
           "project": {"max_iters": 80, "goal_checks": 3, "hard_hours": 12}}
@@ -83,6 +93,14 @@ def metrics(server=VLLM):
         body = urllib.request.urlopen(f"{server}/metrics", timeout=10).read().decode()
     except OSError:
         return None
+    if body.lstrip().startswith("{"):   # Strata: JSON, one request at a time
+        try:
+            j = json.loads(body)
+        except ValueError:
+            return None
+        live, tot = j.get("live") or {}, j.get("totals") or {}
+        return {"running": float(live.get("state") in ("reading", "generating")), "waiting": float(live.get("queued") or 0),
+                "gen_tokens": float(tot.get("output_tokens") or 0), "prompt_tokens": float(tot.get("prompt_tokens") or 0)}
     val = lambda name: sum(float(m) for m in re.findall(rf"^{name}(?:{{[^}}]*}})? ([0-9.e+]+)$", body, re.M))
     if server != VLLM:   # llama.cpp server (--metrics)
         return {"running": val("llamacpp:requests_processing"), "waiting": val("llamacpp:requests_deferred"),
@@ -123,7 +141,7 @@ def classify(request, flaws):
     body = {"model": "qwen3.8-27b", "messages": [{"role": "user", "content": prompt}], "temperature": 0,
             "max_tokens": 60, "chat_template_kwargs": {"enable_thinking": False}}
     try:
-        req = urllib.request.Request(f"{VLLM}/v1/chat/completions", data=json.dumps(body).encode(),
+        req = urllib.request.Request(f"{CLASSIFIER}/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         text = json.loads(urllib.request.urlopen(req, timeout=120).read())["choices"][0]["message"]["content"]
         ids = json.loads(re.search(r"\{.*\}", text, re.S).group(0)).get("ids", [])
@@ -152,17 +170,17 @@ def plan():
     print(f"{len(sched)} runs: {sum(r['kind'] == 'probe' for r in sched)} probe, {sum(r['kind'] == 'project' for r in sched)} project")
 
 
-def plan_moe():
-    """The MoE arm's probe runs, in the A/B's task order (same seed and shuffle), one run per probe and rep."""
+def plan_arm(arm, prefix):
+    """A model arm's probe runs, in the A/B's task order (same seed and shuffle), one run per probe and rep."""
     rng = random.Random(20260930)
     sched = []
     for rep in range(1, PROBE_REPS + 1):
         names = list(PROBES)
         rng.shuffle(names)
         for name in names:
-            sched.append({"id": f"m{len(sched) + 1:03d}", "phase": "probes", "kind": "probe", "name": name, "effort": "moe", "rep": rep})
-    json.dump(sched, open(f"{KIT}/schedule-moe.json", "w"), indent=1)
-    print(f"{len(sched)} MoE probe runs -> {KIT}/schedule-moe.json")
+            sched.append({"id": f"{prefix}{len(sched) + 1:03d}", "phase": "probes", "kind": "probe", "name": name, "effort": arm, "rep": rep})
+    json.dump(sched, open(f"{KIT}/schedule-{arm}.json", "w"), indent=1)
+    print(f"{len(sched)} {arm} probe runs -> {KIT}/schedule-{arm}.json")
 
 
 def ensure_fakes():
@@ -181,6 +199,18 @@ def ensure_fakes():
     put(f"{AB}/ab-launch-moe", f"#!/bin/bash -l\n# ab-launch-moe EFFORT MAX_ITERS GOAL_CHECKS DIR : as ab-launch, but Pi's default model is the MoE\n"
         f"# (config dir {d}) and the driver's server health check points at the MoE server.\n"
         f"export PATH={FAKEBIN}:$PATH RING_DOORBELL={FAKEBIN}/ring-doorbell LLM_URL={MOE} PI_CODING_AGENT_DIR={d}\n"
+        "export THINKING=\"$1\" MAX_ITERS=\"$2\" GOAL_CHECKS=\"$3\"\ncd \"$4\" && exec agent-loop \"$4\"\n", "755")
+    # Strata arm: its own models.json (production's plus a "strata" provider: same compat and window, text only),
+    # the rest symlinked as for the MoE arm.
+    d = f"{AB}/pi-strata-agent"
+    prov = (f'.providers.strata = (.providers.llamacpp | .baseUrl = "{STRATA}/v1" | .models = [(.models[0] | '
+            '.id = "qwen3.8-flash-next" | .name = "Qwen3.8-Flash-Next IQ2_XS (aibox RTX 3090 Ti, Strata)" | .input = ["text"])])')
+    sh(f"mkdir -p {d} && for f in auth.json extensions bin; do ln -sfn {prod}/$f {d}/$f; done && "
+       f"jq {shlex.quote(prov)} {prod}/models.json > {d}/models.json && "
+       f"jq '.defaultProvider=\"strata\" | .defaultModel=\"qwen3.8-flash-next\"' {prod}/settings.json > {d}/settings.json", agent=True)
+    put(f"{AB}/ab-launch-strata", f"#!/bin/bash -l\n# ab-launch-strata EFFORT MAX_ITERS GOAL_CHECKS DIR : as ab-launch, but Pi's default model is\n"
+        f"# Qwen3.8-Flash-Next on Strata (config dir {d}).\n"
+        f"export PATH={FAKEBIN}:$PATH RING_DOORBELL={FAKEBIN}/ring-doorbell LLM_URL={STRATA} PI_CODING_AGENT_DIR={d}\n"
         "export THINKING=\"$1\" MAX_ITERS=\"$2\" GOAL_CHECKS=\"$3\"\ncd \"$4\" && exec agent-loop \"$4\"\n", "755")
 
 
@@ -360,7 +390,9 @@ if __name__ == "__main__":
     if cmd == "plan":
         plan()
     elif cmd == "plan-moe":
-        plan_moe()
+        plan_arm("moe", "m")
+    elif cmd == "plan-strata":
+        plan_arm("strata", "s")
     elif cmd == "go":
         go(sys.argv[2] if len(sys.argv) > 2 else "all")
     elif cmd == "regrade":   # re-run the hidden check on finished runs (after a check fix); keeps the old grade as grade.v1.json
