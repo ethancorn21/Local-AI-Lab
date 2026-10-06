@@ -1,6 +1,6 @@
 # Model choice, October 2026: Qwen3.8-27B vs Qwen3.8-Flash-Next vs Swift 1.5
 
-Status (2026-10-05): tests finished; recommendation below, decision with the human. In short: on a fair footing
+Status (2026-10-05): tests finished; decided: keep the 27B. Deployed: the wrap-up ending on both servers and a 32k thinking cap (below). In short: on a fair footing
 the production 27B is at least as good as both alternatives, and the biggest finding is not about the model at all.
 Production vLLM ends a capped thinking block with a bare `</think>`, after which the 27B keeps reasoning in its
 answer until it runs out of tokens. Ending it with a short wrap-up sentence instead took the same model from 4 to 10
@@ -98,9 +98,14 @@ it closes the stream (vLLM aborts the request) and continues on `/v1/completions
 `/v1/chat/completions/render`), the thinking and the wrap-up sentence, mostly from the prefix cache. With that
 ending the 27B passed 10 of 14 instead of 4, with 30% fewer tokens and no answer at the 32k limit.
 
-**Production fix (not deployed yet):** vLLM's `--reasoning-config` takes a `reasoning_end_str`, the string forced
-at the budget, which may include a transition phrase before the end tag. Setting it to the wrap-up sentence plus
-`</think>` changes only answers that hit the cap; a model that ends its own thinking is unaffected.
+**Production fix (deployed 2026-10-05):** vLLM's `--reasoning-config` takes a `reasoning_end_str`, the string
+forced at the budget, which may include a transition phrase before the end tag; it is now the wrap-up sentence plus
+`</think>` (`server/vllm-hyperqwen/env.example`). llama.cpp on the 5060 Ti gets the same sentence from
+`--reasoning-budget-message`. Both change only answers that hit the cap; a model that ends its own thinking is
+unaffected. Tested on both servers with a 200-token budget: the thinking ends with the sentence, the answer is a
+clean code block. With the clean ending in place, the cap went from 16k to 32k thinking tokens (the human: ending
+the thinking that early cripples the model), and Pi's per-response `maxTokens` from 32k to 49k so the answer keeps
+room after a full budget. In the agent loop the 16k cap fired in about 9% of sessions.
 
 ## Reading
 
@@ -116,10 +121,11 @@ at the budget, which may include a transition phrase before the end tag. Setting
   cap on 12 of 14 tasks, like the base model, and used about as many tokens. Running it also needs a hand-repacked
   checkpoint (below) and gives up the fast variant.
 
-## Recommendation
+## Decision
 
-Keep the 27B and give production vLLM the wrap-up ending. Revisit Flash-Next if prefill latency becomes the
-bottleneck or the box gets more RAM; revisit Swift only with a wrap-up rerun on the 3090 Ti.
+Keep the 27B, with the wrap-up ending and a 32k thinking cap. Flash-Next and Swift are set aside, and their files
+deleted, until the engine matures (Strata squeezing more out of the model) or the next Qwen generation; Flash-Next
+would be worth another look if prefill latency becomes the bottleneck or the box gets more RAM.
 
 ## Swift on HyperQwen: the checkpoint repack
 
