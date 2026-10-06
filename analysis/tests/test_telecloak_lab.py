@@ -174,10 +174,10 @@ def test_replay_reflection_stranger_plaintext_and_stale_rejected(relay):
     before = len(relay.fake.sent)
     relay.fake.from_user(relay.human.seal({"kind": "command", "command": "status"}).parts[0], uid=STRANGER)
     assert relay.run("fetch")[1].count("{") == 0 and len(relay.fake.sent) == before
-    # unencrypted text from the human: not acted on, human told
+    # unencrypted text from the human, no plain request waiting: not acted on, human told in plain text (phone)
     relay.fake.from_user("/stop hollowdeep")
     assert relay.run("fetch")[1].count("{") == 0
-    assert "not encrypted" in relay.read_sent()["text"]
+    assert relay.fake.sent[-1].startswith("The lab ignored a message from you: not encrypted, and no plain requests")
     # a day-old message (e.g. held back and delivered late)
     relay.fake.from_user(relay.human.seal({"kind": "command", "command": "status"}, now=time.time() - 90000).parts[0])
     assert relay.run("fetch")[1].count("{") == 0
@@ -336,12 +336,12 @@ def test_plain_reply_rejected_unless_to_a_plain_message_from_the_human_and_fresh
     send(relay, {"kind": "ask", "project": "p1", "ask": "004", "text": "plain request", "plain": True})
     plain_id = len(relay.fake.sent)
     relay.fake.from_user("answer to a sealed one", reply_to=sealed_id)          # a confidential project's message
-    relay.fake.from_user("no reply at all")                                      # not a reply
     relay.fake.from_user("from a stranger", uid=STRANGER, reply_to=plain_id)    # not the human
     relay.fake.from_user("in a group", chat_type="group", reply_to=plain_id)
     relay.fake.from_user("held back", reply_to=plain_id, date=time.time() - 90000)
+    relay.fake.from_user("held back, no reply", date=time.time() - 90000)
     assert fetched(relay) == []
-    assert "not a reply to a plain message" in relay.read_sent()["text"]       # the human is told (sealed)
+    assert relay.fake.sent[-1].startswith("The lab ignored a message from you: that is a reply to a message the lab")
 
 
 def test_plain_reply_replayed_is_taken_once(relay):
@@ -395,3 +395,34 @@ def test_pull_replies_plain_for_plain_projects(vm, tmp_path, monkeypatch):
     (p / ".agent" / "confidential").touch()
     pull.reply("p1", "Answer delivered")
     assert [b.get("plain") for b in bodies] == [True, None, None]
+
+
+def test_plain_new_message_answers_the_only_waiting_request(relay):
+    send(relay, {"kind": "ask", "project": "p1", "ask": "004", "text": "which db?", "plain": True})
+    assert "just send your answer" in relay.fake.sent[-1]
+    relay.fake.from_user("sqlite")                                           # typed into the chat, not a reply
+    (m,) = fetched(relay)
+    assert (m["kind"], m["project"], m["ask"], m["text"]) == ("answer", "p1", "004", "sqlite")
+    relay.run(f"ack {m['id']}")
+    relay.fake.from_user("and another thing")                                # 004 is answered: nothing waits
+    assert fetched(relay) == []
+    assert relay.fake.sent[-1].startswith("The lab ignored a message from you: not encrypted, and no plain requests")
+
+
+def test_plain_new_message_with_two_waiting_is_refused_and_names_them(relay):
+    send(relay, {"kind": "ask", "project": "p1", "ask": "001", "text": "a?", "plain": True})
+    send(relay, {"kind": "ask", "project": "p2", "ask": "002", "text": "b?", "plain": True})
+    p2_msg = len(relay.fake.sent)
+    relay.fake.from_user("yes")
+    assert fetched(relay) == []
+    assert "2 plain requests are waiting (p1 request 001, p2 request 002): reply to the one you mean" in relay.fake.sent[-1]
+    relay.fake.from_user("yes", reply_to=p2_msg)
+    assert [(m["project"], m["ask"]) for m in fetched(relay)] == [("p2", "002")]
+
+
+def test_answer_confirmed_by_the_lab_stops_the_request_waiting(relay):
+    send(relay, {"kind": "ask", "project": "p1", "ask": "001", "text": "a?", "plain": True})
+    send(relay, {"kind": "ask", "project": "p1", "ask": "002", "text": "b?", "plain": True})
+    send(relay, {"kind": "reply", "project": "p1", "text": "Answer delivered", "answered": ["001"], "plain": True})
+    relay.fake.from_user("go with b")                                        # only 002 still waits
+    assert [(m["project"], m["ask"]) for m in fetched(relay)] == [("p1", "002")]

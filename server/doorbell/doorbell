@@ -17,9 +17,12 @@ Telegram sees only ciphertext ("tc1....", see telecloak_core.py).
   human-to-bot key (so the key alone is not enough, and neither is the Telegram account alone), is at most a day old,
   was not seen before (replays), and is a well-formed answer, message or command.
 - Plain projects (the human's choice, 2026-10-06: encryption only for projects marked confidential): their messages
-  leave as readable text, and the human may answer one by replying to it in Telegram, without the app. Such a reply is
-  accepted only from the human's account, only as a reply to a plain message this relay sent (plain-sent.json: message
-  id -> project and request), and only as an answer to that request or a message to that project, never a command.
+  leave as readable text, and the human may answer one in Telegram, without the app: by replying to it, or with a new
+  message when exactly one plain request is waiting (2026-10-06: the first plain answer was typed into the chat, not
+  sent as a reply, and was refused). Such a message is accepted only from the human's account, only for a plain
+  message this relay sent (plain-sent.json: message id -> project, request, answered), and only as an answer to that
+  request or a message to that project, never a command. Notices about refused plain messages go out plain too (the
+  human reads them on the phone, where there is no app).
   So a hijacked Telegram account can reach plain projects' agents, but cannot start or stop loops or reach a
   confidential project.
 - Anything rejected is logged (syslog, tag doorbell) without its content; the human is told once per fetch.
@@ -182,10 +185,27 @@ def plain_text(body):
     """A plain message as the human reads it in Telegram."""
     p, text = body.get("project", ""), body["text"]
     if body["kind"] == "ask":
-        return f"{p}, request {body.get('ask', '?')}:\n{text}\n\n(Reply to this message to answer it.)"
+        return (f"{p}, request {body.get('ask', '?')}:\n{text}\n\n(Answer by replying to this message; if it is the "
+                f"only request waiting, just send your answer.)")
     if body["kind"] == "ring" and body.get("asks"):
         return f"{p}: waiting for your answer to request {', '.join(body['asks'])}. Reply to this message to tell it something."
-    return f"{p}: {text}"
+    return f"{p}: {text}" if p else text
+
+
+def plain_update(change):
+    """Read-modify-write plain-sent.json under its own lock (deliver and fetch both change it)."""
+    with Lock("plain"):
+        now = time.time()
+        known = {k: v for k, v in load("plain-sent.json", {}).items() if now - v.get("t", 0) < PLAIN_KEEP}
+        change(known, now)
+        save("plain-sent.json", known)
+        return known
+
+
+def mark_answered(known, project, asks):
+    for v in known.values():
+        if v.get("project") == project and v.get("ask") in asks:
+            v["answered"] = True
 
 
 def deliver(token, chat, body):
@@ -216,12 +236,15 @@ def deliver(token, chat, body):
         save("sent.json", sent + [now])
         if body["kind"] == "ring":
             save("rings.json", (rings + [now])[-200:])
-        if plain:                         # what a reply to each part answers
-            known = {k: v for k, v in load("plain-sent.json", {}).items() if now - v.get("t", 0) < PLAIN_KEEP}
-            for i in ids:
-                known[str(i)] = {"project": body["project"], "ask": body.get("ask") if body["kind"] == "ask" else None,
-                                 "t": now}
-            save("plain-sent.json", known)
+        if plain and "project" in body:   # what a reply to each part answers
+
+            def add(known, t):
+                for i in ids:
+                    known[str(i)] = {"project": body["project"], "t": t,
+                                     "ask": body.get("ask") if body["kind"] == "ask" else None}
+            plain_update(add)
+    if body.get("answered") and "project" in body:   # the lab confirmed answers: those requests no longer wait
+        plain_update(lambda known, t: mark_answered(known, body["project"], body["answered"]))
     log(f"sent kind={body['kind']} parts={len(parts)}"
         f"{' (plain)' if plain else '' if ch else ' (no key: fixed ping, unencrypted)'}")
     return "rang" if body["kind"] == "ring" else f"sent ({len(parts)} part{'s' if len(parts) > 1 else ''})"
@@ -273,14 +296,27 @@ def plain_inbound(m, known):
     """A plain reply from the human to one of this relay's plain messages: the answer to its request, or a message to its
     project. Returns (body, msg_id, ts), or raises Refused."""
     to = (m.get("reply_to_message") or {}).get("message_id")
-    entry = known.get(str(to)) if isinstance(to, int) else None
-    if entry is None:
-        raise Refused("not encrypted, and not a reply to a plain message from a project")
+    if isinstance(to, int):
+        entry = known.get(str(to))
+        if entry is None:
+            raise Refused("that is a reply to a message the lab cannot answer that way (an encrypted or an older one); "
+                          "reply to the plain request itself")
+    else:                                 # a new message: the answer to the one plain request waiting, if only one is
+        waiting = {(v["project"], v["ask"]): v for v in known.values() if v.get("ask") and not v.get("answered")}
+        if len(waiting) != 1:
+            which = ", ".join(f"{p} request {a}" for p, a in sorted(waiting))
+            raise Refused(f"not encrypted, and {len(waiting) or 'no'} plain requests are waiting"
+                          + (f" ({which}): reply to the one you mean (swipe left on it)" if waiting else ""))
+        entry = next(iter(waiting.values()))
     body = {"kind": "answer" if entry.get("ask") else "message", "project": entry["project"], "text": m.get("text", "")}
     if entry.get("ask"):
         body["ask"] = entry["ask"]
     msg_id = hashlib.sha256(f"tg:{m.get('chat', {}).get('id')}:{m.get('message_id')}:{m.get('date')}".encode()).hexdigest()[:16]
     return inbound(body), msg_id, m.get("date", 0)
+
+
+def is_plain_text(m):
+    return not is_wire(m.get("text", ""))
 
 
 def cmd_fetch(token, chat):
@@ -297,7 +333,7 @@ def cmd_fetch(token, chat):
             updates, error = [], str(e)
         seen = Seen(st["seen"], keep=2 * MAX_AGE)
         parts = Reassembler(st["parts"])
-        known = load("plain-sent.json", {})
+        known = plain_update(lambda known, t: None)
         for u in updates:
             st["offset"] = max(st["offset"], u["update_id"] + 1)
             m = u.get("message") or {}
@@ -323,8 +359,10 @@ def cmd_fetch(token, chat):
                     raise Refused("already received (replay)")
             except (Refused, TelecloakError) as e:
                 log(f"rejected update {u['update_id']}: {e}")
-                notice = notice or str(e)
+                notice = notice or (str(e), is_plain_text(m))
                 continue
+            if body["kind"] == "answer" and not is_wire(text):   # a plain answer: that request no longer waits
+                known = plain_update(lambda k, t: mark_answered(k, body["project"], [body["ask"]]))
             body.update(id=msg_id, ts=ts)
             save(f"inbound/{msg_id}", body)
             log(f"accepted {msg_id} kind={body['kind']}{' (plain)' if not is_wire(text) else ''}")
@@ -334,10 +372,10 @@ def cmd_fetch(token, chat):
             if MSG_ID.fullmatch(f):
                 print(json.dumps(load(f"inbound/{f}", {})))
     if notice:
-        try:
-            deliver(token, chat, {"kind": "info", "text": f"The lab ignored a message from you: {notice}. It acts "
-                                                          "only on messages sent with telecloak, or on replies to a "
-                                                          "plain message from a project."})
+        why, plain = notice
+        try:   # a refused plain message is told in plain text: the human sent it from the phone, where there is no app
+            deliver(token, chat, {"kind": "info", "plain": plain, "text": f"The lab ignored a message from you: {why}. "
+                                  "It acts only on messages sent with telecloak, or on answers to a plain request."})
         except Refused:
             pass
     if error:

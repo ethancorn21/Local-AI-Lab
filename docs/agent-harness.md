@@ -128,10 +128,12 @@ only). The AI box encrypts it (AES-256-GCM, one key per direction) and sends it,
 Replies count only if they come from the human's own account, decrypt, are under a day old and are not replays.
 Without a key, only a fixed "help, I need your attention" ping can leave. Rate limit: 20 messages an hour, 100 a day.
 
-**Plain projects.** A project not marked confidential sends readable text, and a plain reply counts only if it is a
-reply to one of the relay's own plain messages (it remembers which project and request each one was), from the
-human's account, in the private chat, under a day old and not seen before. It becomes the answer to that request, or a
-message to that project; never a command (start, stop, status stay encrypted-only), and never anything for a
+**Plain projects.** A project not marked confidential sends readable text. A plain message from the human counts if it
+is a reply to one of the relay's own plain messages (it remembers which project and request each one was), or a new
+message while exactly one plain request is waiting; from the human's account, in the private chat, under a day old and
+not seen before. (The first plain answer, 2026-10-06, was typed into the chat rather than sent as a reply, and was
+refused with a notice the phone could not read: notices about plain messages are plain now.) It becomes the answer to
+that request, or a message to that project; never a command (start, stop, status stay encrypted-only), and never anything for a
 confidential project. The trade-off, accepted: someone holding the human's Telegram session can talk to plain
 projects' agents.
 
