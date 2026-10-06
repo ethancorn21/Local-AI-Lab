@@ -60,7 +60,9 @@ RAM, a lot on a 32 GB box. Swift ran at about 104 tok/s on the same vLLM. No Hyp
 | Swift 1.5, vLLM, bare `</think>` | 8 | 5/6 | 3/8 | 315k | 5 | 50 min |
 | 27B, vLLM, bare `</think>` (production today) | 4 | 1/6 | 3/8 | 333k | 7 | ~56 min (est.) |
 | **27B, vLLM, wrap-up ending** | **10** | **4/6** | **6/8** | **237k** | **0** | **~40 min (est.)** |
-| 27B, vLLM, wrap-up, 32k thinking cap (production since 2026-10-05) | 10 | 5/6 | 5/8 | 437k | 0 | 102 min, shared with an agent (not solo) |
+| 27B, vLLM, wrap-up, 32k thinking cap (production 2026-10-05 to 10-06) | 10 | 5/6 | 5/8 | 437k | 0 | 102 min, shared with an agent (not solo) |
+| 27B, vLLM, server-side wrap-up, 16k cap (production again since 2026-10-06) | 11 | 5/6 | 6/8 | 231k | 0 | 37 min, shared with an agent |
+| 27B, vLLM, server-side wrap-up, 8k cap | 6 | 3/6 | 3/8 | 144k | 0 | 25 min, shared with an agent |
 
 Per task (A = algorithmic, P = practical; task names withheld with the set):
 
@@ -71,6 +73,8 @@ Per task (A = algorithmic, P = practical; task names withheld with the set):
 | 27B, bare | P | . | . | . | . | . | . | . | P | P | P | . | . | . |
 | 27B, wrap-up | P | . | P | P | . | P | . | P | P | P | . | P | P | P |
 | 27B, wrap-up, 32k | P | P | P | P | . | P | . | . | P | P | P | . | P | P |
+| 27B, wrap-up, 16k (server) | P | P | P | P | . | P | . | P | P | P | P | . | P | P |
+| 27B, wrap-up, 8k (server) | P | . | P | . | . | P | . | . | . | P | P | . | P | . |
 
 ### LiveCodeBench v6 and probes
 
@@ -116,7 +120,14 @@ tokens instead of 237k. 12 of the 14 answers thought until the 32k cap, and the 
 cleanly (no answer at the length limit). On this set the larger cap bought no extra passes for 1.8x the tokens; the
 human's reason for it (an early end cripples the model on long agent sessions) is not what this set measures.
 Decided 2026-10-06: back to 16k on both servers (Pi `thinking-budget.ts` 16384, `maxTokens` 32768, llama.cpp
-`--reasoning-budget 16384`), wrap-up sentence kept; 8k against 16k measured next, both with the server-side ending.
+`--reasoning-budget 16384`), wrap-up sentence kept.
+
+**8k against 16k (2026-10-06),** both with the production ending (per-request `thinking_token_budget`, the server's
+wrap-up sentence), 16k of answer room after the cap, same seeds, run back to back: 16k passed 11 of 14 (231k
+tokens), 8k passed 6 (144k). Five tasks lost is beyond the one-attempt noise seen so far (two or three tasks
+flipping between runs at the same total); six of 8k's eight failures were runtime errors or wrong answers in code
+written after a cut-short plan. The model uses whatever it is given on hard tasks: 13 of 14 answers reached the 8k
+cap, 12 of 14 the 16k cap, 12 of 14 the 32k cap. Across the three caps: 8k 6, 16k 10-11, 32k 10. 16k stays.
 
 ## Reading
 
