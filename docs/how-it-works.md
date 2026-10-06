@@ -260,6 +260,12 @@ So a fast agent with nothing to build **takes the task over**:
   commits changed too stay put. The fast agent applies that work to its branch, and its first session's prompt says
   so: read the hand-over, check the work, continue from it. The slow agent's branch gets those files back as `main` has
   them, so half-done work never reaches `main` with its next task.
+- **Answers follow the task.** A request to the human is filed in the asking agent's own checkout, and only that
+  agent's loop reads the answer. So when a request about a task is answered after the task moved (or just before), the
+  old holder forwards the request and the answer to the new owner's inbox; its running session gets them after its
+  current step. (The first live takeover, 2026-10-06: the human answered agent b's request about 253 at 18:41; the
+  answer lifted the "waiting for the human" block, a took 253 over at 18:42, and the answer stayed in b's checkout until
+  it was relayed by hand.)
 
 Under these rules that afternoon would have gone: a asks for 253 at 14:37; b's session, on 253 at the time, is told to
 hand over; a few minutes later a builds 253 from b's checked plan instead of waiting until 15:24. (Not measured yet:

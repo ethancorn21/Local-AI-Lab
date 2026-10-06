@@ -111,6 +111,14 @@ git -C "$P.a" log -1 --format=%s | grep -q '^\[driver\] 253 taken over from agen
 n=$(as a 'team_takeover_note tasks/253-flow.md'); n2=$(as a 'team_takeover_note tasks/253-flow.md')
 [[ $n == " TAKEN OVER: agent b, on a slower card, was building this task;"* ]] && [ -z "$n2" ] && ok "a's first prompt says it was taken over, once" || bad "note: '$n' / '$n2'"
 as a team_takeover_ask; [ ! -d "$P/.agent/team/takeover/253" ] && ok "a's request for 253 is done once it holds 253" || bad "stale request"
+# the human answers b's request about 253 after (or just before) the takeover: the answer goes to a (frontpage 18:41)
+printf '# Request 005\nstatus: answered\nblocking: yes\ntask: tasks/253-flow.md\n\n## Request\nA or B?\n\n## Answer (now, telegram)\nB, as recommended\n' > "$P.b/.agent/asks/005.md"
+as b team_takeover_sync
+f=$(ls "$P.a/.agent/inbox/"*.md 2>/dev/null | head -1)
+[ -n "$f" ] && grep -q '^B, as recommended$' "$f" && grep -q 'agent b filed about task 253' "$f" && grep -qx 'status: closed' "$P.b/.agent/asks/005.md" \
+  && grep -qx 'status: open' "$P.b/.agent/asks/001.md" && [ "$(ev takeover_answer_forwarded)" = 1 ] \
+  && ok "b's answered request about 253 goes to a's inbox and is closed in b's checkout; b's own open one stays" || bad "answer not forwarded: $(ls "$P.a/.agent/inbox" 2>&1)"
+as b team_takeover_sync; [ "$(ls "$P.a/.agent/inbox/"*.md | wc -l)" = 1 ] && ok "forwarded once" || bad "forwarded twice"
 
 # --- during a session on that task: hand over ---
 cd "$P"; task 280-crit open none "src/c280.py"; task 281-after open 280 "src/c281.py"; git add -A && git commit -q -m "280, 281"

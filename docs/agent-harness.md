@@ -168,7 +168,9 @@ its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`), with its s
   agent has nothing to build, the faster agent asks for it before it prepares anything. The holder's loop gives the
   claim at once if the task is parked, or tells the session working on it to hand over (`.agent/handover-now`) and
   gives it after. Only that task's work moves with it (`team-takeover paths`: its commits by subject and ledger); the
-  new owner's first prompt says it was taken over.
+  new owner's first prompt says it was taken over. Requests to the human live in the asking agent's checkout, so an
+  answered request about a task another agent now holds is forwarded to that agent's inbox (the first live takeover,
+  2026-10-06 18:42, was unlocked by the human's answer and left that answer behind).
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
   small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
   holds other claims (a full reset once cost it a parked task's work).

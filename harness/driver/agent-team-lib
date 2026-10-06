@@ -596,11 +596,30 @@ team_takeover_receive() {  # the work of a claim given to this agent, onto its b
   done
   return 0
 }
-team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; }   # before every pick
+team_forward_answers() {  # answered requests about a task another agent now holds: to that agent's inbox, closed here
+  # (frontpage 2026-10-06: the human answered b's request 001 about 253 at 18:41, a took 253 over at 18:42, and the
+  # answer stayed in b's checkout, where no session would ever read it)
+  local q t k o f w ms
+  for q in .agent/asks/[0-9]*.md; do
+    [ -f "$q" ] && grep -qx 'status: answered' "$q" || continue
+    t=$(sed -n 's/^task: //p' "$q" | head -1); [ -n "$t" ] || continue
+    k=$(claim_key "$t"); o=$(claim_owner "$k"); [ -n "$o" ] && [ "$o" != "$AGENT_ID" ] || continue
+    read -r _ _ _ f <<<"$(owner_line "$k")"; w=${f%/tasks/*}; [ -d "$w" ] || continue
+    mkdir -p "$w/.agent/inbox"; ms=$(( $(date +%s%N) / 1000000 ))
+    { printf 'The human answered a request that agent %s filed about task %s before the task was given to you. The request and the answer:\n\n' "$AGENT_ID" "$(task_id "$t")"; cat "$q"; } > "$w/.agent/inbox/.$ms.tmp" \
+      && mv "$w/.agent/inbox/.$ms.tmp" "$w/.agent/inbox/$ms.md" || continue
+    sed -i 's/^status: answered$/status: closed/' "$q"
+    printf '\n## Forwarded (%s, by the driver)\nTask %s is agent %s'"'"'s now: this answer went to its inbox.\n' "$(date '+%F %H:%M')" "$(task_id "$t")" "$o" >> "$q"
+    tev takeover_answer_forwarded "$t" "$(basename "$q") to agent $o"; log "team: $(basename "$q") answered for $(task_id "$t"), which agent $o holds now - forwarded to its inbox"
+  done
+  return 0
+}
+team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; team_forward_answers; }   # before every pick
 TAKEOVER_CUT=""
 team_takeover_poll() {  # team_takeover_poll [task file of the running session] : during a session, every TEAM_TAKEOVER_POLL_S
   local cur="" d k a
   [ -n "${1:-}" ] && cur=$(claim_key "$1")
+  team_forward_answers   # .agent/asks is not in git: safe during a session
   for d in "$TEAM"/takeover/*/; do
     [ -f "$d/asker" ] || continue; k=$(basename "$d")
     [ "$(claim_owner "$k")" = "$AGENT_ID" ] || continue
