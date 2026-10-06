@@ -58,7 +58,7 @@ Related notes:
 | Context | 150k per request; 200k tokens of KV cache in total (1.34 full-size requests at once) |
 | Prefix caching | On: 94% of prompt tokens are served from cache in agent sessions |
 | Vision | On (up to 8 images per request); the agent can look at screenshots |
-| Thinking | Effort xhigh (a sentence in the chat template); per-turn thinking budget 32k (set by the harness; 16k until 2026-10-05), 49k per response; at the budget both servers end the thinking with a wrap-up sentence, not a bare `</think>` ([model-choice.md](model-choice.md)) |
+| Thinking | Effort xhigh (a sentence in the chat template); per-turn thinking budget 16k (set by the harness; 32k from 2026-10-05 to 10-06, dropped again: same held-out score for 1.8x the tokens), 32k per response; at the budget both servers end the thinking with a wrap-up sentence, not a bare `</think>` ([model-choice.md](model-choice.md)) |
 | Quality | Perplexity +1.27% versus an 8-bit reference on the lab's own code corpus |
 
 The llama.cpp service is kept, disabled, as a fallback.

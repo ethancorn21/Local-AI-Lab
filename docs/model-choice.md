@@ -115,6 +115,8 @@ practical instead of 6/8: different tasks flipped both ways, within the noise of
 tokens instead of 237k. 12 of the 14 answers thought until the 32k cap, and the wrap-up ending closed every one
 cleanly (no answer at the length limit). On this set the larger cap bought no extra passes for 1.8x the tokens; the
 human's reason for it (an early end cripples the model on long agent sessions) is not what this set measures.
+Decided 2026-10-06: back to 16k on both servers (Pi `thinking-budget.ts` 16384, `maxTokens` 32768, llama.cpp
+`--reasoning-budget 16384`), wrap-up sentence kept; 8k against 16k measured next, both with the server-side ending.
 
 ## Reading
 
