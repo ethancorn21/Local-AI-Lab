@@ -246,6 +246,7 @@ The driver handles the routine failures itself and reports the rest:
 | Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
 | An agent needs something only a person can do | It files a request (`ask_human`); its task waits, the others continue (a team agent with nothing else to build prepares upcoming tasks meanwhile), and the human gets one encrypted message on their phone, with a reminder every 6 hours. Hardware, credentials, money, accounts or anything outside the VM (`human_only`) wait for the human however long it takes |
+| A loop starts on a GPU another project's loop is using | One project per GPU: the other loop is paused (it finishes its current session, then stops) and the new one starts after it. The newest start wins; agents of one team share their GPUs |
 | The human does not answer a request in time | Every other request must name the option the agent would pick. Once the loop has had nothing else to build for 2 hours (`ASK_AUTO_MIN`), it answers the request itself: go ahead with that recommendation. The human gets a notice and can still override it; the override reaches the agent as a message |
 
 A watcher reads the team's event log and alerts on conflicts, deadlocks, stale claims, an agent held up 20+ minutes by

@@ -65,6 +65,45 @@ flock -n 9 || { echo "another agent-loop is running on $P" >&2; exit 1; }
 # The running session's pid is recorded in .agent/pi.pid (text matching with pgrep -f is fooled by any process whose
 # command line merely mentions pi, including the check itself).
 while [ -f .agent/pi.pid ] && kill -0 "$(cat .agent/pi.pid)" 2>/dev/null; do log "waiting for running agent session (pid $(cat .agent/pi.pid))"; sleep 30; done
+
+# One project per GPU (2026-10-06, the human: "if all GPUs are pointed at one singular project, then that's what should
+# be getting done", the other loops closed out). The model server URL stands for the GPU. A loop that starts on a GPU
+# a loop of ANOTHER project holds pauses that loop (.agent/PAUSE: it stops after its current session, so no work is
+# lost and the GPU does not sit idle) and waits until it has exited. Agents of one team share their GPUs as configured.
+# The newest start wins: a loop pauses only rivals that started before it (two starts at once: the later one stays).
+# Leases are pid files (GPU_LEASES/<gpu>/<pid>: group, project, start time), not a held lock: an agent's child processes would
+# inherit a lock fd and keep the GPU taken after the loop died. A lease whose pid no longer runs agent-loop is stale.
+GPU_LEASES=${GPU_LEASES:-$HOME/.agent-kit/gpu}
+GPU_DIR=$GPU_LEASES/$(sed -E 's#^[a-z]+://##; s#/.*##; s#[^A-Za-z0-9.-]#_#g' <<<"$LLM_URL")
+MY_GROUP=${TEAM_DIR:-$P}
+gpu_rivals() {  # pid<TAB>start<TAB>project of live loops of other projects holding this GPU
+  local f pid
+  for f in "$GPU_DIR"/[0-9]*; do
+    [ -f "$f" ] || continue; pid=${f##*/}; [ "$pid" = $$ ] && continue
+    if ! { kill -0 "$pid" 2>/dev/null && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'agent-loop'; }; then
+      rm -f "$f"; continue; fi   # stale: the loop is gone (or its pid was reused)
+    [ "$(sed -n 1p "$f")" = "$MY_GROUP" ] || printf '%s\t%s\t%s\n' "$pid" "$(sed -n 3p "$f")" "$(sed -n 2p "$f")"
+  done
+}
+take_gpu() {
+  local t0 pid start proj me; me=$(date +%s%N)
+  mkdir -p "$GPU_DIR"; printf '%s\n%s\n%s\n' "$MY_GROUP" "$P" "$me" > "$GPU_DIR/$$"   # claim first: a loop starting later sees us
+  trap 'rm -f "$GPU_DIR/$$"' EXIT
+  [ -z "$(gpu_rivals)" ] && return 0
+  t0=$(date +%s)
+  while IFS=$'\t' read -r pid start proj; do
+    [ "${start:-0}" -lt "$me" ] || continue   # a newer start pauses us instead
+    [ -d "$proj/.agent" ] && touch "$proj/.agent/PAUSE"
+    log "GPU $LLM_URL: the loop of $proj (pid $pid) was using it - paused it (it stops after its current session); waiting for it to exit"
+  done < <(gpu_rivals)
+  while [ -n "$(gpu_rivals)" ]; do
+    [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the GPU - stopping"; exit 0; }
+    [ -n "${TEAM_DIR:-}" ] && team_beat
+    sleep 15
+  done
+  log "GPU $LLM_URL: free after $(( ($(date +%s) - t0) / 60 )) min"
+}
+take_gpu
 [ -n "${TEAM_DIR:-}" ] && echo $$ > "$TEAM/loops/$AGENT_ID.pid" && team_beat && log "team mode: agent $AGENT_ID, main checkout $TEAM_DIR, model server $LLM_URL"
 
 USER_TEST_CMD=${TEST_CMD:-}
@@ -105,11 +144,11 @@ Status: open
 # 000: Plan the project from GOAL.md
 
 ## Goal
-GOAL.md says, in the human's own words, what this project should be. Turn it into a plan and a task queue that the following sessions build from, one task at a time. You own the plan: choose the approach and the tech, and split the work the way you think best. GOAL.md is the human's: never edit it. Its numbers are targets with 20% slack (AGENTS.md, Tasks).
+GOAL.md says, in the human's own words, what this project should be. Turn it into a plan and a task queue that the following sessions build from, one task at a time. You own the plan: choose the approach and the tech, and split the work the way you think best. GOAL.md is the human's: never edit it. Its numbers are the human's intuition, not measured requirements (AGENTS.md, Tasks).
 
 ## Acceptance criteria
 - [ ] PLAN.md describes what will be built, the architecture (the main parts and how they fit together), the tech choices with the reason for each, the assumptions you made where GOAL.md is silent, and what is out of scope
-- [ ] PLAN.md maps every point of GOAL.md to the task number(s) that deliver it, and has a `## Deviations from GOAL.md` section (empty until a number is settled within its slack or a request decides otherwise)
+- [ ] PLAN.md maps every point of GOAL.md to the task number(s) that deliver it, and has a `## Deviations from GOAL.md` section (empty until the evidence settles a number elsewhere or a request decides otherwise)
 - [ ] Task files tasks/001-<name>.md onward exist in build order, each with a Goal and testable Acceptance criteria and small enough for a few sessions; the first ones produce something that runs
 - [ ] The project's test command works (`npm test` when there is a package.json, otherwise `python3 -m pytest -q`), even if there are only a few tests so far
 
@@ -134,7 +173,7 @@ Status: open
 # 999: Check the project against GOAL.md
 
 ## Goal
-The task queue is empty. Check the project against GOAL.md point by point, the way the human would when trying it: run it, run the tests, read the code where needed. Whatever GOAL.md asks for that is missing, broken or only partly there becomes a new task, so the loop can finish the job. GOAL.md is the human's: never edit it. A point is met when the project does what it asks, or when PLAN.md's `## Deviations from GOAL.md` covers the difference (a number within its 20% slack, or a choice an answered request decided).
+The task queue is empty. Check the project against GOAL.md point by point, the way the human would when trying it: run it, run the tests, read the code where needed. Whatever GOAL.md asks for that is missing, broken or only partly there becomes a new task, so the loop can finish the job. GOAL.md is the human's: never edit it. A point is met when the project does what it asks, or when PLAN.md's `## Deviations from GOAL.md` covers the difference (a number settled with evidence that the human would not notice it, or a choice an answered request decided).
 
 ## Acceptance criteria
 - [ ] GOAL-CHECK.md lists every point of GOAL.md with its state (met, partly, not met) and the evidence checked in this session (a command and its result, a test, a file)

@@ -15,7 +15,7 @@ The ONLY memory you have is these files and git history. If you do not write it 
 | `DECISIONS.md` | search, append | Your journal: what you chose and why, what you tried that FAILED and why, blockers with attempt counts. Entry header: `## YYYY-MM-DD <task id> DECISION: <the choice>`. Your task's newest entries are in `PROGRESS.md`; search here for other tasks' reasoning (`grep -n -i "<keyword>" DECISIONS.md`). Lasting facts go to `PITFALLS.md`, not here. Never delete or rewrite old entries or the generated index at the top |
 | `PLAN.md` | search (the planning task 000 and the goal check 999: **read**), write | Yours: the approach, architecture, tech choices, assumptions, and which tasks deliver each point of GOAL.md. Search it when you need a bigger picture than your task file gives. Keep it current when you add, split or drop tasks |
 | `DECISIONS-archive.md` | search | Journal entries of finished tasks, moved there verbatim by the driver. Never read it whole, never edit it |
-| `GOAL.md` | | The human's description of the project, in their own words (when the project has one). Never edit it; its numbers have slack (see Tasks). When the human changes it, the driver reopens the planning task (000) with the change |
+| `GOAL.md` | | The human's description of the project, in their own words (when the project has one). Never edit it; its numbers are intuition, not requirements (see Tasks). When the human changes it, the driver reopens the planning task (000) with the change |
 | `tasks/*.md` | | The work queue. First line is `Status: open`, `in-progress`, `split`, `done`, `blocked` or `dropped` |
 
 ## Session protocol (every session)
@@ -94,11 +94,13 @@ Then, in this order:
 - **Tasks you did not create belong to the human**: their goal and acceptance boxes define done. Do not edit them
   (writing their `## Hand-over` section is expected). If one is wrong or impossible, add a `## Proposed changes`
   section to that task file (what and why) and carry on with the rest; the human is notified.
-- **Numbers in GOAL.md are targets with 20% slack.** When reaching a number in GOAL.md exactly (a time budget, a
-  size, a count) would cost far more than it is worth, reaching it within 20% meets it (a 0.5 s budget: up to
-  0.6 s). List it in PLAN.md under `## Deviations from GOAL.md` (the point, what GOAL.md says, what the project does,
-  why) and set the tests to what the project reaches, never looser. A bigger gap, or any other departure from
-  GOAL.md: ask_human with your recommendation.
+- **Numbers in GOAL.md are the human's intuition, not measured requirements.** Each stands for an intent (a 0.5 s
+  page load: the page feels instant). Serve the intent: when reaching the exact number would cost far more than it is
+  worth, pick the target the evidence supports (your measurements, what a user would actually notice) and list it in
+  PLAN.md under `## Deviations from GOAL.md` (the point, what GOAL.md says, what the project does, the evidence that
+  the human would not notice the difference). Set the tests to what the project reaches, never looser. When the gap
+  would change what the human experiences, or for any other departure from GOAL.md: ask_human with your
+  recommendation.
 - **Done**: tick a box only after you verified it (e.g. its test passes). When all are ticked, set `Status: done`.
   The driver re-checks: every box ticked, and the test suite green (for your own tasks: no test failing that was
   not already failing before). A rejected claim reopens the task, with the reasons in `DECISIONS.md`.
