@@ -31,8 +31,9 @@ ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
 STALL_KILL=${STALL_KILL:-900}   # a session whose output has not grown for this many seconds is stopped (watchdog)
 STALL_SESSIONS=${STALL_SESSIONS:-8}   # a task still unfinished after this many sessions is logged as STALLED (and every 4 after)
-ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}
-GOAL_CHECKS=${GOAL_CHECKS:-3}   # goal-check rounds per GOAL.md version before the loop stops for the human   # doorbell reminder interval while a blocking request to the human is open
+ASK_REMIND_HOURS=${ASK_REMIND_HOURS:-6}   # doorbell reminder interval while a blocking request to the human is open
+export ASK_AUTO_MIN=${ASK_AUTO_MIN:-120}   # requests still open after this many minutes with nothing else to build: the agent goes ahead with its own recommendation (0: never)
+GOAL_CHECKS=${GOAL_CHECKS:-3}   # goal-check rounds per GOAL.md version before the loop stops for the human
 LLM_URL=${LLM_URL:-http://127.0.0.1:8080}
 # Where hand-over notes live. progress: PROGRESS.md, a snapshot rewritten every session. task (default): the "## Hand-over"
 # section of the task being worked on (a subtask also reads its parent's); PROGRESS.md becomes a driver-generated
@@ -104,11 +105,11 @@ Status: open
 # 000: Plan the project from GOAL.md
 
 ## Goal
-GOAL.md says, in the human's own words, what this project should be. Turn it into a plan and a task queue that the following sessions build from, one task at a time. You own the plan: choose the approach and the tech, and split the work the way you think best. GOAL.md is the human's: never edit it.
+GOAL.md says, in the human's own words, what this project should be. Turn it into a plan and a task queue that the following sessions build from, one task at a time. You own the plan: choose the approach and the tech, and split the work the way you think best. GOAL.md is the human's: never edit it. Its numbers are targets with 20% slack (AGENTS.md, Tasks).
 
 ## Acceptance criteria
 - [ ] PLAN.md describes what will be built, the architecture (the main parts and how they fit together), the tech choices with the reason for each, the assumptions you made where GOAL.md is silent, and what is out of scope
-- [ ] PLAN.md maps every point of GOAL.md to the task number(s) that deliver it
+- [ ] PLAN.md maps every point of GOAL.md to the task number(s) that deliver it, and has a `## Deviations from GOAL.md` section (empty until a number is settled within its slack or a request decides otherwise)
 - [ ] Task files tasks/001-<name>.md onward exist in build order, each with a Goal and testable Acceptance criteria and small enough for a few sessions; the first ones produce something that runs
 - [ ] The project's test command works (`npm test` when there is a package.json, otherwise `python3 -m pytest -q`), even if there are only a few tests so far
 
@@ -133,7 +134,7 @@ Status: open
 # 999: Check the project against GOAL.md
 
 ## Goal
-The task queue is empty. Check the project against GOAL.md point by point, the way the human would when trying it: run it, run the tests, read the code where needed. Whatever GOAL.md asks for that is missing, broken or only partly there becomes a new task, so the loop can finish the job. GOAL.md is the human's: never edit it.
+The task queue is empty. Check the project against GOAL.md point by point, the way the human would when trying it: run it, run the tests, read the code where needed. Whatever GOAL.md asks for that is missing, broken or only partly there becomes a new task, so the loop can finish the job. GOAL.md is the human's: never edit it. A point is met when the project does what it asks, or when PLAN.md's `## Deviations from GOAL.md` covers the difference (a number within its 20% slack, or a choice an answered request decided).
 
 ## Acceptance criteria
 - [ ] GOAL-CHECK.md lists every point of GOAL.md with its state (met, partly, not met) and the evidence checked in this session (a command and its result, a test, a file)
@@ -403,11 +404,40 @@ wait_for_human() {
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
     [ -n "${TEAM_DIR:-}" ] && team_beat
     sleep 30; now=$(date +%s)
+    ask_deadline && break
     if [ $((now - last)) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
       log "still waiting for the human after $(( (now - t0) / 3600 )) h; $(ring-doorbell)"; last=$now
     fi
   done
-  log "the human answered or wrote after $(( ($(date +%s) - t0) / 60 )) min"
+  log "the wait for the human ended after $(( ($(date +%s) - t0) / 60 )) min"
+}
+# Deadline (2026-10-06: both frontpage agents sat 10-15 h on two requests while the human was busy): once the loop has
+# had nothing to build for ASK_AUTO_MIN minutes with requests open, it answers them itself - go ahead with the
+# recommendation the agent wrote into the request - and tells the human, who can still override (an answer to a closed
+# request reaches the agent as a message). A request marked human-only (hardware, a credential, money, an account,
+# anything outside this VM: things the agent cannot do whatever it decides) keeps waiting. The clock
+# (.agent/asks-idle-since) starts when the loop first finds nothing to build with a request open, keeps running through
+# prep sessions and team waits (neither is real progress), and is cleared when the loop takes real work.
+ask_deadline() {  # true when it answered at least one request just now
+  local since now a done_="" nums=""
+  [ "${ASK_AUTO_MIN:-0}" -gt 0 ] || return 1
+  [ -f .agent/asks-idle-since ] || { date +%s > .agent/asks-idle-since; return 1; }
+  since=$(cat .agent/asks-idle-since); now=$(date +%s)
+  [ $((now - since)) -ge $((ASK_AUTO_MIN * 60)) ] || return 1
+  for a in $(asks_with open); do
+    case "$(ask_field "$a" human-only)" in ""|no) ;; *) continue ;; esac
+    { printf '\n## Answer (%s, auto: no answer after %s min with nothing else to build)\n' "$(date '+%F %H:%M')" "$ASK_AUTO_MIN"
+      printf '%s\n' "The human has not answered yet, so the loop decides: go ahead with the option you recommended in this" \
+        "request (if it names none, the one that serves GOAL.md best). This is the answer: carry it out without asking" \
+        "again. Add a DECISIONS.md entry starting \`AUTO-DECIDED request $(basename "$a" .md):\` with what you chose and why," \
+        "and if the choice departs from GOAL.md, list it in PLAN.md under \`## Deviations from GOAL.md\`. The human has" \
+        "been told and may still override it; an override arrives as a message."; } >> "$a"
+    sed -i 's/^status: open$/status: answered/' "$a"; done_+=" $a"; nums+=" $(basename "$a" .md)"
+    [ -n "${TEAM_DIR:-}" ] && tev ask_auto "$(ask_field "$a" task)" "$a"
+  done
+  [ -n "$done_" ] || return 1
+  log "no answer from the human after $ASK_AUTO_MIN min with nothing else to build: decided$done_ on the agent's recommendation; $(printf 'Decided request(s)%s myself after %s min with no answer and nothing else to build: the agent goes ahead with the option it recommended. Answer the request in the app to override; it reaches the agent as a message.' "$nums" "$ASK_AUTO_MIN" | ring-doorbell --info)"
+  return 0
 }
 # agent-talk holds the loop with .agent/TALK while the human talks with an agent in this project.
 wait_for_talk() {
@@ -766,6 +796,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     # takes freed work within a minute (frontpage 2026-10-03: a stale non-blocking request held agent a here while
     # the task it needed was being handed to it).
     if [ -n "$(asks_with open)" ]; then
+      ask_deadline && continue   # the human did not answer in time: the answered task goes next
       # a team agent prepares upcoming work before it waits for the human (2026-10-05: agent a sat in this wait on a
       # request about 230 while b only prepared, held no task, and a had prep work it could do)
       if [ -n "${TEAM_DIR:-}" ]; then
@@ -793,6 +824,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     task=$(goal_check_next); break
   done
   [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
+  [ -n "$task" ] && [ -z "$PREP" ] && rm -f .agent/asks-idle-since   # real work: the request deadline clock stops
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   if [ -n "$PREP" ]; then prep_iteration "$task"; continue; fi
   [ -n "${TEAM_DIR:-}" ] && team_prep_handoff "$task"   # another agent still preparing it: its notes first (bounded)

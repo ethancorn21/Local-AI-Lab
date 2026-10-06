@@ -2,6 +2,7 @@
 """ring-doorbell: tell the human something through the AI box's Telegram relay (telecloak).
   ring-doorbell             ping: this project is waiting for answers to its open requests (the loop, while it waits)
   ring-doorbell --ask <n>   request <n>, its text on stdin (the ask_human tool)
+  ring-doorbell --info      a notice, its text on stdin (the loop, when it decided open requests itself)
 The project is the git top level of the current directory. The AI box encrypts the message with a key this VM never
 holds and sends it with a bot token this VM never holds (the key behind `Host doorbell` can only run the relay there,
 a forced command). Without a telecloak key on the AI box only the fixed ping "help i need your attention" leaves.
@@ -48,6 +49,8 @@ def main():
     project = os.path.basename(root)
     if len(args) == 2 and args[0] == "--ask" and re.fullmatch(r"\d{1,4}", args[1]):
         body = {"kind": "ask", "project": project, "ask": args[1], "text": sys.stdin.read()}
+    elif args == ["--info"]:
+        body = {"kind": "info", "project": project, "text": sys.stdin.read()}
     elif not args:
         body = {"kind": "ring", "project": project, "asks": open_asks(root), "text": "waiting for your answer"}
     else:
