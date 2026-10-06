@@ -106,7 +106,9 @@ turn. Esc stops the session instead, and the next one starts with the message.
 ### Requests to the human
 
 The agent files a request with the `ask_human` tool. It is saved as `.agent/asks/<n>.md` and reaches the human's phone
-as an encrypted message; the human answers in the telecloak app or with `agent-talk` on the VM.
+over Telegram as plain text; the human answers by replying to it there, or with `agent-talk` on the VM. A project
+marked confidential (`.agent/confidential`, in a team's main checkout) gets encrypted messages instead, answered in the
+telecloak app. Encryption is off by default (the human's choice, 2026-10-06: it is for confidential projects only).
 
 - **The request makes its task wait, not the loop.** The loop works on other tasks meanwhile and comes back to this one
   first once it is answered. A team agent with nothing else to build prepares upcoming tasks.
@@ -125,6 +127,13 @@ text to the AI box over SSH, with a key that can only run the relay (no shell, n
 only). The AI box encrypts it (AES-256-GCM, one key per direction) and sends it, so Telegram only carries ciphertext.
 Replies count only if they come from the human's own account, decrypt, are under a day old and are not replays.
 Without a key, only a fixed "help, I need your attention" ping can leave. Rate limit: 20 messages an hour, 100 a day.
+
+**Plain projects.** A project not marked confidential sends readable text, and a plain reply counts only if it is a
+reply to one of the relay's own plain messages (it remembers which project and request each one was), from the
+human's account, in the private chat, under a day old and not seen before. It becomes the answer to that request, or a
+message to that project; never a command (start, stop, status stay encrypted-only), and never anything for a
+confidential project. The trade-off, accepted: someone holding the human's Telegram session can talk to plain
+projects' agents.
 
 ## One project per GPU
 

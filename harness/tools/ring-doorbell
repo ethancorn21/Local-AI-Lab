@@ -3,8 +3,10 @@
   ring-doorbell             ping: this project is waiting for answers to its open requests (the loop, while it waits)
   ring-doorbell --ask <n>   request <n>, its text on stdin (the ask_human tool)
   ring-doorbell --info      a notice, its text on stdin (the loop, when it decided open requests itself)
-The project is the git top level of the current directory. The AI box encrypts the message with a key this VM never
-holds and sends it with a bot token this VM never holds (the key behind `Host doorbell` can only run the relay there,
+The project is the git top level of the current directory. A project marked confidential (.agent/confidential in it,
+or in a team's main checkout) is encrypted: the AI box encrypts the message with a key this VM never holds. Any other
+project's messages go as plain text the human can read and answer in Telegram (the human's choice, 2026-10-06:
+encryption only where it is needed). Either way it is sent with a bot token this VM never holds (the key behind `Host doorbell` can only run the relay there,
 a forced command). Without a telecloak key on the AI box only the fixed ping "help i need your attention" leaves.
 Prints the relay's one-line result; the exit status is the relay's (3: rate limit). Ringing often is harmless: a ping
 within 10 minutes of the last one is not re-sent.
@@ -23,6 +25,20 @@ def project_root():
                               check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return os.getcwd()
+
+
+def confidential(root):
+    """.agent/confidential in the project, or in its team's main checkout (a team worktree's .agent/team.env)."""
+    root = Path(root)
+    if (root / ".agent" / "confidential").exists():
+        return True
+    try:
+        for line in (root / ".agent" / "team.env").read_text().splitlines():
+            if line.startswith("TEAM_DIR="):
+                return (Path(line.split("=", 1)[1].strip().strip("'\"")) / ".agent" / "confidential").exists()
+    except OSError:
+        pass
+    return False
 
 
 def open_asks(root):
@@ -56,6 +72,8 @@ def main():
     else:
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    if not confidential(root):
+        body["plain"] = True
     rc, line = send(body)
     print(line)
     return rc

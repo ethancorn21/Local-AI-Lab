@@ -43,10 +43,13 @@ class FakeTelegram:
             return [u for u in self.updates if u["update_id"] >= params["offset"]]
         raise AssertionError(method)
 
-    def from_user(self, text, uid=HUMAN, chat_type="private"):
+    def from_user(self, text, uid=HUMAN, chat_type="private", reply_to=None, date=None):
         self.next_id += 1
-        self.updates.append({"update_id": self.next_id, "message": {
-            "chat": {"id": uid, "type": chat_type}, "from": {"id": uid}, "text": text}})
+        m = {"message_id": 1000 + self.next_id, "date": int(date if date is not None else time.time()),
+             "chat": {"id": uid, "type": chat_type}, "from": {"id": uid}, "text": text}
+        if reply_to is not None:
+            m["reply_to_message"] = {"message_id": reply_to}
+        self.updates.append({"update_id": self.next_id, "message": m})
 
 
 @pytest.fixture
@@ -95,8 +98,11 @@ def test_no_key_only_fixed_plain_ping_leaves(relay):
     rc, out = send(relay, {"kind": "ask", "project": "p1", "ask": "001", "text": "secret request text"})
     assert rc == 0 and "rang" in out
     assert relay.fake.sent == ["help i need your attention"]
+    # fetch runs without a key (plain replies need none), but an encrypted message cannot be opened
     rc, out = relay.run("fetch")
-    assert rc == 2 and "telecloak-setup" in out
+    assert rc == 0 and out.strip() == ""
+    relay.fake.from_user(relay.human.seal({"kind": "command", "command": "status"}).parts[0])
+    assert relay.run("fetch")[1].count("{") == 0
 
 
 def test_ask_is_encrypted_and_opens_for_the_human(relay):
@@ -286,7 +292,106 @@ def test_ring_doorbell_sends_open_asks_and_ask_text(tmp_path):
     assert r.returncode == 0 and r.stdout.strip() == "doorbell: rang"
     assert (tmp_path / "args").read_text().split()[-2:] == ["doorbell", "send"]
     assert json.loads((tmp_path / "stdin").read_text()) == {
-        "kind": "ring", "project": "proj", "asks": ["003"], "text": "waiting for your answer"}
+        "kind": "ring", "project": "proj", "asks": ["003"], "text": "waiting for your answer", "plain": True}
     r = subprocess.run([tool, "--ask", "003"], cwd=p, env=env, input="need a key", capture_output=True, text=True)
     assert json.loads((tmp_path / "stdin").read_text())["text"] == "need a key"
     assert subprocess.run([tool, "--ask", "x; id"], cwd=p, env=env, capture_output=True).returncode == 2
+
+
+# ---- plain projects (not marked confidential) ---------------------------------------------------------------------
+
+def fetched(relay):
+    rc, out = relay.run("fetch")
+    return [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+
+
+@pytest.mark.parametrize("key", [False, True])
+def test_plain_ask_is_readable_and_a_reply_answers_it(relay, key):
+    if key:
+        relay.set_key()
+    rc, out = send(relay, {"kind": "ask", "project": "p1", "ask": "001", "text": "plug in the drive\x1b[31m",
+                           "plain": True})
+    assert rc == 0 and "sent" in out
+    msg = relay.fake.sent[-1]
+    assert not msg.startswith("tc1.") and msg.startswith("p1, request 001:\nplug in the drive[31m")
+    relay.fake.from_user("attached as /dev/sdb", reply_to=len(relay.fake.sent))
+    (m,) = fetched(relay)
+    assert (m["kind"], m["project"], m["ask"], m["text"]) == ("answer", "p1", "001", "attached as /dev/sdb")
+    assert len(fetched(relay)) == 1                        # queued until acked, like any message
+    assert "acked 1" in relay.run(f"ack {m['id']}")[1] and fetched(relay) == []
+
+
+def test_plain_reply_to_a_notice_is_a_message_never_a_command(relay):
+    send(relay, {"kind": "info", "project": "p1", "text": "decided request 002 myself", "plain": True})
+    assert relay.fake.sent[-1] == "p1: decided request 002 myself"
+    relay.fake.from_user("/stop p1", reply_to=len(relay.fake.sent))
+    (m,) = fetched(relay)
+    assert (m["kind"], m["project"], m["text"]) == ("message", "p1", "/stop p1") and "command" not in m
+
+
+def test_plain_reply_rejected_unless_to_a_plain_message_from_the_human_and_fresh(relay):
+    relay.set_key()
+    send(relay, {"kind": "ask", "project": "p2", "ask": "003", "text": "sealed request"})      # confidential: sealed
+    sealed_id = len(relay.fake.sent)
+    send(relay, {"kind": "ask", "project": "p1", "ask": "004", "text": "plain request", "plain": True})
+    plain_id = len(relay.fake.sent)
+    relay.fake.from_user("answer to a sealed one", reply_to=sealed_id)          # a confidential project's message
+    relay.fake.from_user("no reply at all")                                      # not a reply
+    relay.fake.from_user("from a stranger", uid=STRANGER, reply_to=plain_id)    # not the human
+    relay.fake.from_user("in a group", chat_type="group", reply_to=plain_id)
+    relay.fake.from_user("held back", reply_to=plain_id, date=time.time() - 90000)
+    assert fetched(relay) == []
+    assert "not a reply to a plain message" in relay.read_sent()["text"]       # the human is told (sealed)
+
+
+def test_plain_reply_replayed_is_taken_once(relay):
+    send(relay, {"kind": "ask", "project": "p1", "ask": "005", "text": "q", "plain": True})
+    relay.fake.from_user("yes", reply_to=len(relay.fake.sent))
+    (m,) = fetched(relay)
+    relay.run(f"ack {m['id']}")
+    relay.fake.updates.append(relay.fake.updates[-1] | {"update_id": relay.fake.next_id + 1})   # delivered again
+    relay.fake.next_id += 1
+    assert fetched(relay) == []
+
+
+def test_plain_needs_a_project_and_long_text_is_split(relay):
+    send(relay, {"kind": "info", "text": "no project", "plain": True})
+    assert relay.fake.sent[-1] == "help i need your attention"                  # no key, no project: fixed ping
+    send(relay, {"kind": "ask", "project": "p1", "ask": "006", "text": "z" * 7990, "plain": True})
+    assert len(relay.fake.sent) == 4 and all(len(t) <= 4000 for t in relay.fake.sent[1:])
+    relay.fake.from_user("ok", reply_to=3)                                       # a reply to any part counts
+    assert fetched(relay)[0]["ask"] == "006"
+
+
+def test_ring_doorbell_plain_unless_confidential(tmp_path):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "ssh").write_text(f'#!/bin/sh\ncat > {tmp_path}/stdin\necho "doorbell: sent"\n')
+    (fake / "ssh").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+    tool = str(REPO / "harness" / "tools" / "ring-doorbell")
+    main, wt = tmp_path / "proj", tmp_path / "proj.b"
+    for d in (main, wt):
+        (d / ".agent").mkdir(parents=True)
+    (wt / ".agent" / "team.env").write_text(f"AGENT_ID=b\nTEAM_DIR={main}\n")
+
+    def sent_from(d):
+        subprocess.run([tool, "--info"], cwd=d, env=env, input="hi", capture_output=True, text=True, check=True)
+        return json.loads((tmp_path / "stdin").read_text())
+    assert sent_from(main).get("plain") is True and sent_from(wt).get("plain") is True
+    (main / ".agent" / "confidential").touch()
+    assert "plain" not in sent_from(main) and "plain" not in sent_from(wt)   # a team worktree follows its main checkout
+
+
+def test_pull_replies_plain_for_plain_projects(vm, tmp_path, monkeypatch):
+    pull, p, _ = vm
+    pull = load(REPO / "harness" / "tools" / "telecloak-pull", "pull_reply_under_test")
+    monkeypatch.setattr(pull, "PROJECTS", p.parent)
+    bodies = []
+    monkeypatch.setattr(pull, "ssh", lambda args, stdin=None, timeout=120: bodies.append(json.loads(stdin))
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    pull.reply("p1", "Answer delivered")
+    pull.reply(None, "status of everything")
+    (p / ".agent" / "confidential").touch()
+    pull.reply("p1", "Answer delivered")
+    assert [b.get("plain") for b in bodies] == [True, None, None]

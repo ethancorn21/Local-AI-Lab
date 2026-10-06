@@ -1,8 +1,9 @@
 #!/usr/bin/python3 -I
 """doorbell: the lab's Telegram relay (telecloak). The forced command of the doorbell account's only SSH key, which the
 agents' VM uses; SSH_ORIGINAL_COMMAND picks the action:
-  send        stdin: one JSON message {"kind": ask|ring|reply|info, "project", "ask", "asks", "answered", "text"}.
-              Encrypted here and sent to the human.
+  send        stdin: one JSON message {"kind": ask|ring|reply|info, "project", "ask", "asks", "answered", "text",
+              "plain"}. Encrypted here and sent to the human; with "plain": true (a project not marked confidential,
+              2026-10-06) sent as readable text instead, and a plain reply to it is accepted (below).
   fetch       the human's messages to the bot (sent with the telecloak app), checked and decrypted here, printed as
               JSON lines. Each stays queued until acked, so nothing is lost if the VM drops the connection.
   ack <id>... drop fetched messages the VM has handled
@@ -15,11 +16,18 @@ Telegram sees only ciphertext ("tc1....", see telecloak_core.py).
 - Inbound is accepted only from the human's own account (CHAT_ID) in the private chat, only if it decrypts with the
   human-to-bot key (so the key alone is not enough, and neither is the Telegram account alone), is at most a day old,
   was not seen before (replays), and is a well-formed answer, message or command.
+- Plain projects (the human's choice, 2026-10-06: encryption only for projects marked confidential): their messages
+  leave as readable text, and the human may answer one by replying to it in Telegram, without the app. Such a reply is
+  accepted only from the human's account, only as a reply to a plain message this relay sent (plain-sent.json: message
+  id -> project and request), and only as an answer to that request or a message to that project, never a command.
+  So a hijacked Telegram account can reach plain projects' agents, but cannot start or stop loops or reach a
+  confidential project.
 - Anything rejected is logged (syslog, tag doorbell) without its content; the human is told once per fetch.
 - Rate limits on everything sent: PER_HOUR and PER_DAY; a ring within RING_GAP of the last is not re-sent.
 Credentials: /etc/doorbell/telegram.env (BOT_TOKEN, CHAT_ID), written by doorbell-setup. State: /var/lib/doorbell.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -45,6 +53,8 @@ POLL = 20                             # seconds a fetch waits for new messages (
 PROJECT = re.compile(r"[A-Za-z0-9._-]{1,64}")
 ASK = re.compile(r"\d{1,4}")
 MSG_ID = re.compile(r"[0-9a-f]{16}")
+PLAIN_KEEP = 7 * 86400                # how long a plain message can still be answered by replying to it
+TG_LIMIT = 4000                       # characters per plain Telegram message (Telegram's limit is 4096)
 COMMANDS = {"start", "stop", "stop-now", "status"}
 UNSAFE = re.compile("[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]")
 
@@ -163,13 +173,26 @@ def outbound(msg):
         if isinstance(msg.get(k), list):
             body[k] = [a for a in msg[k] if isinstance(a, str) and ASK.fullmatch(a)][:50]
     body["text"] = clean(msg.get("text", "")) or (FIXED if body["kind"] == "ring" else "")
+    if msg.get("plain") is True and "project" in body:
+        body["plain"] = True
     return body
+
+
+def plain_text(body):
+    """A plain message as the human reads it in Telegram."""
+    p, text = body.get("project", ""), body["text"]
+    if body["kind"] == "ask":
+        return f"{p}, request {body.get('ask', '?')}:\n{text}\n\n(Reply to this message to answer it.)"
+    if body["kind"] == "ring" and body.get("asks"):
+        return f"{p}: waiting for your answer to request {', '.join(body['asks'])}. Reply to this message to tell it something."
+    return f"{p}: {text}"
 
 
 def deliver(token, chat, body):
     """Encrypt and send one message to the human, within the rate limits. Returns a one-line result."""
-    ch = channel(token, chat)
-    if ch is None:
+    plain = body.get("plain") is True
+    ch = None if plain else channel(token, chat)
+    if ch is None and not plain:
         body = {"kind": "ring"}           # no key: only the fixed ping may leave, never message text
     now = time.time()
     with Lock("send"):
@@ -180,13 +203,27 @@ def deliver(token, chat, body):
         if sum(now - t < 3600 for t in sent) >= PER_HOUR or len(sent) >= PER_DAY:
             log("refused: rate limit")
             raise Refused(f"rate limit reached ({PER_HOUR} an hour, {PER_DAY} a day)", 3)
-        parts = [FIXED] if ch is None else ch.seal(body).parts
+        if plain:
+            t = plain_text(body)
+            parts = [t[i:i + TG_LIMIT] for i in range(0, len(t), TG_LIMIT)]
+        else:
+            parts = [FIXED] if ch is None else ch.seal(body).parts
+        ids = []
         for p in parts:
-            telegram(token, "sendMessage", {"chat_id": chat, "text": p})
+            r = telegram(token, "sendMessage", {"chat_id": chat, "text": p})
+            if isinstance(r, dict) and isinstance(r.get("message_id"), int):
+                ids.append(r["message_id"])
         save("sent.json", sent + [now])
         if body["kind"] == "ring":
             save("rings.json", (rings + [now])[-200:])
-    log(f"sent kind={body['kind']} parts={len(parts)}{'' if ch else ' (no key: fixed ping, unencrypted)'}")
+        if plain:                         # what a reply to each part answers
+            known = {k: v for k, v in load("plain-sent.json", {}).items() if now - v.get("t", 0) < PLAIN_KEEP}
+            for i in ids:
+                known[str(i)] = {"project": body["project"], "ask": body.get("ask") if body["kind"] == "ask" else None,
+                                 "t": now}
+            save("plain-sent.json", known)
+    log(f"sent kind={body['kind']} parts={len(parts)}"
+        f"{' (plain)' if plain else '' if ch else ' (no key: fixed ping, unencrypted)'}")
     return "rang" if body["kind"] == "ring" else f"sent ({len(parts)} part{'s' if len(parts) > 1 else ''})"
 
 
@@ -232,10 +269,22 @@ def inbound(body):
     return out
 
 
+def plain_inbound(m, known):
+    """A plain reply from the human to one of this relay's plain messages: the answer to its request, or a message to its
+    project. Returns (body, msg_id, ts), or raises Refused."""
+    to = (m.get("reply_to_message") or {}).get("message_id")
+    entry = known.get(str(to)) if isinstance(to, int) else None
+    if entry is None:
+        raise Refused("not encrypted, and not a reply to a plain message from a project")
+    body = {"kind": "answer" if entry.get("ask") else "message", "project": entry["project"], "text": m.get("text", "")}
+    if entry.get("ask"):
+        body["ask"] = entry["ask"]
+    msg_id = hashlib.sha256(f"tg:{m.get('chat', {}).get('id')}:{m.get('message_id')}:{m.get('date')}".encode()).hexdigest()[:16]
+    return inbound(body), msg_id, m.get("date", 0)
+
+
 def cmd_fetch(token, chat):
     ch = channel(token, chat)
-    if ch is None:
-        raise Refused("no telecloak key (run telecloak-setup on the AI box)", 2)
     inbox = f"{STATE}/inbound"
     os.makedirs(inbox, mode=0o700, exist_ok=True)
     notice, error = None, None
@@ -248,6 +297,7 @@ def cmd_fetch(token, chat):
             updates, error = [], str(e)
         seen = Seen(st["seen"], keep=2 * MAX_AGE)
         parts = Reassembler(st["parts"])
+        known = load("plain-sent.json", {})
         for u in updates:
             st["offset"] = max(st["offset"], u["update_id"] + 1)
             m = u.get("message") or {}
@@ -257,24 +307,27 @@ def cmd_fetch(token, chat):
                 continue
             try:
                 text = m.get("text", "")
-                if not is_wire(text):
-                    raise Refused("not encrypted")
-                msg = parts.add(ch.open(text))
-                if msg is None:
-                    continue              # more parts to come
+                if is_wire(text):
+                    if ch is None:
+                        raise Refused("encrypted, but there is no telecloak key here (run telecloak-setup)")
+                    msg = parts.add(ch.open(text))
+                    if msg is None:
+                        continue          # more parts to come
+                    body, msg_id, ts = inbound(msg.body), msg.msg_id, msg.ts
+                else:
+                    body, msg_id, ts = plain_inbound(m, known)
                 now = time.time()
-                if not now - MAX_AGE <= msg.ts <= now + MAX_AHEAD:
+                if not now - MAX_AGE <= ts <= now + MAX_AHEAD:
                     raise Refused("too old, or dated in the future")
-                if not seen.add(msg.msg_id):
+                if not seen.add(msg_id):
                     raise Refused("already received (replay)")
-                body = inbound(msg.body)
             except (Refused, TelecloakError) as e:
                 log(f"rejected update {u['update_id']}: {e}")
                 notice = notice or str(e)
                 continue
-            body.update(id=msg.msg_id, ts=msg.ts)
-            save(f"inbound/{msg.msg_id}", body)
-            log(f"accepted {msg.msg_id} kind={body['kind']}")
+            body.update(id=msg_id, ts=ts)
+            save(f"inbound/{msg_id}", body)
+            log(f"accepted {msg_id} kind={body['kind']}{' (plain)' if not is_wire(text) else ''}")
         save("fetch.json", st)
         pending = sorted(os.listdir(inbox), key=lambda f: os.stat(f"{inbox}/{f}").st_mtime)
         for f in pending:
@@ -283,7 +336,8 @@ def cmd_fetch(token, chat):
     if notice:
         try:
             deliver(token, chat, {"kind": "info", "text": f"The lab ignored a message from you: {notice}. It acts "
-                                                          "only on messages sent with telecloak."})
+                                                          "only on messages sent with telecloak, or on replies to a "
+                                                          "plain message from a project."})
         except Refused:
             pass
     if error:

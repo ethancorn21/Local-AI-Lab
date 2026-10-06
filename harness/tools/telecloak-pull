@@ -39,10 +39,26 @@ def ssh(args, stdin=None, timeout=120):
                           input=stdin, capture_output=True, text=True, timeout=timeout)
 
 
+def confidential(p: Path):
+    """.agent/confidential in the project, or in its team's main checkout (ring-doorbell does the same)."""
+    if (p / ".agent" / "confidential").exists():
+        return True
+    try:
+        for line in (p / ".agent" / "team.env").read_text().splitlines():
+            if line.startswith("TEAM_DIR="):
+                return (Path(line.split("=", 1)[1].strip().strip("'\"")) / ".agent" / "confidential").exists()
+    except OSError:
+        pass
+    return False
+
+
 def reply(project, text, **extra):
     body = {"kind": "reply", "text": text, **extra}
     if project:
         body["project"] = project
+        p = project_dir(project)
+        if p is not None and not confidential(p):   # a plain project's results go plain too; status of all stays sealed
+            body["plain"] = True
     try:
         r = ssh(["send"], json.dumps(body))
         if r.returncode:

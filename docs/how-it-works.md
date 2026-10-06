@@ -287,7 +287,7 @@ The driver handles the routine failures itself and reports the rest:
 | A task runs 8 sessions without finishing | Flagged STALLED (and every 4 sessions after) |
 | Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
-| An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets an encrypted message on their phone |
+| An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets a Telegram message on their phone, answered by replying to it (encrypted, through the telecloak app, only for projects marked confidential) |
 | Nobody answers for 2 hours and there is nothing else to build | The agent goes ahead with its recommendation; the human is told and can still override. Things only a person can do (hardware, credentials, money, accounts) keep waiting |
 | A loop starts on a GPU another project is using | The other project's loop finishes its current session and stops; the newest start wins |
 

@@ -19,7 +19,7 @@ Related notes:
 | AI box (trusted network) | The GPU server. Model servers listen on localhost only. |
 | Harness VM (isolated lab network) | The agents' own machine: the harness, the driver, the projects, a search engine for web research. |
 | Link | SSH tunnels from the VM to the AI box, one per model port. The tunnel key can forward only the listed ports. |
-| Operator | Laptop to VM over SSH (`agent-watch`, loop control) or the telecloak app (messages, start/stop, requests); laptop to AI box for administration. |
+| Operator | Laptop to VM over SSH (`agent-watch`, loop control), Telegram (replies to plain requests), or the telecloak app (start/stop, confidential projects); laptop to AI box for administration. |
 | Claude | The architect: turns the operator's intent into goals and harness rules, and administers both machines through its own accounts. |
 
 ## Hardware (AI box)
@@ -173,4 +173,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 arrived; takeover (an idle fast agent takes the slow card's critical task, with its work). |
+| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 arrived; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |
