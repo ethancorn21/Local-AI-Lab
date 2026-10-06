@@ -9,6 +9,8 @@
 #   merge.lock           one merge into main at a time
 #   prep/<id>/owner      an idle agent is preparing that task: "<agent> <loop pid> <epoch>" (see Prep below)
 #   prep-tries/<id>      prep sessions on that task that wrote no notes (two and it is not prepared again)
+#   takeover/<key>/asker a faster agent with nothing to build asks the holder for that claim (see Takeover below)
+#   carry/<key>          a claim just given: "<giver> <commit>" and the paths of its work, for the new owner to apply
 #   events.jsonl         what happened, for monitoring (agent-team status): claims, waits, merges, conflicts
 #   STOP                 written by the agent that ran the last goal check; the others stop too
 # Rules in code, not prose: a task is offered only when its `Depends on:` tasks are done in main and its `Touches:`
@@ -331,7 +333,7 @@ waiting_bigger_agent() {  # a running agent with a bigger window than this one (
   done
   return 0
 }
-team_handover_finish() {  # back up this agent's branch and reset it to main, for a task marked handed over by it
+team_handover_finish() {  # back up this agent's branch and take the handed task's work off it, for a task marked handed over by it
   local m k a s b
   for m in "$TEAM"/handed/*; do
     [ -f "$m" ] || continue
@@ -339,8 +341,16 @@ team_handover_finish() {  # back up this agent's branch and reset it to main, fo
     k=$(basename "$m"); b="$BRANCH-handover-$k-$(date +%Y%m%d-%H%M)"
     commit_leftovers "before handing $k over"
     if [ "$(git rev-list --count main..HEAD)" -gt 0 ]; then
-      git branch "$b" HEAD && git reset -q --hard main || { log "WARNING team: could not reset $BRANCH after handing $k over"; continue; }
-      log "team: $k handed over - this branch's work on it is kept on $b, and $BRANCH is reset to main"
+      git branch "$b" HEAD || { log "WARNING team: could not back up $BRANCH before handing $k over"; continue; }
+      # With other claims still held, only this task's files go back to main's; their work stays (frontpage
+      # 2026-10-06: handing 243 over reset agent/b to main, and its session on 253, which it still held, was lost
+      # and done again). With none, the whole branch is reset as before.
+      if [ -n "$(own_claims)" ] && team_put_back "$k" "handed over to a bigger agent"; then
+        log "team: $k handed over - this branch's work on it is kept on $b, and its files on $BRANCH are put back as main has them"
+      else
+        git reset -q --hard main || { log "WARNING team: could not reset $BRANCH after handing $k over"; continue; }
+        log "team: $k handed over - this branch's work on it is kept on $b, and $BRANCH is reset to main"
+      fi
     else b=none; fi
     echo "$AGENT_ID $(date +%s) kept $b" > "$m"; tev handover_reset "" "$k backup $b"
   done
@@ -400,15 +410,213 @@ team_ranks() {  # "<id> <rank>" for each open task of this checkout (000 and 999
   done | plan-schedule --ranks 2>/dev/null
 }
 rank_of() { awk -v t="$1" '$1 == t { print $2; f = 1 } END { if (!f) print 0 }' <<<"$2"; }   # rank_of <id> <team_ranks>
-team_pick_order() {  # the task files in the order this agent takes them: the planning task, then by rank
-  local f ranks o=r
-  ranks=$(team_ranks); team_is_slow && o=""
+claim_rank() { awk -v k="$1" '{ id = $1; sub(/[a-z]+$/, "", id) } id == k && $2 > m { m = $2 } END { print m + 0 }' <<<"$2"; }   # claim_rank <key> <team_ranks> : its tasks' highest rank
+own_claims() { local o; for o in "$TEAM"/claims/*/owner; do [ -f "$o" ] && [ "$(cut -d' ' -f1 "$o")" = "$AGENT_ID" ] && basename "$(dirname "$o")"; done; return 0; }
+team_pick_order() {  # the task files in the order this agent takes them: the planning task; then its own claims, the
+  # highest rank first, slow agent or not: finishing what it holds comes first (frontpage 2026-10-06: agent b held 253,
+  # which five tasks waited on, and 243b, which nothing did; its lowest-rank-first order took 243b and parked 253 for
+  # 39 minutes while agent a waited); then the rest by rank (a slower agent the lowest first, see above)
+  local f k ranks slow="" own
+  ranks=$(team_ranks); team_is_slow && slow=1
+  own=" $(own_claims | tr '\n' ' ')"
   compgen -G 'tasks/000-*.md' || true
   for f in tasks/[0-9]*.md; do
     [ -f "$f" ] || continue
     case $f in tasks/000-*) continue ;; esac
-    printf '%s %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
-  done | sort -k1,1n$o -k2,2 | cut -d' ' -f2
+    k=$(claim_key "$f")
+    if [[ $own == *" $k "* ]]; then printf '0 -%s -%s %s\n' "$(claim_rank "$k" "$ranks")" "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
+    elif [ -n "$slow" ]; then printf '1 %s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
+    else printf '1 -%s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"; fi
+  done | sort -k1,1n -k2,2n -k3,3n -k4,4 | cut -d' ' -f4
+}
+
+# Takeover: an idle faster agent takes over a task a slower agent holds when other tasks wait on it. frontpage
+# 2026-10-06: agent a merged 252 and went back to its own 244; 14 s later agent b (a quarter of a's speed) took 253, the
+# only task free for it, which five tasks waited on. At 14:37 a had nothing left (b held 253 and 243), b's next session
+# went to 243b, and a waited 47 minutes. The 3-session hand-over is for an agent that is stuck, not one that is slow,
+# and prep moves notes, never a claim. So:
+#   - asking: an agent with nothing to build, before it prepares anything (real work beats notes), asks for the claim
+#     of a slower running agent that other open tasks wait on (rank 2+) and that it could build now itself
+#     (dependencies done in main, its own size limit, no file overlap with any other claim, no open request to the
+#     human about it); the highest rank first (team-takeover pick). $TEAM/takeover/<key>/asker = "<asker> <loop pid>
+#     <epoch> <asker's checkout>". Then it waits: the answer takes seconds, or one hand-over of the holder's session.
+#   - answering: only the holder's loop changes its claim. Between sessions it gives the claim at once; during a session
+#     on that task, wrapup's driver signal (.agent/handover-now) makes the session write its hand-over and end, and the
+#     claim goes after it; during a session on another task (the claim is parked), its watcher gives it at once.
+#   - giving: the claim's owner becomes the asker. $TEAM/carry/<key> = "<holder> <commit>" and the task's paths
+#     (team-takeover paths): the asker applies that work to its branch before its next session, whose prompt says so.
+#     The holder's branch gets those paths back as main has them (its other claims' work stays): at once between
+#     sessions, else right after the session, before anything of that branch is verified or merged.
+agent_running() { local f=$TEAM/loops/$1.pid; [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; }
+team_has_slower() {  # another running agent is slower than this one (only then can this one take anything over)
+  local id me; me=$(agent_speed "$AGENT_ID")
+  for id in $(live_agents); do
+    [ "$id" = "$AGENT_ID" ] && continue
+    awk -v o="$(agent_speed "$id")" -v m="$me" 'BEGIN { exit !(o < m) }' && return 0
+  done
+  return 1
+}
+team_takeover_why_not() {  # team_takeover_why_not <holder's checkout> <key> : why this agent could not build that claim now (empty: it could)
+  local hw=$1 k=$2 top s t q pending="" startable=""
+  top=$(compgen -G "$hw/tasks/$k-*.md" | head -1); [ -n "$top" ] || { echo "no task file"; return 0; }
+  s=$(status_of "$top"); case $s in done|dropped|blocked) echo "$s"; return 0 ;; esac
+  for q in "$hw"/.agent/asks/[0-9]*.md; do   # a request to the human about it is open in the holder's checkout
+    [ -f "$q" ] && grep -qx 'status: open' "$q" || continue
+    t=$(sed -n 's/^task: //p' "$q" | head -1); [ -n "$t" ] && [ "$(claim_key "$t")" = "$k" ] && { echo "waits for the human"; return 0; }
+  done
+  t=$(unmet_deps "$top"); [ -n "$t" ] && { echo "waits for $(echo $t | tr ' ' ,)"; return 0; }
+  for t in "$hw"/tasks/$k[a-z]*-*.md; do   # split: an unfinished subtask must be able to start
+    [ -f "$t" ] || continue
+    case $(status_of "$t") in done|dropped) continue ;; open|in-progress) [ -z "$(unmet_deps "$t")" ] && startable=1 ;; esac
+    pending=1
+  done
+  [ -n "$pending" ] && [ -z "$startable" ] && { echo "no subtask can start"; return 0; }
+  if [ -n "${TEAM_MAX_TOUCHES:-}" ]; then
+    t=$(touches_of "$top" | grep -c .); [ "$t" -gt "$TEAM_MAX_TOUCHES" ] && { echo "too big for this agent ($t files > $TEAM_MAX_TOUCHES)"; return 0; }
+  fi
+  for t in $(others_tasks); do
+    [ "$(claim_key "$t")" = "$k" ] && continue
+    overlap "$top" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }
+  done
+  return 0
+}
+team_takeover_facts() {  # team-takeover pick's input: one line per claim another running agent holds
+  local o a f k ranks me
+  ranks=$(team_ranks); me=$(agent_speed "$AGENT_ID")
+  for o in "$TEAM"/claims/*/owner; do
+    [ -f "$o" ] || continue
+    read -r a _ _ f < "$o"; k=$(basename "$(dirname "$o")")
+    case $k in 000|999) continue ;; esac
+    [ -n "$a" ] && [ "$a" != "$AGENT_ID" ] && agent_running "$a" || continue
+    [ -d "$TEAM/takeover/$k" ] && continue   # another agent asked for it already
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$a" "$(agent_speed "$a")" "$me" "$(claim_rank "$k" "$ranks")" "$(team_takeover_why_not "${f%/tasks/*}" "$k")"
+  done
+}
+team_takeover_candidate() {  # the claim this agent would ask for now, or nothing
+  [ "${TEAM_TAKEOVER:-1}" = 1 ] && team_has_slower || return 0
+  team_takeover_facts | team-takeover pick 2>/dev/null
+}
+team_takeover_ask() {  # team_takeover_ask : an agent with nothing to build asks for a slower agent's claim; true while its request is open
+  [ "${TEAM_TAKEOVER:-1}" = 1 ] || return 1
+  local d a k o top why
+  for d in "$TEAM"/takeover/*/; do   # its earlier request: open while the holder still holds the claim
+    [ -f "$d/asker" ] || continue; read -r a _ < "$d/asker"; [ "$a" = "$AGENT_ID" ] || continue
+    k=$(basename "$d"); o=$(claim_owner "$k")
+    [ -n "$o" ] && [ "$o" != "$AGENT_ID" ] && agent_running "$o" && return 0
+    rm -rf "$d"   # given to this agent, finished, released, or its holder stopped
+  done
+  team_has_slower || return 1
+  why=$(mktemp); k=$(team_takeover_facts | team-takeover pick 2> "$why"); why=$(cat "$why"; rm -f "$why")
+  [ -n "$k" ] || return 1
+  mkdir -p "$TEAM/takeover"; mkdir "$TEAM/takeover/$k" 2>/dev/null || return 1
+  echo "$AGENT_ID $$ $(date +%s) $PWD" > "$TEAM/takeover/$k/asker"   # the loop runs in its checkout
+  read -r o _ _ top <<<"$(owner_line "$k")"
+  tev takeover_asked "$top" "from agent $o: $(grep "^$k " <<<"$why" | head -1)"
+  log "team: nothing to build - asked agent $o for $k (a slower agent; other tasks wait on it)"
+  return 0
+}
+team_put_back() {  # team_put_back <key> <why> [paths] : that task's files on this branch become main's again; its other work stays
+  local k=$1 p co="" rm="" paths
+  if [ $# -ge 3 ]; then paths=$3
+  else paths=$(team-takeover paths "$k" main HEAD .agent/iterations.jsonl 2>/dev/null) || return 1; fi   # failed: nothing changed
+  for p in $paths; do
+    if git cat-file -e "main:$p" 2>/dev/null; then co+=" $p"; else rm+=" $p"; fi
+  done
+  # shellcheck disable=SC2086
+  [ -z "$co" ] || git checkout -q main -- $co || log "WARNING team: could not put back $k's files: $co"
+  # shellcheck disable=SC2086
+  [ -z "$rm" ] || git rm -q -r --ignore-unmatch -- $rm > /dev/null || log "WARNING team: could not remove $k's new files: $rm"
+  git diff --cached --quiet || git commit -q -m "[driver] $k $2: its files on this branch put back as main has them"
+}
+team_takeover_give() {  # team_takeover_give <key> now|later : the holder gives its claim to the agent that asked for it
+  local k=$1 d=$TEAM/takeover/$1 a ap aw top sha paths err
+  read -r a ap _ aw < "$d/asker" || return 0
+  if ! kill -0 "$ap" 2>/dev/null; then rm -rf "$d"; tev takeover_dropped "" "$k: agent $a's loop is gone"; return 0; fi
+  [ "$2" = now ] && commit_leftovers "before giving $k to agent $a"
+  sha=$(git rev-parse HEAD); err=$(mktemp)
+  # without the task's paths its work would stay on this branch and reach main: then the claim stays here
+  if ! paths=$(team-takeover paths "$k" main "$sha" .agent/iterations.jsonl 2> "$err"); then
+    log "WARNING team: team-takeover paths failed for $k ($(head -c 200 "$err")) - not giving it to agent $a"; rm -f "$err"; return 0
+  fi
+  paths=$(echo $paths)
+  top=$(compgen -G "tasks/$k-*.md" | head -1); [ -n "$top" ] || top=tasks/$(basename "$(owner_line "$k" | cut -d' ' -f4)")
+  # In this order, so a watcher stopped half-way (the session ended) leaves nothing wrong: the work for the asker, this
+  # branch's put-back (settle skips it while the claim is still this agent's), then the claim, then the request.
+  mkdir -p "$TEAM/carry"
+  printf '%s %s\n%s\n' "$AGENT_ID" "$sha" "$paths" > "$TEAM/carry/.$k.$$" && mv "$TEAM/carry/.$k.$$" "$TEAM/carry/$k"
+  echo "$a $paths" > ".agent/put-back-$k"
+  echo "$a $ap $(date +%s) $aw/$top" > "$TEAM/claims/$k/.owner.$$" && mv "$TEAM/claims/$k/.owner.$$" "$TEAM/claims/$k/owner"
+  rm -rf "$d"; rm -f ".agent/progress-$k"
+  [ "$2" = now ] && team_takeover_settle
+  tev takeover "$top" "to agent $a: $(wc -w <<<"$paths") file(s) of its work go with it ($(git rev-parse --short "$sha"))$(sed 's/^/; /' "$err" | tr -d '\n' | cut -c1-200)"
+  log "team: gave $k to agent $a (a faster agent with nothing to build; other tasks wait on it) - $(wc -w <<<"$paths") file(s) of its work go with it"
+  rm -f "$err"
+}
+team_takeover_settle() {  # put back the files of claims given away during a session (before anything is verified or merged)
+  local f k a paths
+  for f in .agent/put-back-*; do
+    [ -f "$f" ] || continue
+    k=${f#.agent/put-back-}; read -r a paths < "$f"
+    [ "$(claim_owner "$k")" = "$AGENT_ID" ] || team_put_back "$k" "taken over by agent $a" "$paths"   # still its own: the give never finished
+    rm -f "$f"
+  done
+  return 0
+}
+team_takeover_answer() {  # the holder, between sessions: gives every claim of its that was asked for
+  local d k
+  for d in "$TEAM"/takeover/*/; do
+    [ -f "$d/asker" ] || continue; k=$(basename "$d")
+    [ "$(claim_owner "$k")" = "$AGENT_ID" ] && team_takeover_give "$k" now
+  done
+  return 0
+}
+team_takeover_receive() {  # the work of a claim given to this agent, onto its branch
+  local c k h sha paths base p
+  for c in "$TEAM"/carry/*; do
+    [ -f "$c" ] || continue; k=$(basename "$c")
+    read -r h sha < "$c"
+    [ "$h" != "$AGENT_ID" ] && [ "$(claim_owner "$k")" = "$AGENT_ID" ] || continue
+    paths=$(sed -n 2p "$c"); team_sync || true
+    if [ -n "$paths" ]; then
+      base=$(git merge-base main "$sha")
+      # shellcheck disable=SC2086
+      if git diff --binary "$base" "$sha" -- $paths | git apply --index --check 2>/dev/null; then
+        git diff --binary "$base" "$sha" -- $paths | git apply --index
+      else   # main changed those files since: the holder's version wins (no other agent could hold them)
+        for p in $paths; do
+          if git cat-file -e "$sha:$p" 2>/dev/null; then git checkout -q "$sha" -- "$p"; else git rm -q -r --ignore-unmatch -- "$p" > /dev/null; fi
+        done
+        tev takeover_carry_overwrite "" "$k: $paths"; log "team: $k's work did not apply cleanly on main - took agent $h's version of its files"
+      fi
+      git diff --cached --quiet || git commit -q -m "[driver] $k taken over from agent $h: its work carried ($h@$(git rev-parse --short "$sha"))"
+    fi
+    echo "$h $(git rev-parse --short "$sha")" > ".agent/taken-over-$k"
+    rm -f "$c"; tev takeover_carried "" "$k from agent $h: $(wc -w <<<"$paths") file(s)"
+    log "team: took over $k from agent $h - $(wc -w <<<"$paths") file(s) of its work carried into $BRANCH"
+  done
+  return 0
+}
+team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; }   # before every pick
+TAKEOVER_CUT=""
+team_takeover_poll() {  # team_takeover_poll [task file of the running session] : during a session, every TEAM_TAKEOVER_POLL_S
+  local cur="" d k a
+  [ -n "${1:-}" ] && cur=$(claim_key "$1")
+  for d in "$TEAM"/takeover/*/; do
+    [ -f "$d/asker" ] || continue; k=$(basename "$d")
+    [ "$(claim_owner "$k")" = "$AGENT_ID" ] || continue
+    if [ "$k" != "$cur" ]; then team_takeover_give "$k" later; continue; fi   # parked: given at once
+    [ "$TAKEOVER_CUT" = "$k" ] && continue
+    read -r a _ < "$d/asker"; TAKEOVER_CUT=$k
+    echo "agent $a, on a faster card, has nothing to build and takes this task over (other tasks wait on it)" > .agent/handover-now
+    tev takeover_cut "$1" "asked by agent $a"; log "team: agent $a asked for $k - this session is told to write its hand-over and end"
+  done
+  return 0
+}
+team_session_watch() { TAKEOVER_CUT=""; while sleep "${TEAM_TAKEOVER_POLL_S:-20}"; do team_beat; team_takeover_poll "$1"; done; }   # team_session_watch <task file> : background, during a build session
+team_takeover_note() {  # team_takeover_note <task file> : the prompt's note on a task just taken over (its first session only)
+  local f h s; f=.agent/taken-over-$(claim_key "$1")
+  [ -f "$f" ] || return 0; read -r h s < "$f"; rm -f "$f"
+  printf '%s' " TAKEN OVER: agent $h, on a slower card, was building this task; the driver gave it to you because other tasks wait on it. Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read the hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
 }
 
 # Prep: an agent with nothing to take prepares a task that starts soon (its dependencies are being built, or could
@@ -518,7 +726,9 @@ team_prep_watch() {  # team_prep_watch <task file> : in the background during a 
   local f=$1 t why
   while sleep "${TEAM_PREP_POLL_S:-20}"; do
     team_beat
+    team_takeover_poll   # this agent's own claims a faster agent asked for are given at once (none is being built)
     if prep_ready "$f"; then why="task $(task_id "$f") can be built now (its dependencies are in main, or another agent took it)"
+    elif t=$(team_takeover_candidate) && [ -n "$t" ]; then why="task $t, held by slower agent $(claim_owner "$t"), can be taken over by you (other tasks wait on it)"
     else t=$(next_task); [ -n "$t" ] || continue; why="task $(task_id "$t") is free for you to build"; fi
     echo "$why" > .agent/wrapup-now
     log "prep $(task_id "$f"): $why - the session is told to write its notes and end"; tev prep_cut "$f" "$why"

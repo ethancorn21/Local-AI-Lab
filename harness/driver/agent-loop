@@ -314,19 +314,23 @@ pending_subtasks() {
   echo "$n"
 }
 has_subtasks() { compgen -G "tasks/$1[a-z]*-*.md" > /dev/null; }
-workable() {  # workable <file> in-progress|open
+workable() {  # workable <file> in-progress|open|any
   local s; s=$(status_of "$1")
   grep -qxF -- "$1" <<<"${WAITING:-}" && return 1   # waits for the human's answer to a request
   [ "$(pending_subtasks "$(task_id "$1")")" -eq 0 ] || return 1
-  if [ "$2" = in-progress ]; then [ "$s" = in-progress ]; else [ "$s" = open ] || [ "$s" = split ]; fi || return 1
+  case $2 in
+    in-progress) [ "$s" = in-progress ] ;;
+    open) [ "$s" = open ] || [ "$s" = split ] ;;
+    *) [ "$s" = in-progress ] || [ "$s" = open ] || [ "$s" = split ] ;;
+  esac || return 1
   [ -z "${TEAM_DIR:-}" ] || [ -n "${TEAM_IGNORE:-}" ] || team_workable "$1"   # claims, dependencies, file overlap
 }
 next_task() {
   local f
-  for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" in-progress && { echo "$f"; return; }; done
-  if [ -n "${TEAM_DIR:-}" ] && [ -z "${TEAM_IGNORE:-}" ]; then   # a team takes the critical path first (agent-team-lib)
-    for f in $(team_pick_order); do workable "$f" open && { echo "$f"; return; }; done; return
+  if [ -n "${TEAM_DIR:-}" ] && [ -z "${TEAM_IGNORE:-}" ]; then   # a team: its own claims first, then the critical path (agent-team-lib)
+    for f in $(team_pick_order); do workable "$f" any && { echo "$f"; return; }; done; return
   fi
+  for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" in-progress && { echo "$f"; return; }; done
   for f in tasks/[0-9]*.md; do [ -f "$f" ] && workable "$f" open && { echo "$f"; return; }; done
 }
 # New tasks, changed human criteria and proposals go to the loop log (task-audit prints one line per finding).
@@ -441,7 +445,7 @@ wait_for_human() {
   t0=$(date +%s); last=$t0
   while [ "$(asks_with answered)" = "$a0" ] && [ -n "$(asks_with open)" ] && ! { [ -n "$WAITING" ] && inbox_pending; }; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
-    [ -n "${TEAM_DIR:-}" ] && team_beat
+    [ -n "${TEAM_DIR:-}" ] && { team_beat; team_takeover_answer; }   # a faster agent may take a parked claim meanwhile
     sleep 30; now=$(date +%s)
     ask_deadline && break
     if [ $((now - last)) -ge $((ASK_REMIND_HOURS * 3600)) ]; then
@@ -787,7 +791,7 @@ prep_iteration() {  # prep_iteration <task file>
      harness: $harness}' >> "$LEDGER"
   PREP_FILE=""
 }
-[ -n "${TEAM_DIR:-}" ] && team_handover_finish   # a hand-over marked while this loop was stopped
+[ -n "${TEAM_DIR:-}" ] && { team_handover_finish; team_takeover_settle; }   # a hand-over or takeover left half done while this loop was stopped
 # team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
 if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
 task_scan
@@ -825,6 +829,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
   PREP=""
   while :; do
+    [ -n "${TEAM_DIR:-}" ] && team_takeover_sync   # claims asked for by a faster agent go to it; work of claims given to this one arrives
     WAITING=$(waiting_tasks)
     task=$(answered_first)
     [ -z "$task" ] && task=$(next_task)
@@ -839,6 +844,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
       # a team agent prepares upcoming work before it waits for the human (2026-10-05: agent a sat in this wait on a
       # request about 230 while b only prepared, held no task, and a had prep work it could do)
       if [ -n "${TEAM_DIR:-}" ]; then
+        team_takeover_ask && { team_wait; continue; }   # a slower agent's task that others wait on: real work first
         task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
         if [ -n "$(others_tasks)" ]; then team_wait; continue; fi
       fi
@@ -847,7 +853,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     if [ -n "${TEAM_DIR:-}" ]; then   # wait for the other agents, or (lead agent, nobody holding work) check the goal
       decision=$(team_idle_decision)
       case $decision in
-        wait) task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
+        wait) team_takeover_ask && { team_wait; continue; }   # a slower agent's task that others wait on: real work before prep
+              task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
               team_wait; continue ;;
         stop) log "team: stopping - $(cat "$TEAM/STOP" 2>/dev/null)"; task=""; break ;;
         force*) task=${decision#force }
@@ -898,6 +905,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     PROMPT="$PROMPT$(team_prompt)"
     pn=$(team_prep_note "$task"); PROMPT="$PROMPT$pn"
     [[ $pn == " PREP NOTES:"* ]] && { tev prep_used "$task"; log "iteration $i starts from the prep notes $(prep_file "$task")"; }
+    tn=$(team_takeover_note "$task"); PROMPT="$PROMPT$tn"
+    [ -n "$tn" ] && { tev takeover_used "$task"; log "iteration $i continues the work of the agent $task was taken over from"; }
     split=$(team_split_note "$task")
     [ -n "$split" ] && { PROMPT="$PROMPT$split"; log "$task is too big for another agent: this session is told to split it"; tev split_asked "$task"; }
   fi
@@ -947,8 +956,11 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
                 [ "$n" -gt 51200 ] && log "WARNING: $f is $((n / 1024)) KB, over Pi's 50 KB single-read limit" >&2
               done | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add')
   n4=$(printf %04d "$i")
-  rm -f .agent/stalled
+  rm -f .agent/stalled .agent/handover-now
+  twpid=""; [ -n "${TEAM_DIR:-}" ] && { team_session_watch "$task" 9>&- & twpid=$!; }   # takeover requests, answered during the session
   run_session
+  [ -n "$twpid" ] && { kill "$twpid" 2>/dev/null; wait "$twpid" 2>/dev/null; }
+  rm -f .agent/handover-now
   t1=$(date -Iseconds); s1=$(date +%s)
   HANDOVER_GUARD=false; ho_changed=null
   if [ "$HANDOVER_MODE" = task ] && [ -f "$task" ]; then
@@ -964,6 +976,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     leftovers=true; code_leftovers=$(git status --porcelain | grep -cvE ' (PROGRESS|DECISIONS|CODEMAP)\.md$| codemap/')
   fi
   commit_leftovers "uncommitted work after iteration $i"
+  [ -n "${TEAM_DIR:-}" ] && team_takeover_settle   # claims given away during the session: their files leave this branch before anything is verified
   if [ "$(agent_commits)" -gt "$before" ]; then no_progress=0
   elif [ "$code_leftovers" -gt 0 ]; then no_progress=0; log "no agent commit, but the driver saved $code_leftovers changed code file(s) - counts as progress"
   elif ! server_ok; then log "model server down during iteration $i - not counted toward the no-progress limit"
@@ -990,7 +1003,8 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
     if [ "$VERIFY" = accepted ] && team_merge "$task" && [ "$(task_id "$task")" = "$(claim_key "$task")" ]; then release_claim "$task"; fi
     [ "$status_after" = dropped ] && [ "$(task_id "$task")" = "$(claim_key "$task")" ] && release_claim "$task"
-    case $status_after in done|dropped) ;; *) [ -f "$task" ] && team_handover_check "$task" "${ticked0:-0}" ;; esac
+    # a faster agent asked for this task: it goes to that agent before the next pick, with its work (not a hand-over)
+    case $status_after in done|dropped) ;; *) [ -f "$task" ] && [ ! -f "$TEAM/takeover/$(claim_key "$task")/asker" ] && team_handover_check "$task" "${ticked0:-0}" ;; esac
   fi
   if [ "$status_after" = blocked ]; then   # blocked while a request is open: it resumes when that is answered
     for a in $(asks_with open); do grep -qxF -- "$task" "${a%.md}.waiters" 2>/dev/null || echo "$task" >> "${a%.md}.waiters"; done

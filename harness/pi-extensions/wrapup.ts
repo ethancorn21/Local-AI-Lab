@@ -6,8 +6,9 @@
  *  - soft limit: after a turn that ends in tool calls with context >= SOFT, steer the agent with a hand-over message
  *  - compaction is always cancelled: a summary lets the session run on with a blurred memory of its own work
  *  - hard stop: MAX_TURNS turns after the steer, or context >= HARD, abort and exit; the driver commits leftovers
- *  - driver signal (prep sessions): when the driver writes .agent/wrapup-now (the task being prepared can be built now,
- *    or other work is free), the same steer, tool limit and hard stop apply, with DRIVER_TURNS turns
+ *  - driver signal: when the driver writes .agent/wrapup-now in a prep session (the task being prepared can be built
+ *    now, or other work is free), or .agent/handover-now in a build session (a faster agent takes the task over, team
+ *    mode, 2026-10-06), the same steer, tool limit and hard stop apply, with DRIVER_TURNS turns
  *  - a prep session (WRAPUP_PREP_FILE set) hands over into its notes file, not the task's hand-over; and once its
  *    context reaches PREP_CHECKPOINT with no notes file yet, it is told to write what it has now and go on (agent b,
  *    2026-10-05: read ~90k tokens for 231, then tried to write all its notes in one last call at the window's edge;
@@ -41,8 +42,8 @@ const PREP_FILE = process.env.WRAPUP_PREP_FILE ?? "";   // a prep session: these
 const DRIVER_TURNS = Number(process.env.WRAPUP_DRIVER_TURNS ?? 4);
 const PREP_CHECKPOINT = Number(process.env.WRAPUP_PREP_CHECKPOINT_TOKENS ?? Math.round(SOFT * 0.6));
 
-const message = (tokens: number) =>
-	`[harness] CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token hand-over limit. ` +
+const handoverMessage = (why: string, turns = MAX_TURNS) =>
+	`[harness] ${why} ` +
 	`Stop the current step now and hand over to a fresh agent. From now on only these tools work: reading or editing ` +
 	`PROGRESS.md, DECISIONS.md and task files, and git add/commit/status/diff. Do not run tests or read other files.\n` +
 	(TASK_HANDOVER
@@ -54,8 +55,10 @@ const message = (tokens: number) =>
 	`3. Only then, if turns remain: refine the notes (failed attempts go in DECISIONS.md) and commit again. If this step ` +
 	`turned out too big for one session, split what remains of the task into subtask files now (AGENTS.md, Tasks).\n` +
 	`4. End your turn with no further tool calls.\n` +
-	`The harness ends this session after ${MAX_TURNS} more turns regardless: anything not committed by then is saved ` +
+	`The harness ends this session after ${turns} more turns regardless: anything not committed by then is saved ` +
 	`by the harness, but your notes should be committed by step 2.`;
+const message = (tokens: number) =>
+	handoverMessage(`CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token hand-over limit.`);
 
 const prepMessage = (why: string) =>
 	`[harness] ${why} Stop researching now. From now on only these tools work: reading or editing task files and ` +
@@ -125,21 +128,24 @@ export default function (pi: ExtensionAPI) {
 			? prepMessage(`CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token limit.`)
 			: message(tokens), { deliverAs: "steer" });
 	};
-	// The driver's signal: a steer from outside the session (a prep session whose task can be built now). Delivered
-	// once a second at most, like the human's messages, and only while the agent runs (a steer needs a running agent).
-	const signal = join(process.cwd(), ".agent", "wrapup-now");
+	// The driver's signal: a steer from outside the session (a prep session whose task can be built now, or a build
+	// session whose task a faster agent takes over). Each kind has its own file, so a prep signal left behind never ends
+	// a build session. Delivered once a second at most, like the human's messages, and only while the agent runs (a
+	// steer needs a running agent).
+	const signal = join(process.cwd(), ".agent", PREP_FILE ? "wrapup-now" : "handover-now");
 	let running = false;
 	pi.on("agent_start", async () => { running = true; });
 	pi.on("agent_end", async () => { running = false; });
 	const iv = setInterval(() => {
-		if (!PREP_FILE || !running || steered || stopping || !existsSync(signal)) return;
+		if (!running || steered || stopping || !existsSync(signal)) return;
 		let why = "";
 		try { why = readFileSync(signal, "utf8").trim(); unlinkSync(signal); } catch { return; }
 		steered = true;
 		turnsSinceSteer = 0;
 		turnLimit = DRIVER_TURNS;
 		mark(`driver-stop ${why.slice(0, 160)}`);
-		pi.sendUserMessage(prepMessage(`PREP ENDS NOW: ${why}.`), { deliverAs: "steer" });
+		pi.sendUserMessage(PREP_FILE ? prepMessage(`PREP ENDS NOW: ${why}.`) : handoverMessage(`HAND-OVER NOW: ${why}.`, DRIVER_TURNS),
+			{ deliverAs: "steer" });
 	}, 1000);
 	iv.unref?.();
 	const stop = (ctx: any, why: string) => {

@@ -173,4 +173,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 arrived. |
+| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 arrived; takeover (an idle fast agent takes the slow card's critical task, with its work). |

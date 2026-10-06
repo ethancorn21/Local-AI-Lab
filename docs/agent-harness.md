@@ -150,11 +150,17 @@ its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`), with its s
   another agent holds a task whose `Touches:` files overlap.
 - **Size.** An agent can be limited to tasks that touch at most N files (`TEAM_MAX_TOUCHES`: 8 for agent b). A task too
   big for another running agent gets split first, into new top-level tasks it can take.
-- **Who takes what.** A task's rank is the length of the longest chain of open tasks waiting on it. Fast agents take
-  the highest rank first; a slower agent (`TEAM_SPEED`) takes the lowest first while a faster one runs, so the fast
-  card never waits on the slow one.
+- **Who takes what.** A task's rank is the length of the longest chain of open tasks waiting on it. An agent finishes
+  its own claims first, the highest rank first. For new work, fast agents take the highest rank first; a slower agent
+  (`TEAM_SPEED`) takes the lowest first while a faster one runs, so the fast card rarely waits on the slow one.
+- **Takeover.** When the slow agent holds a task that others wait on anyway (it was the only one free) and a faster
+  agent has nothing to build, the faster agent asks for it before it prepares anything. The holder's loop gives the
+  claim at once if the task is parked, or tells the session working on it to hand over (`.agent/handover-now`) and
+  gives it after. Only that task's work moves with it (`team-takeover paths`: its commits by subject and ledger); the
+  new owner's first prompt says it was taken over.
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
-  small agent gives the task up; its work is kept on a backup branch.
+  small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
+  holds other claims (a full reset once cost it a parked task's work).
 - **Sync and merge.** Before every session the driver merges `main` into the agent's branch. An accepted task goes into
   `main` under a lock, with the tests re-run if `main` changed; a conflict or a new failure reopens the task.
 - **Shared memory files merge cleanly.** Journals keep both sides' entries, generated files are regenerated, hand-over
@@ -197,10 +203,11 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_single_regression.sh` | One agent: identical logs, history and task files with the old and new driver |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
+| `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
 | `test_team_split.sh`, `test_team_handover.sh`, `test_team_deps.sh`, `test_team_restart.sh`, `test_replan.sh` | Splitting for the small agent, handing tasks over, dependency edge cases, restarts, re-planning |
 | `test_ask_deadline.sh`, `test_ask_human_ext.mjs` | The request deadline and the recommendation rule |
 | `test_gpu_lease.sh` | One project per GPU |
-| `test_stall_watchdog.sh`, `test_venv.sh`, `test_wrapup_signal.mjs`, `test_pi_live.py` | Hang handling, pinned Python packages, the prep cut, the live viewer |
+| `test_stall_watchdog.sh`, `test_venv.sh`, `test_wrapup_signal.mjs`, `test_pi_live.py` | Hang handling, pinned Python packages, the prep cut and the takeover hand-over, the live viewer |
 
 All in [analysis/tests/](../analysis/tests/).
 
@@ -226,6 +233,8 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-06 | `GOAL.md` numbers treated as intuition, settled with evidence | The human's numbers are feel, not measurement |
 | 10-06 | One project per GPU | Loops of other projects could share a card indefinitely |
 | 10-06 | Thinking cap back to 16k | 32k: same score for 1.8x the tokens; 8k: 6 of 14 instead of 11 |
+| 10-06 | Takeover: an idle fast agent takes the slow agent's critical task | a waited 47 min while b held 253 (five tasks behind it) and worked on 243b; the 3-session hand-over is for a stuck agent, not a slow one |
+| 10-06 | New driver logic in Python helpers, called from the bash | 1,700 lines of bash; bug 2 of 10-06 was glob order silently becoming policy. No rewrite: nobody reads it for its own sake |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for

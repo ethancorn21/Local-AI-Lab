@@ -178,9 +178,12 @@ waiting on it, itself included.
 241 (nothing waits on it)                            rank of 241 = 1 (a leaf)
 ```
 
+- An agent finishes its own claims first, the highest rank first, whatever its speed. (2026-10-06: agent b held 253,
+  which five tasks waited on, and 243b, which nothing did; its lowest-rank-first order picked 243b, and 253 lay parked
+  for 39 minutes while agent a waited.)
 - Fast agents take the highest rank first, so long chains start early.
 - A slower agent takes the lowest rank first while a faster agent is running: leaves, which nothing waits on, so a fast
-  agent never sits idle waiting for the slow card. Each agent's relative speed is a setting (`TEAM_SPEED`: 4 for a 3090
+  agent rarely sits idle waiting for the slow card (when it does: [takeover](#when-the-slow-card-holds-the-critical-path-takeover)). Each agent's relative speed is a setting (`TEAM_SPEED`: 4 for a 3090
   class card, 1 for the 5060 Ti). Alone, or with equal speeds, an agent takes the longest chain itself.
 - On a replay of the first team project, "lowest number first" (the old rule) left the fast agent idle 5 of 15 task
   lengths; critical-path-first, 3 of 13.
@@ -195,7 +198,8 @@ waiting on it, itself included.
   hand-over limit, less room for its start-up reading and its notes (about 50k tokens, ~200 KB, for the 5060 Ti agent).
 - **Handing a task to a bigger agent.** When the small agent has had 3 sessions in a row on a task without ticking a box
   while a bigger agent waits for work, the driver takes the task away from it (its half-done work is kept on a backup
-  branch) and the bigger agent gets it.
+  branch) and the bigger agent gets it. Only that task's files leave the small agent's branch if it holds other tasks
+  too (on 2026-10-06 a full reset threw away its work on a parked task, which it then did again).
 
 ### When an agent has nothing to build: prep
 
@@ -231,6 +235,38 @@ A real sequence from the first live day (2026-10-04): agent a builds 230. Agent 
 assumptions checked against a's branch), then 231. When 230 merges, a takes 242 and starts from b's notes. When 242
 merges, b's prep of 231 is cut; a takes 231 (most work behind it) with b's notes, and b takes 241, a one-file task
 nothing waits on.
+
+### When the slow card holds the critical path: takeover
+
+The rules above keep the slow agent off the critical path when they can, but not always: when the critical-path task
+is the only thing free, the slow agent takes it. On 2026-10-06 agent a merged 252 and went back to its own task 244;
+14 seconds later agent b took 253, which five tasks waited on. When a finished 244 it had nothing left to build and
+waited 47 minutes. Prep could not help: prep moves notes, never a claim (a had even written 253's notes the night
+before; b built from them). The 3-session hand-over did not help either: it is for an agent that is stuck, and b was
+only slow.
+
+So a fast agent with nothing to build **takes the task over**:
+
+- **Asking.** Before it prepares anything (real work beats notes), the fast agent looks at the claims of slower agents:
+  a task that other open tasks wait on (rank 2 or more), that it could build right now itself, and that is not
+  waiting for the human's answer. It asks for the one with the highest rank and waits. A prep session already
+  running is cut when such a task appears.
+- **Answering.** Only the holder's loop changes its own claim. If the task is parked (the holder is in a session on
+  something else, or between sessions), it gives the claim within 20 seconds. If a session is working on that very
+  task, the session is told to write its hand-over and commit (the same signal that cuts a prep session, here
+  `.agent/handover-now`); the claim goes when the session ends, a few turns later.
+- **What moves.** The task's work, not the holder's whole branch: the files changed by commits named after the task
+  ("253: ...", or a driver commit after a session the ledger records on 253), and its task files. Files another task's
+  commits changed too stay put. The fast agent applies that work to its branch, and its first session's prompt says
+  so: read the hand-over, check the work, continue from it. The slow agent's branch gets those files back as `main` has
+  them, so half-done work never reaches `main` with its next task.
+
+Under these rules that afternoon would have gone: a asks for 253 at 14:37; b's session, on 253 at the time, is told to
+hand over; a few minutes later a builds 253 from b's checked plan instead of waiting until 15:24. (Not measured yet:
+the first live takeover will show how long the hand-over takes on the slow card.)
+
+The decisions behind this (which claim to ask for, which files belong to a task) are in a small Python helper,
+`team-takeover`; the bash driver does the moving.
 
 ### What still runs on one agent
 
@@ -272,14 +308,15 @@ Per agent, in `~/.agent-kit/agents/<id>.env` (copied into every new team project
 
 Driver-wide (environment, defaults shown): `ITER_TIMEOUT` 2700 s per session, `TEAM_STALE_MIN` 120 (minutes before a
 dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 turns prep off),
-`TEAM_PREP_HANDOFF_S` 300, `TEAM_PREP_RESERVE_TOKENS` 25000.
+`TEAM_PREP_HANDOFF_S` 300, `TEAM_PREP_RESERVE_TOKENS` 25000, `TEAM_TAKEOVER` 1 (0 turns takeover off),
+`TEAM_TAKEOVER_POLL_S` 20.
 
 ## Glossary
 
 | Term | Meaning |
 |---|---|
 | Session (iteration) | One fresh agent run: start, orient, one step, notes, commit, exit |
-| Driver | `agent-loop` plus `agent-team-lib`: the bash script that runs the sessions and enforces the rules |
+| Driver | `agent-loop` plus `agent-team-lib`: the bash script that runs the sessions and enforces the rules, with small Python helpers for some decisions (`plan-schedule`, `team-takeover`) |
 | Task, subtask | A file in `tasks/` with a goal and acceptance boxes; `025a` is a subtask of `025` |
 | Acceptance criteria (boxes) | The checklist that defines done; the human's cannot be changed by agents |
 | Hand-over (notes) | The `## Hand-over` section a session leaves for the next one on the same task |
@@ -293,6 +330,7 @@ dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 t
 | Prep, prep notes | Notes an idle agent writes for a task that starts later |
 | Cut | The driver's signal that ends a prep session early because real work is free |
 | Hand-off | A claiming agent waiting for, and receiving, another agent's prep notes |
+| Takeover | A fast agent with nothing to build taking a task that others wait on from a slower agent, with its work so far |
 | Ledger | One JSON line per session with its result and the exact harness version |
 | Goal check | Task 999: the whole project checked against `GOAL.md` |
 | Sprint | Everything planned since the planning task last finished |

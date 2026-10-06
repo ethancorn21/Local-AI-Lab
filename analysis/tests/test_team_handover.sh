@@ -7,7 +7,7 @@ set -u
 D=${1:-$HOME/bin}
 T=$(mktemp -d); trap 'kill $apid 2>/dev/null; rm -rf "$T"' EXIT
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
-export HOME=$T/home; mkdir -p "$HOME/.agent-kit/agents"
+export HOME=$T/home PATH="$D:$PATH"; mkdir -p "$HOME/.agent-kit/agents"
 printf 'LLM_URL=x\n' > "$HOME/.agent-kit/agents/a.env"
 printf 'LLM_URL=y\nTEAM_MAX_TOUCHES=8\n' > "$HOME/.agent-kit/agents/b.env"
 P=$T/proj; mkdir -p "$P/tasks"; cd "$P"

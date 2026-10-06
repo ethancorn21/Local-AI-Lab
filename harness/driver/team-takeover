@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""team-takeover : the decisions behind a takeover in team mode (agent-team-lib, "Takeover"); bash does the moving.
+
+team-takeover pick < facts
+    Which claim an idle agent asks for. stdin, one line per claim another live agent holds, written by agent-team-lib's
+    team_takeover_facts with the driver's own dependency, size and file-overlap checks (so this can never disagree with
+    the scheduler about what is free):
+        <key> TAB <holder> TAB <holder's speed> TAB <this agent's speed> TAB <rank> TAB <why this agent cannot build it>
+    A claim qualifies when its holder is slower, other open tasks wait on it (rank 2 or more: the task itself plus at
+    least one behind it) and the last field is empty. Prints the key with the highest rank (lowest key on a tie), or
+    nothing. stderr: one line per claim, why it was or was not chosen.
+
+team-takeover paths <key> <base> <head> [ledger]
+    The files one task's work changed on a branch, so that work can move to another branch, or off this one, without
+    the branch's other work (a hand-over used to reset the whole branch to main, and agent b lost its work on 253 when
+    243 was handed over, 2026-10-06). Commits in base..head, merges skipped, are attributed by subject:
+        "253: ...", "253b: ...", "[driver] 253: ...", "[driver] stall note for 253: ...",
+        "[driver] uncommitted work before handing 253 over", "... before merging 253 into main", "... giving 253 ...",
+        "[driver] uncommitted work after iteration 84" (the ledger, .agent/iterations.jsonl, says which task 84 was).
+    stdout: the paths the task's commits changed that no other task's commits changed, plus its own task files
+    (tasks/<key>-*.md, tasks/<key><letter>-*.md) always, minus memory files every task writes (PROGRESS.md, DECISIONS*.md,
+    PITFALLS.md, CODEMAP.md, codemap/, tasks/prep/: journals and generated files that merge cleanly) and other tasks'
+    task files (dependency lines added there belong to the plan). stderr: "shared <path>" for a path other tasks changed
+    too (left where it is), "unknown <sha> <subject>" for commits it could not attribute (their files are left alone).
+"""
+import json, re, subprocess, sys
+
+MEMORY = re.compile(r"^(PROGRESS\.md|DECISIONS(-archive)?\.md|PITFALLS\.md|CODEMAP\.md|codemap/.*|tasks/prep/.*)$")
+TASK_FILE = re.compile(r"^tasks/(\d+)[a-z]*-[^/]*\.md$")
+SUBJECTS = [
+    re.compile(r"^(?:\[driver\] )?(?:prep )?(\d+)[a-z]*(?::|\s)"),     # agent commits, "[driver] 253: ...", "[driver] 240 split ..."
+    re.compile(r"^\[driver\] stall note for (\d+)[a-z]*\b"),
+    re.compile(r"^\[driver\] .*\bbefore (?:handing|merging|giving) (\d+)[a-z]*\b"),
+]
+AFTER_ITER = re.compile(r"^\[driver\] uncommitted work after iteration (\d+)\b")
+
+
+def key_of(task):
+    m = re.match(r"(\d+)", task.rsplit("/", 1)[-1])
+    return m.group(1) if m else None
+
+
+def pick(lines):
+    best = None
+    for line in lines:
+        if not line.strip():
+            continue
+        key, holder, hs, ms, rank, why = (line.rstrip("\n").split("\t") + [""] * 6)[:6]
+        try:
+            slower, rank = float(hs) < float(ms), int(rank)
+        except ValueError:
+            print(f"{key}: bad line {line.strip()!r}", file=sys.stderr)
+            continue
+        if not slower:
+            reason = f"agent {holder} is not slower"
+        elif rank < 2:
+            reason = "nothing waits on it"
+        elif why:
+            reason = why
+        else:
+            reason = ""
+            if best is None or (rank, -int(key)) > (best[1], -int(best[0])):
+                best = (key, rank)
+        print(f"{key} (agent {holder}, rank {rank}): {reason or 'can be taken over'}", file=sys.stderr)
+    if best:
+        print(best[0])
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+
+
+def iteration_tasks(ledger):
+    tasks = {}
+    if not ledger:
+        return tasks
+    try:
+        with open(ledger) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    tasks[int(r["iter"])] = key_of(r.get("task") or "")
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return tasks
+
+
+def attribute(subject, iters):
+    for rx in SUBJECTS:
+        m = rx.match(subject)
+        if m:
+            return m.group(1)
+    m = AFTER_ITER.match(subject)
+    if m:
+        return iters.get(int(m.group(1)))
+    return None
+
+
+def paths(key, base, head, ledger=None):
+    iters = iteration_tasks(ledger)
+    key = key.lstrip("0") or "0"
+    owners = {}   # path -> set of keys whose commits changed it
+    log = git("log", "--no-merges", "--format=%x00%H%x09%s", "--name-only", f"{base}..{head}")
+    for block in log.split("\0")[1:]:
+        head_line, _, files = block.partition("\n")
+        sha, _, subject = head_line.partition("\t")
+        k = attribute(subject, iters)
+        if k is None:
+            print(f"unknown {sha[:7]} {subject[:100]}", file=sys.stderr)
+            continue
+        for p in files.split("\n"):
+            if p.strip():
+                owners.setdefault(p.strip(), set()).add(k.lstrip("0") or "0")
+    out = []
+    for p in sorted(owners):
+        if MEMORY.match(p):
+            continue
+        t = TASK_FILE.match(p)
+        if t:   # task files belong to their task, whoever's commit changed them
+            if (t.group(1).lstrip("0") or "0") == key:
+                out.append(p)
+            continue
+        if key in owners[p]:
+            if owners[p] == {key}:
+                out.append(p)
+            else:
+                print(f"shared {p}", file=sys.stderr)
+    for p in out:
+        print(p)
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "pick":
+        pick(sys.stdin)
+    elif len(sys.argv) >= 5 and sys.argv[1] == "paths":
+        paths(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else None)
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
