@@ -49,6 +49,9 @@ def main():
             out.flush()
     except OSError:
         pass
+    # The reader thread may be blocked in stdin.readline; a normal exit would wait on that buffer's lock and abort
+    # ("could not acquire lock ... at interpreter shutdown", a core dump) whenever the server restarts.
+    os._exit(0)
 
 
 if __name__ == "__main__":

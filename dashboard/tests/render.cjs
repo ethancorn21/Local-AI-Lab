@@ -35,11 +35,12 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   const names = Object.keys(state.channels);
   const name = "demo.a", ch = state.channels[name];
   const tools = ch.events.filter(e => e.t === "tool").length;
+  const pane = () => d.getElementById(`say-${name}`)?.closest(".channel");   // this agent's pane on the live wall
 
   // live
   check("live: one pane per agent", d.querySelectorAll("#view .channel").length === names.length, d.querySelectorAll("#view .channel").length);
   check("live: pane shows the task", text("#view .ch-task").some(t => t === ch.meta.task), text("#view .ch-task"));
-  check("live: every tool call in the pane", d.querySelectorAll("#view .channel .tool").length === tools, d.querySelectorAll("#view .channel .tool").length);
+  check("live: every tool call in the pane", pane()?.querySelectorAll(".tool").length === tools, pane()?.querySelectorAll(".tool").length);
   check("live: HTML from the agent stays text", !w.PWNED && !d.querySelector("#view img") && !d.querySelector("#view .say b")
         && d.getElementById("view").textContent.includes('<img src=x onerror="window.PWNED=1">'));
   check("nav: agent listed, request counted", text("#nav-agents button").length === names.length && d.querySelector("#nav-main .n")?.textContent === "1");
@@ -48,15 +49,15 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   check("status: streaming count", d.getElementById("status").textContent.includes(`${names.length} streaming`), d.getElementById("status").textContent);
 
   // live updates: a new block, streamed text, a finished tool call
-  const n0 = d.querySelectorAll("#view .channel .say").length;
+  const n0 = pane().querySelectorAll(".say").length;
   push({ type: "ev", ch: name, ev: { id: "9-1", t: "say", text: "Streaming", done: false }, last: Date.now() / 1000 });
   push({ type: "upd", ch: name, id: "9-1", append: { text: " more" }, last: Date.now() / 1000 });
   push({ type: "ev", ch: name, ev: { id: "9-2", t: "tool", kind: "Edit", target: "web/feed.py", meta: "", running: true }, last: Date.now() / 1000 });
   push({ type: "upd", ch: name, id: "9-2", set: { running: false, meta: { add: 2, del: 1 }, body: { diff: [["-", "4", "old"], ["+", "4", "new()"], ["+", "5", "x"]], path: "web/feed.py" } }, last: Date.now() / 1000 });
   await tick();
-  const says = d.querySelectorAll("#view .channel .say");
+  const says = pane().querySelectorAll(".say");
   check("live: new block appended and streamed", says.length === n0 + 1 && says[says.length - 1].textContent.startsWith("Streaming more"), says[says.length - 1]?.textContent);
-  const lastTool = [...d.querySelectorAll("#view .channel .tool")].pop();
+  const lastTool = [...pane().querySelectorAll(".tool")].pop();
   check("live: tool call finished in place with its diff", lastTool?.querySelectorAll(".ln.add").length === 2 && lastTool.querySelector(".meta").textContent.includes("+2"),
         lastTool?.outerHTML.slice(0, 200));
   push({ type: "meta", ch: name, meta: { task: "a new task", task_id: "005" } });
@@ -127,7 +128,10 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   check("agent: reconnect resyncs this agent", posts.at(-1)?.url === "/api/resync" && posts.at(-1).body.ch === name);
   push({ type: "gone", ch: name });
   await tick();
-  check("agent: gone agent leaves the console", !text("#nav-agents button").length);
+  check("agent: gone agent leaves the console", text("#nav-agents button").length === names.length - 1, text("#nav-agents button"));
+  push({ type: "board", project: "demo", board: null });
+  await tick();
+  check("board: a dropped board leaves the nav", text("#nav-main button").some(t => t.includes("no sprint yet")), text("#nav-main button"));
 
   // the links down
   push({ type: "feed", feed: { connected: false } });

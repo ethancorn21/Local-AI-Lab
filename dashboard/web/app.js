@@ -80,7 +80,7 @@ function handle(m) {
       return notify(m.ch, "update", ev, m);
     }
     case "task": { const c = S.channels[m.ch]; if (!c) return; c.snap = m.snap; notify(m.ch, "task"); return renderChrome(); }
-    case "board": S.boards[m.project] = m.board; return notify(null, "board");
+    case "board": if (m.board) S.boards[m.project] = m.board; else delete S.boards[m.project]; notify(null, "board"); return renderChrome();
     case "feed": S.feed = m.feed; return renderChrome();
     case "hw": S.hw = m.hw; return notify(null, "hw");
     case "hist": S.hist = m.hist; return notify(null, "hist");

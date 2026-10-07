@@ -8,7 +8,10 @@ reply containing HTML spliced in. Checks: the stream a browser gets carries ever
 answer text, the driver's loop.log lines, context size, the task panel and the sprint board; a second session starts
 cleanly; messages land in .agent/inbox, answers in .agent/asks and the open request leaves the panel; a resync replays
 the channel; the hidden project never reaches the console; the server refuses other Host headers, cross-site POSTs,
-oversized bodies and paths outside its file list; a dropped VM link shows and refuses commands. Then the page itself
+oversized bodies and paths outside its file list; a dropped VM link shows and refuses commands. A second agent's
+session holds a pytest summary with no "passed" and a line the shipper cannot read: each costs only itself, noted in
+that agent's feed. A shipper restart replays each pane in place, never wiping the page, and drops an agent that
+stopped meanwhile; ingest exits cleanly when the server goes away. Then the page itself
 (jsdom): every view renders from the captured state with no script errors, live updates land, agent text with HTML in
 it stays text.
 
@@ -38,7 +41,7 @@ PY = sys.executable
 SESS = open(sys.argv[1], "rb").read().splitlines(keepends=True)
 S = tempfile.mkdtemp(prefix="labdash-e2e-")
 P = f"{S}/projects"
-MAIN, WT, SECRET = f"{P}/demo", f"{P}/demo.a", f"{P}/secret"
+MAIN, WT, WT_B, SECRET = f"{P}/demo", f"{P}/demo.a", f"{P}/demo.b", f"{P}/secret"
 FAILS = []
 CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]")   # as in labdash-ship
 
@@ -75,7 +78,7 @@ Each feed row shows its source and age.
       relative to now
 - [ ] tests pass
 """
-for d in (MAIN, WT, SECRET):
+for d in (MAIN, WT, WT_B, SECRET):
     os.makedirs(f"{d}/.agent/sessions")
 write(f"{MAIN}/.agent/team-main", "")
 write(f"{MAIN}/tasks/001-scaffold.md", "Status: done\n# 001: Scaffold\n")
@@ -108,6 +111,24 @@ sess1 = open(f"{WT}/.agent/sessions/iter-0001.jsonl", "wb", buffering=0)
 def ev_line(o):
     return (json.dumps(o) + "\n").encode()
 
+
+# Agent b: no loop running (on the console because its session is recent). Its session holds what once took every
+# agent off the console: a pytest summary with failures and no "passed", and a line the shipper cannot read.
+def tool_pair(i, name, args, text):
+    return [ev_line({"type": "tool_execution_start", "toolCallId": f"t{i}", "toolName": name, "args": args}),
+            ev_line({"type": "tool_execution_end", "toolCallId": f"t{i}", "toolName": name, "isError": False,
+                     "result": {"content": [{"type": "text", "text": text}]}})]
+
+
+write(f"{WT_B}/.agent/team.env", f"TEAM_DIR={MAIN}\nAGENT_ID=b\nLLM_URL=http://127.0.0.1:8081/v1\n")
+SESS_B = b"".join(
+    tool_pair(1, "bash", {"command": "pytest -q"}, "FAILED tests/test_rows.py::test_one - Assertio...\n2 failed, 4 warnings in 11.50s")
+    + [ev_line({"type": "tool_execution_start", "toolCallId": "t2", "toolName": "bash", "args": ["not", "a", "dict"]})]
+    + tool_pair(3, "read", {"path": "web/feed.py", "limit": "forty"}, "line one\nline two")
+    + [ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_start"}}),
+       ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "after the bad line"}}),
+       ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_end"}})])
+write(f"{WT_B}/.agent/sessions/iter-0001.jsonl", SESS_B.decode())
 
 HTML_REPLY = '<img src=x onerror="window.PWNED=1"><b>bold?</b>'
 SPLICE = [ev_line({"type": "message_end", "message": {"role": "user", "content": [
@@ -278,6 +299,17 @@ try:
     check("sprint board", b and b["total"] == 4 and [x["id"] for x in b["done"]] == ["001"]
           and [(x["id"], x["agent"], x["boxes"]) for x in b["building"]] == [("002", "a", [1, 3])]
           and [(x["id"], x["waits"]) for x in b["open"]] == [("003", ["002"]), ("004", [])], b)
+    cb = wait_for(lambda: (lambda c: c if c and any(e.get("text") == "after the bad line" for e in c["events"]) else None)(state()["channels"].get("demo.b")))
+    evb = (cb or {}).get("events", [])
+    check("agent b on the console beside a", cb and cb["meta"].get("agent") == "b" and "demo.a" in state()["channels"], list(state()["channels"]))
+    check("pytest summary with failures and no 'passed' counted", any(e["t"] == "tool" and e["target"] == "pytest -q"
+          and e.get("meta") == {"pass": 0, "fail": 2} for e in evb), [e.get("meta") for e in evb if e["t"] == "tool"])
+    check("read with a non-numeric limit shown", any(e["t"] == "tool" and e["kind"] == "Read" and e.get("meta") == "2 lines" for e in evb))
+    check("unreadable line skipped and noted in b's feed", [e["text"][:40] for e in evb if e["t"] == "sys"] == ["console: skipped a session event it coul"],
+          [e["text"] for e in evb if e["t"] == "sys"])
+    check("b's stream goes on after it", bool(cb))
+    check("shipper logged the fault once", open(f"{S}/ship.log").read().count("fault in demo.b (a session event): AttributeError") == 1,
+          open(f"{S}/ship.log").read()[-400:])
     check("main checkout is not a channel", "demo" not in state()["channels"])
     check("hidden project never shipped", not any(n.startswith("secret") for n in state()["channels"]) and "secret" not in state()["boards"]
           and not any(b"SECRET-MARKER" in r for r in RAW))
@@ -332,8 +364,34 @@ try:
     check("dropped link shown", wait_for(lambda: state()["feed"]["connected"] is False))
     check("commands refused while down", post("/api/message", {"ch": "demo.a", "text": "hi"})[0] == 503)
     check("streams kept while down", "demo.a" in state()["channels"])
+
+    # ---- the shipper comes back (a restart): panes stay put, a loop that stopped meanwhile leaves
+    ship.kill()
+    ship.wait()
+    old = time.time() - 7 * 3600
+    os.utime(f"{WT_B}/.agent/sessions/iter-0001.jsonl", (old, old))
+    n_snap, n_reset = len(msgs(type="snapshot")), len(msgs(type="reset", ch="demo.a"))
+    ship = subprocess.Popen([PY, SHIP, "--stdio"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(f"{S}/ship2.log", "w"))
+    ingest = subprocess.Popen([PY, INGEST], env=env, stdin=ship.stdout, stdout=ship.stdin, stderr=open(f"{S}/ingest2.log", "w"))
+    check("reconnect: link back", wait_for(lambda: state()["feed"]["connected"]))
+    check("reconnect: b, stopped meanwhile, leaves", wait_for(lambda: msgs(type="gone", ch="demo.b") and "demo.b" not in state()["channels"]))
+    check("reconnect: a replayed in place, page never wiped", wait_for(lambda: len(msgs(type="reset", ch="demo.a")) > n_reset)
+          and len(msgs(type="snapshot")) == n_snap and not msgs(type="gone", ch="demo.a") and "demo.a" in state()["channels"])
+    st, _, body = post("/api/message", {"ch": "demo.a", "text": "back again"})
+    check("reconnect: commands work", st == 202 and wait_for(lambda: msgs(type="ack", id=json.loads(body).get("id"), ok=True)), (st, body))
+    check("reconnect: board kept", "demo" in state()["boards"])
+
     check("server log clean", "Traceback" not in open(f"{S}/server.log").read(), open(f"{S}/server.log").read()[-400:])
-    check("shipper log clean", "Traceback" not in open(f"{S}/ship.log").read(), open(f"{S}/ship.log").read()[-400:])
+    for lg in ("ship.log", "ship2.log"):
+        text = open(f"{S}/{lg}").read()
+        check(f"shipper log clean, no faults on the real session ({lg})", "Traceback" not in text and "fault in demo.a" not in text, text[-400:])
+    server.terminate()
+    try:
+        rc = ingest.wait(10)
+    except subprocess.TimeoutExpired:
+        rc = None
+    check("ingest exits cleanly when the server goes away", rc == 0 and "Fatal" not in open(f"{S}/ingest2.log").read(),
+          (rc, open(f"{S}/ingest2.log").read()[-300:]))
 
     # ---- the page
     try:

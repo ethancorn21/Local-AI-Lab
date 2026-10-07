@@ -54,8 +54,13 @@ flowchart LR
    socket.
 3. **labdash** (the server) keeps the last two sessions of each agent in memory, samples the hardware itself every 3
    seconds, and pushes everything to the browser as **Server-Sent Events** (one long HTTP response the server keeps
-   writing to; the browser's `EventSource` reconnects on its own if it drops).
-4. The operator's messages and answers go back down the same SSH connection; the shipper writes them into the agent's
+   writing to; the browser's `EventSource` reconnects on its own if it drops). When the shipper reconnects, the page
+   keeps every pane; the shipper replays each agent's current session into its pane, then sends the full list of
+   agents it has, and only agents missing from that list leave the page.
+4. **One agent's data cannot take the others down.** A line the shipper cannot read (a malformed event, or a bug in
+   how it reads one) is skipped, logged once per kind in the shipper's journal, and noted once in that agent's feed as
+   a driver line starting "console: skipped". The server does the same with a line from the shipper it cannot use.
+5. The operator's messages and answers go back down the same SSH connection; the shipper writes them into the agent's
    `.agent/inbox/` or `.agent/asks/<n>.md` exactly as `agent-watch` and `agent-talk` do, and acknowledges each one.
    Nothing on the AI box ever connects to the VM, so the firewall stays one-way.
 
@@ -134,8 +139,8 @@ python3 dashboard/tests/test_e2e.py <any .agent/sessions/iter-*.jsonl>
 ```
 
 Feeds a real session file into a fake team worktree the way Pi writes it, with an operator message and a reply
-containing HTML spliced in, and checks everything between the agent's files and the page (80+ checks, about 10
-seconds). The page checks run in jsdom: `npm i jsdom` in any directory, then set `NODE_PATH=<dir>/node_modules`.
+containing HTML spliced in, plus a second agent whose session holds lines that once crashed the shipper, and a
+shipper restart. It checks everything between the agent's files and the page (about 100 checks, under 10 seconds). The page checks run in jsdom: `npm i jsdom` in any directory, then set `NODE_PATH=<dir>/node_modules`.
 
 ## When something looks wrong
 
@@ -144,5 +149,7 @@ seconds). The page checks run in jsdom: `npm i jsdom` in any directory, then set
 | Red banner "console server is unreachable" | The page lost the server: the tunnel or the AI box is down | The page retries every 2 seconds and launchd restarts the tunnel; `/tmp/labdash-tunnel.log` on the Mac says why |
 | Banner "link from the agent VM is down" | The shipper's SSH connection dropped; streams stay where they stopped, hardware stays live | The shipper reconnects on its own; `journalctl -u labdash-ship` on the VM |
 | An amber pane, "stream stuck" | No events for 90 s while the model works | Reconnect on that pane (or `R` on an agent's page) replays its session from the file |
+| A driver line "console: skipped … it could not read" | The shipper met a line it cannot show; that one line is missing, the rest of the stream is fine | `journalctl -u labdash-ship` on the VM has the error (`fault in <agent> …`); worth a fix in `labdash-ship` and a case in the e2e test |
+| The banner flips up and down every ~10 s | The shipper is crashing and systemd restarts it | `journalctl -u labdash-ship` on the VM; this should not happen any more (see the line above) |
 | A message stays "sending…" | No acknowledgement from the shipper | The link is down; nothing was written. Send it again when it is back |
 | Anything else | | Reconnect all, then `journalctl -u labdash` on the AI box |

@@ -105,11 +105,19 @@ class Hub:
             return
         with self.lock:
             now = time.time()
-            if op == "hello":
-                self.channels.clear()
-                self.boards.clear()
+            if op == "hello":   # a reconnect: the page keeps every pane until the shipper resets it or says it is gone
                 self.feed.update(connected=True, since=now, host=str(o.get("host", ""))[:64])
-                self.broadcast({"type": "snapshot", **self.snapshot()})
+                self.broadcast({"type": "feed", "feed": self.feed})
+            elif op == "synced":   # the shipper's full list after a (re)connect: anything else stopped while it was away
+                keep, projects = o.get("channels"), o.get("projects")
+                if not isinstance(keep, list) or not isinstance(projects, list):
+                    return
+                for n in [n for n in self.channels if n not in keep]:
+                    del self.channels[n]
+                    self.broadcast({"type": "gone", "ch": n})
+                for p in [p for p in self.boards if p not in projects]:
+                    del self.boards[p]
+                    self.broadcast({"type": "board", "project": p, "board": None})
             elif op == "reset":
                 self.channels[ch] = {"meta": tidy(o.get("meta") or {}), "events": [], "idx": {}, "snap": None, "last": now}
                 self.broadcast({"type": "reset", "ch": ch, "meta": self.channels[ch]["meta"], "last": now})
@@ -190,6 +198,9 @@ HUB = Hub()
 
 # ------------------------------------------------------------------------------------------------ the ingest socket
 
+BAD_LINES = set()
+
+
 def feed_reader(conn):
     fh = conn.makefile("rb")
     try:
@@ -206,7 +217,13 @@ def feed_reader(conn):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
             if isinstance(o, dict):
-                HUB.handle(o)
+                try:
+                    HUB.handle(o)
+                except Exception as e:   # a line of the wrong shape costs that line, not the link
+                    kind = (str(o.get("op"))[:20], type(e).__name__)
+                    if kind not in BAD_LINES:
+                        BAD_LINES.add(kind)
+                        log(f"skipped a {kind[0]!r} line from the shipper: {kind[1]}: {e} (later ones like it not logged)")
     except OSError:
         pass
     finally:
