@@ -22,6 +22,18 @@ team-takeover paths <key> <base> <head> [ledger]
     PITFALLS.md, CODEMAP.md, codemap/, tasks/prep/: journals and generated files that merge cleanly) and other tasks'
     task files (dependency lines added there belong to the plan). stderr: "shared <path>" for a path other tasks changed
     too (left where it is), "unknown <sha> <subject>" for commits it could not attribute (their files are left alone).
+
+team-takeover cycles < facts
+    Tasks that wait on each other in a cycle, and which agent gets all of them (agent-team-lib, "Cycles"). frontpage
+    2026-10-07: 256 (agent c) waited for 257 and 257 (agent a) for 256 - a merge of either alone left main red - and
+    all three agents sat idle for four hours. stdin, one line per unfinished task, written by team_cycle_facts:
+        <id> TAB <its dependencies not finished in main> TAB <holder, or empty> TAB <holder's loop runs: 1|0>
+             TAB <holder's speed> TAB <number of files it touches>
+    A parent task also waits for its unfinished subtasks (025 for 025a). A task that depends on itself is a cycle too.
+    stdout, one line per cycle: <the agent that gets them, or - when no running agent holds any>
+        TAB <the cycle's task ids> TAB <claim keys of them that other agents hold>
+    The agent: of the running agents holding one of them, the fastest, then the one holding the most of the cycle's
+    files (the least work moves), then the lowest id.
 """
 import json, re, subprocess, sys
 
@@ -131,9 +143,78 @@ def paths(key, base, head, ledger=None):
         print(p)
 
 
+def sccs(nodes, edges):
+    """Tarjan's strongly connected components, without recursion (a long chain of tasks must not hit the limit)."""
+    index, low, on, stack, out, n = {}, {}, set(), [], [], 0
+    for root in nodes:
+        if root in index:
+            continue
+        work = [(root, iter(edges[root]))]
+        index[root] = low[root] = n; n += 1; stack.append(root); on.add(root)
+        while work:
+            v, it = work[-1]
+            w = next(it, None)
+            if w is not None:
+                if w not in index:
+                    index[w] = low[w] = n; n += 1; stack.append(w); on.add(w)
+                    work.append((w, iter(edges[w])))
+                elif w in on:
+                    low[v] = min(low[v], index[w])
+                continue
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[v])
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop(); on.discard(w); comp.append(w)
+                    if w == v:
+                        break
+                out.append(comp)
+    return out
+
+
+def task_order(t):
+    m = re.match(r"(\d+)(.*)", t)
+    return (int(m.group(1)), m.group(2)) if m else (10**9, t)
+
+
+def cycles(lines):
+    tasks = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        tid, deps, holder, running, speed, touches = (line.rstrip("\n").split("\t") + [""] * 6)[:6]
+        try:
+            speed, touches = float(speed or 0), int(touches or 0)
+        except ValueError:
+            print(f"bad line {line.strip()!r}", file=sys.stderr)
+            continue
+        tasks[tid] = (deps.split(), holder, running == "1", speed, touches)
+    edges = {t: [d for d in v[0] if d in tasks] for t, v in tasks.items()}
+    for t in tasks:   # a parent waits for its unfinished subtasks
+        if t[-1:].isalpha() and t[:-1] in tasks:
+            edges[t[:-1]].append(t)
+    for comp in sccs(sorted(tasks, key=task_order), edges):
+        if len(comp) == 1 and comp[0] not in edges[comp[0]]:
+            continue
+        comp.sort(key=task_order)
+        score = {}   # running holder -> (speed, files of the cycle it holds)
+        for t in comp:
+            _, holder, running, speed, touches = tasks[t]
+            if holder and running:
+                s = score.get(holder, (speed, 0))
+                score[holder] = (s[0], s[1] + touches)
+        to = min(score, key=lambda h: (-score[h][0], -score[h][1], h)) if score else "-"
+        keys = sorted({key_of(t) for t in comp if tasks[t][1] and tasks[t][1] != to}, key=int)
+        print(f"{to}\t{' '.join(comp)}\t{' '.join(keys)}")
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "pick":
         pick(sys.stdin)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "cycles":
+        cycles(sys.stdin)
     elif len(sys.argv) >= 5 and sys.argv[1] == "paths":
         paths(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else None)
     else:

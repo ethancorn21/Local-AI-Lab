@@ -5,6 +5,9 @@
 #   any  task: writes one line per `Touches:` path; a task with a `Stub-writes:` line also overwrites that file (an
 #        undeclared shared file: the conflict case). Then ticks its boxes and sets itself done.
 #   `Stub-sleep: N` in a task file: that task's step takes N more seconds.
+#   `Stub-needs: <id>` in a task file: its first session finds it cannot finish before task <id>, adds <id> to its
+#        `Depends on:` line, commits and ends (as agents are told); later sessions build it. Two tasks that need each
+#        other, held by two agents, are frontpage's 256/257 deadlock (2026-10-07).
 #   a prep session (team mode): writes the notes file it is asked for, plus a stray code file the driver must drop.
 #        With STUB_PREP_WAIT it first waits (up to that many seconds) for the driver's cut signal, .agent/wrapup-now,
 #        the way the wrapup extension makes a real session end.
@@ -26,6 +29,12 @@ if grep -q 'FIRST, before your task step' <<<"$PROMPT" || tail -6 DECISIONS.md 2
   git merge-base --is-ancestor main HEAD || git merge -q -X ours --no-edit -m "merge main (stub resolves)" main
 fi
 [ -n "$TASK" ] && ss=$(sed -n 's/^Stub-sleep:[[:space:]]*//p' "$TASK") && [ -n "$ss" ] && sleep "$ss"
+if [ -n "$TASK" ] && nd=$(sed -n 's/^Stub-needs:[[:space:]]*//p' "$TASK") && [ -n "$nd" ] && ! grep -qE "^Depends on:.*\b$nd\b" "$TASK"; then
+  sed -i -E "s/^Depends on:[[:space:]]*(none)?[[:space:]]*\$/Depends on: /; s/^(Depends on: .+)\$/\1, $nd/; s/^Depends on: \$/Depends on: $nd/" "$TASK"
+  sed -i '1s/.*/Status: in-progress/' "$TASK"
+  git add -A && git commit -q -m "$(basename "$TASK" .md | cut -d- -f1): cannot finish before $nd - added it to Depends on"
+  echo '{"type":"stub"}'; exit 0
+fi
 case $TASK in
   tasks/000-*)
     for f in "$STUB_FIXTURES"/*.md; do [ -e "tasks/$(basename "$f")" ] || cp "$f" tasks/; done   # a re-plan keeps the tasks it has

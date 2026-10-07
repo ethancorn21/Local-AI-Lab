@@ -119,6 +119,13 @@ telecloak app. Encryption is off by default (the human's choice, 2026-10-06: it 
   can still override; a later answer reaches the agent as a message. Human-only requests wait however long it takes.
   Why: on 2026-10-06 both frontpage agents sat idle 10-15 hours overnight on two requests while the human was busy.
 - **Reminders:** the doorbell rings once per new set of open requests and every 6 hours after.
+- **A task waits as blocked only while its request is open.** The answer is what resumes a blocked task, and nothing
+  else ever picks one. So a task set `blocked` with no open (or answered) request about it anywhere in the team, or
+  with a status the driver does not know, counts as in progress: when picked, the driver sets it in progress and the
+  prompt says to file the request first if the human is needed. Why: on 2026-10-07 agent a set 257 blocked "pending
+  the human's answer", but left filing the request to its next session (`ask_human` is off during a hand-over), and a
+  next session never came. The stuck rule in `AGENTS.md` (third failed attempt: set blocked, stop) led to the same
+  dead end; it now says to file the request too.
 - **Requests are untrusted input.** The agent reads web pages, so a request could carry an injected command: read any
   command in one before running it. The app shows plain text only.
 
@@ -170,6 +177,25 @@ merged from the others', so tasks the agents created do not become the human's.
   gives it after. Only that task's work moves with it (`team-takeover paths`: its commits by subject and ledger); the
   new owner's first prompt says it was taken over. Requests to the human live in the asking agent's checkout, so an
   answered request about a task another agent now holds is forwarded to that agent's inbox.
+- **Cycles.** Tasks whose `Depends on:` lines wait on each other (directly, through a chain, or a parent through its
+  subtasks) can never start one after the other. Before every pick the driver finds them (`team-takeover cycles`) and
+  gives all of a cycle's tasks to one agent: the fastest of the agents holding them, then the one holding most of the
+  cycle's files, so the least work moves. It asks for the others' claims through the takeover's ask and give, with their
+  work. For that agent a dependency on another task of the same cycle counts as met; its prompt says to build them
+  together, and the first one accepted takes the others' work into `main` with it. Why: on 2026-10-07, 256 (the v3 row
+  template, agent c) waited for 257 (its e2e test, agent a) and 257 for 256, because a merge of either alone left
+  `main` red; the old deadlock rule only fired when no other agent held a claim, and all three agents sat idle 4 hours.
+- **Finished claims are released.** A claim whose tasks are all done in `main` (they got there with another task's
+  merge, which carries the whole branch) is freed; it used to keep other tasks off its files for good.
+- **Stall: the net under every rule.** Each loop records what it is doing (`.agent/team/loops/<id>.state`: working,
+  waiting for other agents, for the human, for the model server, for a talk). When every running agent has waited for
+  the others `TEAM_STALL_MIN` (15) minutes, with tasks unfinished in `main` and no request to the human open anywhere,
+  nothing will change by itself: a deadlock no rule knows. The lead agent logs why each agent waits and tells the human
+  (doorbell, then every 6 hours while it lasts). Then each agent starts its own most important task anyway (the lead
+  also an unclaimed one), one per agent per stall and each task at most `TEAM_STALL_FORCES` (2) times. The prompt says
+  to do what it can, and if nothing can be done, to file a request saying what stops the team. So a stall ends in work
+  or in a request, which the human sees and the request deadline decides if nobody answers; never in silence. Why: on
+  2026-10-07 the human noticed the 4-hour deadlock only because the GPU fans had stopped.
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
   small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
   holds other claims (a full reset once cost it a parked task's work).
@@ -204,7 +230,8 @@ Why: on the first team project the small card's agent was busy only 44% of the t
 
 Every claim, wait, merge and conflict goes to `<project>/.agent/team/events.jsonl`. `agent-team status <name>` shows
 who holds what. A watcher (`analysis/team-watch.py`) alerts on conflicts, deadlocks, stale claims, agents held up 20+
-minutes, and loops that died.
+minutes, and loops that died; it runs only while a Claude session monitors the team. A stall (above) reaches the human
+from the driver itself.
 
 ## Tests of the harness
 
@@ -217,6 +244,8 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
 | `test_team_add.sh` | Adding an agent to an existing team: its checkout, its settings, and who owns each task |
+| `test_team_deadlock.sh` | The 2026-10-07 deadlock reproduced; cycles found and gathered on one agent with their work; dead statuses; finished claims released; the stall net (when it fires, when not, forced starts and their limits) |
+| `test_team_deadlock_e2e.sh` | Two stub agents whose tasks come to need each other: the cycle rule finishes the project; with it off, the stall net does; with both off, nothing moves (the old deadlock) |
 | `test_team_split.sh`, `test_team_handover.sh`, `test_team_deps.sh`, `test_team_restart.sh`, `test_replan.sh` | Splitting for the small agent, handing tasks over, dependency edge cases, restarts, re-planning |
 | `test_ask_deadline.sh`, `test_ask_human_ext.mjs` | The request deadline and the recommendation rule |
 | `test_gpu_lease.sh` | One project per GPU |
@@ -248,6 +277,7 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-06 | Thinking cap back to 16k | 32k: same score for 1.8x the tokens; 8k: 6 of 14 instead of 11 |
 | 10-06 | Takeover: an idle fast agent takes the slow agent's critical task | a waited 47 min while b held 253 (five tasks behind it) and worked on 243b; the 3-session hand-over is for a stuck agent, not a slow one |
 | 10-06 | New driver logic in Python helpers, called from the bash | 1,700 lines of bash, and a 10-06 bug was glob order silently becoming policy. No rewrite |
+| 10-07 | Cycles gathered on one agent; blocked needs an open request; the stall net | All three agents sat idle 4 hours on 256/257 waiting for each other, and the human found out from the silent GPU fans |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for

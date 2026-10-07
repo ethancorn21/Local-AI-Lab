@@ -275,6 +275,36 @@ happened live yet.
 The decisions behind this (which claim to ask for, which files belong to a task) are in a small Python helper,
 `team-takeover`; the bash driver does the moving.
 
+### When tasks wait on each other: cycles
+
+Agents add dependencies as they learn what their task needs, and sometimes two tasks end up needing each other. On
+2026-10-07, 256 (agent c, the new feed row template) and 257 (agent a, the browser test that checks those rows) were
+each "done" on their own branch, but merging either one alone would turn `main` red: the new template fails the old
+test, and the new test fails the old template. So each agent wrote the other task into its `Depends on:` line, and each
+waited for the other's task to reach `main`. That never happens. Everything else waited on those two, and all three
+agents sat idle for four hours. The old rule for this ("take one anyway") only fired when nobody held a claim.
+
+Now, before every pick, the driver looks for **cycles**: tasks that wait on each other, directly or through a chain.
+All of a cycle's tasks go to one agent (the fastest of their holders; then the one already holding most of their files,
+so the least work moves), through the same ask-and-give as a takeover, with each task's work so far. For that agent a
+dependency on another task of the same cycle counts as met. It builds them together on its one branch, and the first
+one accepted goes into `main` with the others' work in it, so `main` never sees one half without the other.
+
+### When nothing moves: the stall net
+
+The rules above each fix a deadlock someone has already seen. The **stall net** is for the ones nobody has seen yet.
+Each loop records what it is doing. When every running agent has been waiting for the others for 15 minutes, with
+tasks unfinished and no request to the human open, nothing will change by itself. Then:
+
+1. The lead agent logs why each agent is waiting and tells the human over Telegram (on 2026-10-07 the human only found
+   out because the GPU fans had gone quiet).
+2. Each agent starts its own most important task anyway (at most once per stall, and twice per task overall). Its
+   prompt says what happened: do what can be done, and if nothing can, file a request to the human saying exactly what
+   stops the work.
+
+So a stall always ends in work or in a request, and a request is something the human sees and the request deadline
+settles if nobody answers.
+
 ### What still runs on one agent
 
 Planning (000) and the goal check (999) are each done by one agent while the others have nothing to prepare (the plan
@@ -292,7 +322,9 @@ The driver handles the routine failures itself and reports the rest:
 | A session goes silent for 15 minutes | Stopped with everything it started; the next session's task file says what hung |
 | A done claim fails verification | Task reopened with the reasons in the journal |
 | A task runs 8 sessions without finishing | Flagged STALLED (and every 4 sessions after) |
-| Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
+| Tasks wait on each other in a cycle | All of them go to one agent, with their work, which builds them together ([cycles](#when-tasks-wait-on-each-other-cycles)) |
+| A task is set blocked, but no request to the human about it is open | Set back in progress; its next session is told to file the request first if it needs the human |
+| Every agent waits 15 minutes for the others, with work left and no request open | A stall: the human is told why each agent waits, and each agent starts its own most important task anyway ([stall](#when-nothing-moves-the-stall-net)) |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
 | An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets a Telegram message and answers by replying (confidential projects: encrypted, in the telecloak app) |
 | Nobody answers for 2 hours and there is nothing else to build | The agent goes ahead with its recommendation; the human is told and can still override. Things only a person can do (hardware, credentials, money, accounts) keep waiting |
@@ -316,7 +348,8 @@ Per agent, in `~/.agent-kit/agents/<id>.env` (copied into the agent's worktree b
 Driver-wide (environment, defaults shown): `ITER_TIMEOUT` 2700 s per session, `TEAM_STALE_MIN` 120 (minutes before a
 dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 turns prep off),
 `TEAM_PREP_HANDOFF_S` 300, `TEAM_PREP_RESERVE_TOKENS` 25000, `TEAM_TAKEOVER` 1 (0 turns takeover off),
-`TEAM_TAKEOVER_POLL_S` 20.
+`TEAM_TAKEOVER_POLL_S` 20, `TEAM_CYCLE_FIX` 1 (0 turns the cycle rule off), `TEAM_STALL_MIN` 15 (0 turns the stall
+net off), `TEAM_STALL_FORCES` 2.
 
 ## Glossary
 
@@ -338,6 +371,8 @@ dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 t
 | Cut | The driver's signal that ends a prep session early because real work is free |
 | Hand-off | A claiming agent waiting for, and receiving, another agent's prep notes |
 | Takeover | A fast agent with nothing to build taking a task that others wait on from a slower agent, with its work so far |
+| Cycle | Tasks that wait on each other, so none can start first; all of them go to one agent |
+| Stall | Every agent waiting for the others, with work left and nobody asked: the driver tells the human and starts work anyway |
 | Ledger | One JSON line per session with its result and the exact harness version |
 | Goal check | Task 999: the whole project checked against `GOAL.md` |
 | Sprint | Everything planned since the planning task last finished |

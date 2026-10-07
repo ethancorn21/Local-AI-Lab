@@ -130,8 +130,10 @@ A message starting with `[harness] CONTEXT LIMIT` ends the session: follow its s
 ## Stuck rule
 
 - Every failed attempt at a blocker gets logged in `DECISIONS.md` under that blocker, with its attempt number.
-- On the **3rd** failed attempt at the same blocker: set the task to `Status: blocked`, write in `DECISIONS.md` what
-  was tried and what a human or stronger model would need to know, commit, and stop.
+- On the **3rd** failed attempt at the same blocker: write in `DECISIONS.md` what was tried and what a human or
+  stronger model would need to know, file a request with `ask_human` (what you need, and your recommendation), set
+  the task to `Status: blocked`, commit, and stop. A blocked task waits only while its request is open: without one,
+  the driver sets it back in progress.
 - Do not work around a blocker by weakening or deleting tests.
 
 ## Never

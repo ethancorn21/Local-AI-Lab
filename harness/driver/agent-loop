@@ -318,6 +318,7 @@ workable() {  # workable <file> in-progress|open|any
   local s; s=$(status_of "$1")
   grep -qxF -- "$1" <<<"${WAITING:-}" && return 1   # waits for the human's answer to a request
   [ "$(pending_subtasks "$(task_id "$1")")" -eq 0 ] || return 1
+  case $s in open|in-progress|split|done|dropped) ;; *) dead_status "$1" && s=in-progress ;; esac   # see dead_status
   case $2 in
     in-progress) [ "$s" = in-progress ] ;;
     open) [ "$s" = open ] || [ "$s" = split ] ;;
@@ -381,6 +382,7 @@ wait_for_server() {
   server_ok && return 0
   local t0 d=30; t0=$(date +%s)
   log "WARNING: model server unreachable at $LLM_URL - waiting, no sessions run until it answers"
+  [ -n "${TEAM_DIR:-}" ] && team_state server
   until server_ok; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the model server - stopping"; exit 0; }
     [ -n "${TEAM_DIR:-}" ] && team_beat
@@ -413,6 +415,32 @@ asks_with() {  # asks_with <status> [blocking] : request files with that status 
   return 0
 }
 waiting_tasks() { local a; for a in $(asks_with open blocking); do ask_field "$a" task; done | sort -u; }
+# A task waits as blocked only while a request to the human about it is open (or answered, not yet read): the answer is
+# what resumes it, and nothing else ever picks a blocked task. frontpage 2026-10-07: 257 was set blocked "pending the
+# human's answer", but the request was left for the next session (ask_human is off during a hand-over), and a next
+# session never came. AGENTS.md's stuck rule ("3rd failed attempt: set blocked, stop") led to the same dead end. A
+# status the driver does not know is one too. Such a task counts as in-progress (workable), and when picked it is set
+# in-progress and its session is told why (revive_task).
+dead_status() {  # dead_status <task file>
+  local s w a; s=$(status_of "$1")
+  case $s in open|in-progress|split|done|dropped) return 1 ;; blocked) ;; *) return 0 ;; esac
+  for w in . $([ -n "${TEAM_DIR:-}" ] && team_checkouts); do   # in a team the request may be in the checkout that filed it
+    for a in "$w"/.agent/asks/[0-9]*.md; do
+      [ -f "$a" ] || continue
+      case $(ask_field "$a" status) in open|answered) ;; *) continue ;; esac
+      { [ "$(ask_field "$a" task)" = "$1" ] || grep -qxF -- "$1" "${a%.md}.waiters" 2>/dev/null; } && return 1
+    done
+  done
+  return 0
+}
+revive_task() {  # revive_task <task file> : a picked task with a dead status goes in-progress; prints the prompt's note
+  local s; s=$(status_of "$1"); dead_status "$1" || return 0
+  if head -1 "$1" | grep -qi '^Status:'; then sed -i '1s/.*/Status: in-progress/' "$1"; else sed -i '1i Status: in-progress' "$1"; fi
+  git add "$1" && git commit -q -m "[driver] $(task_id "$1"): status '$s' with no request to the human open - set in-progress"
+  log "$1: status '$s', but no request to the human about it is open - set in-progress (nothing else would ever resume it)" >&2
+  [ -n "${TEAM_DIR:-}" ] && tev revived "$1" "$s"
+  printf '%s' " UNBLOCKED: this task's status was \`$s\`, but no request to the human about it was open, and only the answer to one resumes a waiting task: nothing would ever have picked it up again. The driver set it in-progress. If you need the human to decide or do something, file the request with ask_human first thing this session, with your recommendation (the task then waits for the answer while other work goes on); otherwise carry on with the task."
+}
 inbox_pending() { compgen -G ".agent/inbox/[0-9]*.md" > /dev/null; }
 # The task of the first answered request, set runnable again (with its waiters) so it goes next; prints its file.
 answered_first() {
@@ -442,6 +470,7 @@ wait_for_human() {
     rung=$(ring-doorbell); printf '%s\n%s\n' "$key" "$(date +%s)" > .agent/asks-rung
   fi
   log "nothing to work on until the human answers: open request(s) $key - waiting (agent-talk to answer); $rung"
+  [ -n "${TEAM_DIR:-}" ] && team_state human
   t0=$(date +%s); last=$t0
   while [ "$(asks_with answered)" = "$a0" ] && [ -n "$(asks_with open)" ] && ! { [ -n "$WAITING" ] && inbox_pending; }; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the human - stopping"; exit 0; }
@@ -486,6 +515,7 @@ ask_deadline() {  # true when it answered at least one request just now
 wait_for_talk() {
   [ -f .agent/TALK ] || return 0
   log "the human is talking with an agent in this project (agent-talk) - waiting"
+  [ -n "${TEAM_DIR:-}" ] && team_state talk
   while [ -f .agent/TALK ]; do
     [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for a talk to end - stopping"; exit 0; }
     if [ $(( $(date +%s) - $(stat -c %Y .agent/TALK) )) -gt 43200 ]; then
@@ -717,6 +747,7 @@ verify_done() {
 commit_leftovers "uncommitted work found at loop start"
 # One agent session: iteration $i on $task with $PROMPT, in the viewer's tmux window or headless. Sets rc (124 = timeout).
 run_session() {
+  [ -n "${TEAM_DIR:-}" ] && team_state work
   if [ "$VIEWER" = tui ]; then
     # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
     # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
@@ -791,7 +822,7 @@ prep_iteration() {  # prep_iteration <task file>
      harness: $harness}' >> "$LEDGER"
   PREP_FILE=""
 }
-[ -n "${TEAM_DIR:-}" ] && { team_handover_finish; team_takeover_settle; }   # a hand-over or takeover left half done while this loop was stopped
+[ -n "${TEAM_DIR:-}" ] && { team_state start; team_handover_finish; team_takeover_settle; }   # a hand-over or takeover left half done while this loop was stopped
 # team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
 if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
 task_scan
@@ -827,7 +858,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
   # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
-  PREP=""
+  PREP="" FORCED_NOTE=""
   while :; do
     [ -n "${TEAM_DIR:-}" ] && team_takeover_sync   # claims asked for by a faster agent go to it; work of claims given to this one arrives
     WAITING=$(waiting_tasks)
@@ -861,6 +892,10 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
                 log "team: DEADLOCK - open tasks wait on dependencies nobody can finish ($(team_idle_reason)); taking $task anyway"
                 tev deps_deadlock "$task" "$(team_idle_reason)"
                 claim_task "$task" || { team_wait; continue; }; break ;;   # refused: wait a cycle, never spin
+        stall*) task=${decision#stall }   # the whole team stalled (agent-team-lib, Stall): this agent's most important task anyway
+                FORCED_NOTE=$(team_forced "$task")
+                log "team: STALL - starting $task anyway ($(team_why_not "$task" | sed 's/^$/nothing in the way here/'))"
+                claim_task "$task" || { FORCED_NOTE=""; team_wait; continue; }; break ;;
       esac
       task=$(goal_check_next)
       if [ -n "$task" ]; then claim_task "$task" || { team_wait; continue; }
@@ -873,6 +908,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   [ -n "$task" ] && [ -z "$PREP" ] && rm -f .agent/asks-idle-since   # real work: the request deadline clock stops
   if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   if [ -n "$PREP" ]; then prep_iteration "$task"; continue; fi
+  REVIVED=$(revive_task "$task")   # blocked with no request open, or an unknown status: in-progress, and the prompt says why
   [ -n "${TEAM_DIR:-}" ] && team_prep_handoff "$task"   # another agent still preparing it: its notes first (bounded)
   before=$(agent_commits); head0=$(git rev-parse HEAD); split=""
   ticked0=$(grep -cE '^[[:space:]]*- \[x\]' "$task" 2>/dev/null || true)
@@ -907,9 +943,12 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     [[ $pn == " PREP NOTES:"* ]] && { tev prep_used "$task"; log "iteration $i starts from the prep notes $(prep_file "$task")"; }
     tn=$(team_takeover_note "$task"); PROMPT="$PROMPT$tn"
     [ -n "$tn" ] && { tev takeover_used "$task"; log "iteration $i continues the work of the agent $task was taken over from"; }
+    cn=$(team_cycle_note "$task"); PROMPT="$PROMPT$cn$FORCED_NOTE"
+    [ -n "$cn" ] && log "iteration $i: $task is part of a cycle of tasks that wait on each other - told to build them together"
     split=$(team_split_note "$task")
     [ -n "$split" ] && { PROMPT="$PROMPT$split"; log "$task is too big for another agent: this session is told to split it"; tev split_asked "$task"; }
   fi
+  PROMPT="$PROMPT$REVIVED"
   # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).
   pb=$(stat -c %s PROGRESS.md 2>/dev/null || echo 0)
   [ "$pb" -gt 30720 ] && PROMPT="$PROMPT FIRST, before anything else: PROGRESS.md is $((pb / 1024)) KB, far over its ~150-line budget. Rewrite it to the current state only (drop finished and superseded notes; git history keeps them) and commit that on its own." \

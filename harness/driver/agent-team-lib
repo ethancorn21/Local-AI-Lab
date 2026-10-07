@@ -99,7 +99,7 @@ others_tasks() {  # task files (in their worktrees) that other live agents hold
 }
 deps_of() { sed -n 's/^Depends on:[[:space:]]*//Ip' "$1" | head -1 | grep -oE '\b[0-9]+[a-z]*\b' || true; }
 unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (or dropped) in main
-  local d f s p
+  local d f s p o
   p=$(claim_key "$1")
   for d in $(deps_of "$1"); do
     # A subtask's dependency on its own parent is void: the parent (split) waits for its subtasks, so the two would
@@ -108,7 +108,13 @@ unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (o
     [[ $d =~ ^[0-9]+$ ]] && d=$(printf %03d "$((10#$d))")
     f=$(compgen -G "$TEAM_DIR/tasks/$d-*.md" | head -1)
     if [ -z "$f" ]; then echo "$d"; continue; fi
-    s=$(status_of "$f"); [ "$s" = done ] || [ "$s" = dropped ] || echo "$d"
+    s=$(status_of "$f"); { [ "$s" = done ] || [ "$s" = dropped ]; } && continue
+    # A task of the same cycle that this agent holds, or nobody holds, is built together with this one (Cycles below).
+    # UNMET_RAW=1: the plain answer, for finding the cycles.
+    if [ -z "${UNMET_RAW:-}" ] && in_cycle_with "$(task_id "$1")" "$d"; then
+      o=$(claim_owner "$(claim_key "$f")"); { [ -z "$o" ] || [ "$o" = "$AGENT_ID" ]; } && continue
+    fi
+    echo "$d"
   done
   return 0
 }
@@ -234,6 +240,7 @@ team_retry_merge() {  # a fast-forward that main refused earlier, retried before
 team_idle_decision() {
   local f
   [ -f "$TEAM/STOP" ] && { echo stop; return; }
+  [ -f "$TEAM/stall" ] && { f=$(team_force_pick); [ -n "$f" ] && { echo "stall $f"; return; }; }   # Stall below
   others_hold_claims && { echo wait; return; }   # only this agent's own claims, none workable: nobody frees them, so force
   team_lead || { echo wait; return; }
   f=$(TEAM_IGNORE=1 next_task)   # open work nobody holds and nobody can start: its dependencies cannot be met
@@ -250,6 +257,7 @@ team_wait() {  # one wait step (60 s) while another agent works
   elif [ "$r" != "$TEAM_WAIT_REASON" ]; then   # e.g. "no open tasks" during planning, then "waits for 203": the watcher needs to see that
     TEAM_WAIT_REASON=$r; log "team: still waiting, now because: $r"; tev wait_reason "" "$r"
   fi
+  team_state wait "$TEAM_WAIT_T0"; team_stall_check
   [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting - stopping"; exit 0; }
   sleep "${TEAM_WAIT_S:-60}"
   team_sync || true
@@ -529,8 +537,9 @@ team_put_back() {  # team_put_back <key> <why> [paths] : that task's files on th
   git diff --cached --quiet || git commit -q -m "[driver] $k $2: its files on this branch put back as main has them"
 }
 team_takeover_give() {  # team_takeover_give <key> now|later : the holder gives its claim to the agent that asked for it
-  local k=$1 d=$TEAM/takeover/$1 a ap aw top sha paths err
+  local k=$1 d=$TEAM/takeover/$1 a ap aw top sha paths err why
   read -r a ap _ aw < "$d/asker" || return 0
+  why=$(cat "$d/why" 2>/dev/null)   # "cycle <ids>" when a cycle is gathered on that agent (Cycles below); else the faster agent's ask
   if ! kill -0 "$ap" 2>/dev/null; then rm -rf "$d"; tev takeover_dropped "" "$k: agent $a's loop is gone"; return 0; fi
   [ "$2" = now ] && commit_leftovers "before giving $k to agent $a"
   sha=$(git rev-parse HEAD); err=$(mktemp)
@@ -543,13 +552,14 @@ team_takeover_give() {  # team_takeover_give <key> now|later : the holder gives 
   # In this order, so a watcher stopped half-way (the session ended) leaves nothing wrong: the work for the asker, this
   # branch's put-back (settle skips it while the claim is still this agent's), then the claim, then the request.
   mkdir -p "$TEAM/carry"
-  printf '%s %s\n%s\n' "$AGENT_ID" "$sha" "$paths" > "$TEAM/carry/.$k.$$" && mv "$TEAM/carry/.$k.$$" "$TEAM/carry/$k"
+  printf '%s %s\n%s\n%s\n' "$AGENT_ID" "$sha" "$paths" "$why" > "$TEAM/carry/.$k.$$" && mv "$TEAM/carry/.$k.$$" "$TEAM/carry/$k"
   echo "$a $paths" > ".agent/put-back-$k"
   echo "$a $ap $(date +%s) $aw/$top" > "$TEAM/claims/$k/.owner.$$" && mv "$TEAM/claims/$k/.owner.$$" "$TEAM/claims/$k/owner"
   rm -rf "$d"; rm -f ".agent/progress-$k"
   [ "$2" = now ] && team_takeover_settle
-  tev takeover "$top" "to agent $a: $(wc -w <<<"$paths") file(s) of its work go with it ($(git rev-parse --short "$sha"))$(sed 's/^/; /' "$err" | tr -d '\n' | cut -c1-200)"
-  log "team: gave $k to agent $a (a faster agent with nothing to build; other tasks wait on it) - $(wc -w <<<"$paths") file(s) of its work go with it"
+  tev takeover "$top" "to agent $a${why:+ ($why)}: $(wc -w <<<"$paths") file(s) of its work go with it ($(git rev-parse --short "$sha"))$(sed 's/^/; /' "$err" | tr -d '\n' | cut -c1-200)"
+  if [ -n "$why" ]; then log "team: gave $k to agent $a (tasks ${why#cycle } wait on each other: one agent builds them all) - $(wc -w <<<"$paths") file(s) of its work go with it"
+  else log "team: gave $k to agent $a (a faster agent with nothing to build; other tasks wait on it) - $(wc -w <<<"$paths") file(s) of its work go with it"; fi
   rm -f "$err"
 }
 team_takeover_settle() {  # put back the files of claims given away during a session (before anything is verified or merged)
@@ -571,12 +581,12 @@ team_takeover_answer() {  # the holder, between sessions: gives every claim of i
   return 0
 }
 team_takeover_receive() {  # the work of a claim given to this agent, onto its branch
-  local c k h sha paths base p
+  local c k h sha paths base p why
   for c in "$TEAM"/carry/*; do
     [ -f "$c" ] || continue; k=$(basename "$c")
     read -r h sha < "$c"
     [ "$h" != "$AGENT_ID" ] && [ "$(claim_owner "$k")" = "$AGENT_ID" ] || continue
-    paths=$(sed -n 2p "$c"); team_sync || true
+    paths=$(sed -n 2p "$c"); why=$(sed -n 3p "$c"); team_sync || true
     if [ -n "$paths" ]; then
       base=$(git merge-base main "$sha")
       # shellcheck disable=SC2086
@@ -590,7 +600,7 @@ team_takeover_receive() {  # the work of a claim given to this agent, onto its b
       fi
       git diff --cached --quiet || git commit -q -m "[driver] $k taken over from agent $h: its work carried ($h@$(git rev-parse --short "$sha"))"
     fi
-    echo "$h $(git rev-parse --short "$sha")" > ".agent/taken-over-$k"
+    echo "$h $(git rev-parse --short "$sha") $why" > ".agent/taken-over-$k"
     rm -f "$c"; tev takeover_carried "" "$k from agent $h: $(wc -w <<<"$paths") file(s)"
     log "team: took over $k from agent $h - $(wc -w <<<"$paths") file(s) of its work carried into $BRANCH"
   done
@@ -614,7 +624,7 @@ team_forward_answers() {  # answered requests about a task another agent now hol
   done
   return 0
 }
-team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; team_forward_answers; }   # before every pick
+team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; team_forward_answers; team_release_finished; team_cycles_sync; }   # before every pick
 TAKEOVER_CUT=""
 team_takeover_poll() {  # team_takeover_poll [task file of the running session] : during a session, every TEAM_TAKEOVER_POLL_S
   local cur="" d k a
@@ -626,16 +636,158 @@ team_takeover_poll() {  # team_takeover_poll [task file of the running session] 
     if [ "$k" != "$cur" ]; then team_takeover_give "$k" later; continue; fi   # parked: given at once
     [ "$TAKEOVER_CUT" = "$k" ] && continue
     read -r a _ < "$d/asker"; TAKEOVER_CUT=$k
-    echo "agent $a, on a faster card, has nothing to build and takes this task over (other tasks wait on it)" > .agent/handover-now
+    if [ -f "$d/why" ]; then echo "agent $a takes this task over: tasks $(sed 's/^cycle //' "$d/why") wait on each other, so one agent builds them all" > .agent/handover-now
+    else echo "agent $a, on a faster card, has nothing to build and takes this task over (other tasks wait on it)" > .agent/handover-now; fi
     tev takeover_cut "$1" "asked by agent $a"; log "team: agent $a asked for $k - this session is told to write its hand-over and end"
   done
   return 0
 }
 team_session_watch() { TAKEOVER_CUT=""; while sleep "${TEAM_TAKEOVER_POLL_S:-20}"; do team_beat; team_takeover_poll "$1"; done; }   # team_session_watch <task file> : background, during a build session
 team_takeover_note() {  # team_takeover_note <task file> : the prompt's note on a task just taken over (its first session only)
-  local f h s; f=.agent/taken-over-$(claim_key "$1")
-  [ -f "$f" ] || return 0; read -r h s < "$f"; rm -f "$f"
-  printf '%s' " TAKEN OVER: agent $h, on a slower card, was building this task; the driver gave it to you because other tasks wait on it. Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read the hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
+  local f h s why; f=.agent/taken-over-$(claim_key "$1")
+  [ -f "$f" ] || return 0; read -r h s why < "$f"; rm -f "$f"
+  if [[ $why == cycle* ]]; then
+    printf '%s' " TAKEN OVER: agent $h was building task $(claim_key "$1"), part of a cycle of tasks that wait on each other; the driver gave it to you (see CYCLE). Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read that hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
+  else
+    printf '%s' " TAKEN OVER: agent $h, on a slower card, was building this task; the driver gave it to you because other tasks wait on it. Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read the hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
+  fi
+}
+
+# Cycles: tasks that wait on each other can never start one after the other. frontpage 2026-10-07: 256 (agent c, the
+# v3 row template) waited for 257 (agent a, the e2e test for it) and 257 for 256: a merge of either alone left main
+# red, neither agent may merge the other's branch, and each loop waited for the other's task to reach main. The rule
+# that breaks a deadlock (team_idle_decision) only fires when no other agent holds a claim, so all three agents sat
+# idle for four hours. So all of a cycle's tasks go to one agent (team-takeover cycles picks which), through the
+# takeover's ask and give with the task's work; for that agent a dependency on another task of the same cycle counts
+# as met (unmet_deps): it builds them on one branch, and the first one accepted takes the others' work into main.
+# Before every pick: TEAM_CYCLES = team-takeover cycles' lines; the agent that is to get a cycle asks for its claims.
+TEAM_CYCLES=""
+in_cycle_with() {  # in_cycle_with <id> <id> : both tasks are in the same cycle
+  [ -n "$TEAM_CYCLES" ] || return 1
+  awk -F'\t' -v a="$1" -v b="$2" '{ n = split($2, x, " "); fa = fb = 0; for (i = 1; i <= n; i++) { fa += (x[i] == a); fb += (x[i] == b) } if (fa && fb) f = 1 } END { exit !f }' <<<"$TEAM_CYCLES"
+}
+team_cycle_fact() {  # team_cycle_fact <task file> <holder> : its line for team-takeover cycles (nothing when finished)
+  local s r=0 sp=0
+  [ -f "$1" ] || return 0
+  case $(basename "$1") in 000-*|999-*) return 0 ;; esac
+  s=$(status_of "$1"); case $s in done|dropped) return 0 ;; esac
+  [ -n "$2" ] && { agent_running "$2" && r=1; sp=$(agent_speed "$2"); }
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(task_id "$1")" "$(UNMET_RAW=1 unmet_deps "$1" | tr '\n' ' ')" "$2" "$r" "$sp" "$(touches_of "$1" | grep -c .)"
+}
+team_cycle_facts() {  # every unfinished task, as its holder's checkout has it (it may have split it or added dependencies there)
+  local o k a f w held=" "
+  for o in "$TEAM"/claims/*/owner; do
+    [ -f "$o" ] || continue
+    k=$(basename "$(dirname "$o")"); a=$(claim_owner "$k"); [ -n "$a" ] || continue   # a stale claim counts as nobody's
+    read -r _ _ _ f < "$o"; w=${f%/tasks/*}; held+="$k "
+    for f in "$w"/tasks/"$k"-*.md "$w"/tasks/"$k"[a-z]*-*.md; do team_cycle_fact "$f" "$a"; done
+  done
+  for f in "$TEAM_DIR"/tasks/[0-9]*.md; do
+    [[ $held == *" $(claim_key "$f") "* ]] || team_cycle_fact "$f" ""
+  done
+}
+team_cycles_sync() {  # before every pick: find the cycles; ask for the cycle claims other agents hold when this agent gets them
+  [ "${TEAM_CYCLE_FIX:-1}" = 1 ] || { TEAM_CYCLES=""; return 0; }
+  local to ids keys k o d
+  TEAM_CYCLES=$(team_cycle_facts | team-takeover cycles 2>/dev/null)
+  while IFS=$'\t' read -r to ids keys; do
+    [ -n "$ids" ] || continue
+    [ -f "$TEAM/cycles/${ids// /-}" ] || { mkdir -p "$TEAM/cycles"; touch "$TEAM/cycles/${ids// /-}"; tev cycle "" "$ids -> agent $to"; log "team: CYCLE - tasks $ids wait on each other; agent $to gets them all and builds them together"; }
+    [ "$to" = "$AGENT_ID" ] || continue
+    for k in $keys; do
+      o=$(claim_owner "$k"); [ -n "$o" ] && [ "$o" != "$AGENT_ID" ] || continue
+      d=$TEAM/takeover/$k; mkdir -p "$TEAM/takeover"; mkdir "$d" 2>/dev/null || continue   # asked already (by anyone)
+      echo "cycle $ids" > "$d/why"; echo "$AGENT_ID $$ $(date +%s) $PWD" > "$d/asker"   # why first: the holder acts on asker
+      tev takeover_asked "tasks/$k" "from agent $o: cycle $ids"; log "team: asked agent $o for $k (tasks $ids wait on each other)"
+    done
+  done <<<"$TEAM_CYCLES"
+  return 0
+}
+team_cycle_note() {  # team_cycle_note <task file> : the prompt's note on a task of a cycle this agent holds
+  local id line ids
+  id=$(task_id "$1"); [ -n "$TEAM_CYCLES" ] || return 0
+  line=$(awk -F'\t' -v a="$id" '{ n = split($2, x, " "); for (i = 1; i <= n; i++) if (x[i] == a) { print $2; exit } }' <<<"$TEAM_CYCLES")
+  [ -n "$line" ] || return 0
+  ids=$(sed 's/ /, /g' <<<"$line")
+  printf '%s' " CYCLE: tasks $ids wait on each other (their Depends on lines name each other, or a parent and its subtasks), so none of them could go into main before the others; two agents held them and each waited for the other. The driver gave all of them to you, and while you hold them a dependency on another task of this cycle counts as met. Build them together on your branch, so that the tests pass with all of their work in place. Set only this session's task done when it is finished: once it is accepted, it goes into main with everything on your branch (the other tasks' work included), and they come next."
+}
+team_release_finished() {  # own claims whose tasks are all done or dropped, here and in main: free them. A task can reach
+  # main done without its own merge (another task's merge carries the whole branch); its claim was then never released
+  # and kept other tasks off its files (team_why_not's overlap check) for good.
+  local k f n
+  for k in $(own_claims); do
+    n=0
+    for f in tasks/"$k"-*.md tasks/"$k"[a-z]*-*.md "$TEAM_DIR"/tasks/"$k"-*.md "$TEAM_DIR"/tasks/"$k"[a-z]*-*.md; do
+      [ -f "$f" ] || continue; n=$((n + 1))
+      case $(status_of "$f") in done|dropped) ;; *) continue 2 ;; esac
+    done
+    [ "$n" -gt 0 ] || continue
+    rm -rf "${TEAM:?}/claims/$k"; tev release "tasks/$k" "all its tasks are done in main"; log "team: released $k - all its tasks are done in main (they got there with another task's merge)"
+  done
+  return 0
+}
+
+# Stall: the net under every other rule. Each loop records what it does (loops/<id>.state: work, wait, human, server or
+# talk, and since when). When every running agent has waited TEAM_STALL_MIN (15) minutes for other agents, with tasks
+# unfinished in main and no request to the human open anywhere, nothing will change by itself: a deadlock no rule above
+# knows. The lead agent writes $TEAM/stall (the episode: when the last agent began waiting), logs why each agent waits,
+# and tells the human (doorbell). Then each agent starts its own most important claim anyway, the lead also an unclaimed
+# task if it holds none (team_force_pick): one per agent per episode, each task at most TEAM_STALL_FORCES (2) times. Its prompt
+# says to do what it can, and if nothing can be done, to file a request to the human saying what stops the team - so a
+# stall ends in work or in a request (which the human sees, and ASK_AUTO_MIN decides if nobody answers), never in silence.
+team_state() { echo "$1 ${2:-$(date +%s)}" > "$TEAM/loops/$AGENT_ID.state" 2>/dev/null || true; }   # team_state <state> [since]
+team_checkouts() {  # every checkout of the team: main's and each agent's
+  local f; echo "$TEAM_DIR"
+  for f in "$TEAM"/agents/*; do [ -f "$f" ] && cat "$f"; done
+  return 0
+}
+team_asks_open() {  # a request to the human is open in any checkout of the team
+  local w; for w in $(team_checkouts); do grep -lqx 'status: open' "$w"/.agent/asks/[0-9]*.md 2>/dev/null && return 0; done; return 1
+}
+team_stall_check() {  # the lead, in each wait step: notice a stall, record it, tell the human
+  [ "${TEAM_STALL_MIN:-15}" -gt 0 ] && team_lead || return 0
+  local id st t since=0 now r why="" n
+  now=$(date +%s)
+  for id in $(live_agents); do
+    read -r st t 2>/dev/null < "$TEAM/loops/$id.state" || return 0   # a loop from before this rule: no verdict
+    [ "$st" = wait ] || { rm -f "$TEAM/stall"; return 0; }
+    [ "$t" -gt "$since" ] && since=$t
+  done
+  if [ $((now - since)) -lt $((${TEAM_STALL_MIN:-15} * 60)) ] || [ -z "$(open_in_main)" ] || team_asks_open; then rm -f "$TEAM/stall"; return 0; fi
+  if [ "$(cut -d' ' -f1 "$TEAM/stall" 2>/dev/null)" = "$since" ]; then   # known: remind every ASK_REMIND_HOURS
+    [ $((now - $(cut -d' ' -f2 "$TEAM/stall"))) -ge $((${ASK_REMIND_HOURS:-6} * 3600)) ] || return 0
+  fi
+  echo "$since $now" > "$TEAM/stall"
+  for id in $(live_agents); do
+    r=$(tail -n 3000 "$TEAM/events.jsonl" 2>/dev/null | jq -r --arg a "$id" 'select(.agent == $a and (.event == "wait_start" or .event == "wait_reason")) | .detail' 2>/dev/null | tail -1)
+    why+="agent $id: ${r:-?}"$'\n'
+  done
+  n=$(wc -w <<<"$(open_in_main)")
+  tev team_stall "" "$(( (now - since) / 60 )) min; $(tr '\n' ' ' <<<"$why" | cut -c1-600)"
+  log "team: STALL - no agent has had anything to build for $(( (now - since) / 60 )) min, with $n task(s) unfinished and no request to the human open. Each agent now starts its own most important task anyway. Why each waited: $(tr '\n' ' ' <<<"$why")"
+  printf '%s\n\n%s\n%s\n' "Team $(basename "$TEAM_DIR"): every agent has had nothing to build for $(( (now - since) / 60 )) min, with $n task(s) unfinished and no request open to you. A deadlock the driver has no rule for: it now starts each agent's most important task anyway, and an agent that cannot go on files a request to you." \
+    "Why each agent waited:" "$why" | ring-doorbell --info > /dev/null 2>&1
+  return 0
+}
+team_force_pick() {  # during a stall: the task this agent starts anyway, or nothing
+  local ep f k n
+  ep=$(cut -d' ' -f1 "$TEAM/stall" 2>/dev/null); [ -n "$ep" ] || return 0
+  [ "$(cat "$TEAM/forced/.agent-$AGENT_ID" 2>/dev/null)" = "$ep" ] && return 0   # one forced start per agent per stall
+  for f in $(team_pick_order); do   # its own claims first, the most important first; then (the lead) unclaimed tasks
+    case $f in tasks/000-*|tasks/999-*) continue ;; esac
+    k=$(claim_key "$f")
+    case $(claim_owner "$k") in "$AGENT_ID") ;; "") team_lead || continue ;; *) continue ;; esac
+    TEAM_IGNORE=1 workable "$f" any || continue   # its status, a request to the human, unfinished subtasks still count
+    grep -qx "$ep" "$TEAM/forced/$k" 2>/dev/null && continue   # once per stall
+    n=$(grep -c . "$TEAM/forced/$k" 2>/dev/null || true); [ "${n:-0}" -lt "${TEAM_STALL_FORCES:-2}" ] || continue
+    echo "$f"; return 0
+  done
+}
+team_forced() {  # team_forced <task file> : record a forced start, print the prompt's note
+  local ep k u; ep=$(cut -d' ' -f1 "$TEAM/stall" 2>/dev/null); k=$(claim_key "$1")
+  mkdir -p "$TEAM/forced"; echo "${ep:-0}" >> "$TEAM/forced/$k"; echo "${ep:-0}" > "$TEAM/forced/.agent-$AGENT_ID"; tev stall_force "$1" ""
+  u=$(UNMET_RAW=1 unmet_deps "$1" | tr '\n' ' ' | sed 's/ $//')
+  printf '%s' " FORCED START: no agent of this team has had anything to build for ${TEAM_STALL_MIN:-15}+ minutes, though tasks are unfinished and no request to the human is open, so the driver started this task anyway.${u:+ Its dependencies not yet finished in main: $u.} Do the part of it you can do now. If nothing can be done until something else happens, do not wait for it and do not build stand-ins: file a request to the human with ask_human that says exactly what stops the work and what you recommend, then end the session."
 }
 
 # Prep: an agent with nothing to take prepares a task that starts soon (its dependencies are being built, or could
