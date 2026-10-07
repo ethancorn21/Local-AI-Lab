@@ -708,6 +708,10 @@ team_prep_target() {  # the task this idle agent prepares, or nothing: open, unc
     [ "$(status_of "$f")" = open ] || continue
     id=$(task_id "$f")
     [ -f "$(prep_file "$f")" ] && continue
+    # A handed-over task has real work and a hand-over already, and a waiting agent about to claim it (frontpage
+    # 2026-10-07: b, idle after handing 802 to c, prepared 802 in the seconds before c claimed it; c then waited 230 s
+    # for notes that never came).
+    [ -f "$TEAM/handed/$(claim_key "$f")" ] && continue
     [ "$(cat "$TEAM/prep-tries/$id" 2>/dev/null || echo 0)" -lt 2 ] || continue
     grep -qxF -- "$f" <<<"${WAITING:-}" && continue
     [ -z "$(claim_owner "$(claim_key "$f")")" ] && [ -z "$(prep_owner "$id")" ] && [ -z "$(done_in_main "$f")" ] || continue

@@ -81,6 +81,10 @@ rm -rf "$P.b/tasks/prep"
 claim a 103 103-mid.md
 t=$(as b team_prep_target); [ "$t" = tasks/104-end.md ] && ok "a claims 103: 104 (waits only on work in progress) is b's target" || bad "with 103 claimed: $t"
 unclaim 103
+mkdir -p "$P/.agent/team/handed"; echo "b $(date +%s) kept agent/b-handover-103-x" > "$P/.agent/team/handed/103"
+t=$(as b team_prep_target); [ "$t" != tasks/103-mid.md ] && [ "$(as a team_prep_target)" != tasks/103-mid.md ] \
+  && ok "103 just handed over by b, not yet claimed: no one prepares it" || bad "handed-over 103 is a prep target: b $t, a $(as a team_prep_target)"
+rm -rf "$P/.agent/team/handed"
 sed -i '1s/.*/Status: open/' "$P/tasks/000-plan.md"
 [ -z "$(as b team_prep_target)" ] && ok "planning open in main: no prep (the plan may change every task)" || bad "prep during planning: $(as b team_prep_target)"
 sed -i '1s/.*/Status: done/' "$P/tasks/000-plan.md"
