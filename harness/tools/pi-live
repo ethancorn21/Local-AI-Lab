@@ -74,7 +74,7 @@ DIFF_LINES, WRITE_LINES, OUTPUT_LINES = 40, 12, 6
 
 lock = threading.RLock()   # re-entrant: Ctrl-C can land while the main thread holds it
 ui = {"cols": 80, "input": "", "thinking": True, "label": "", "t0": time.time(), "phase": "", "sprint": "",
-      "composing": None, "project": None, "task_id": "", "session_file": None, "ended": None, "loop_on": True,
+      "composing": None, "project": None, "session_file": None, "ended": None, "loop_on": True,
       "sess_on": True, "loop_last": None}
 INTERACTIVE = False
 
@@ -341,14 +341,13 @@ def llama_phase(state):
 
 
 def sprint_line():
-    """Where the current task sits in the sprint and how far the sprint is, from sprint-progress (next to this
-    script): '4 of 6 in this sprint | sprint 1/6 done, 3 in progress, 2 to go', or '' if unavailable."""
+    """How far the sprint is, from sprint-progress (next to this script):
+    'sprint 1/6 done · 3 being built · 2 not started', or '' if unavailable."""
     if not ui.get("project"):
         return ""
     tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "sprint-progress")
-    cmd = [tool, ui["project"]] + (["--task", ui["task_id"]] if ui.get("task_id") else [])
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+        return subprocess.run([tool, ui["project"]], capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -809,15 +808,18 @@ def start_session(path, n):
                     pass
     except OSError:
         pass
+    # The task's name only: the operator reads the name, not the task or session number (Ethan 2026-10-06). The
+    # header carries the start time instead, so consecutive sessions on one task stay apart in the scrollback.
     m = re.match(r"tasks/(\d+[a-z]*)-(.+)\.md$", task)
-    short = f"task {m.group(1)} ({m.group(2).replace('-', ' ')})" if m else task
-    ui.update(task_id=m.group(1) if m else "", label=f"session {n} | {short}", t0=t0, session_file=path,
+    short = m.group(2).replace('-', ' ') if m else task
+    ui.update(label=short, t0=t0, session_file=path,
               ended=os.path.getmtime(path), loop_on=pid_alive("loop.pid"), sess_on=pid_alive("pi.pid"))
     ui["sprint"] = sprint_line()
     R.end_stream()
     R.reset()
     gap()
-    out(f"{BOLD}── session {n} · {short}{' · ' + ui['sprint'] if ui['sprint'] else ''} ──{RST}\n")
+    out(f"{BOLD}── {time.strftime('%H:%M', time.localtime(t0))} · {short}"
+        f"{' · ' + ui['sprint'] if ui['sprint'] else ''} ──{RST}\n")
 
 
 def loop_line(line):

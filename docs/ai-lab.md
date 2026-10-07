@@ -177,4 +177,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline and required recommendation; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; takeover; plain-text requests answered in Telegram; second RTX 3090 in, agent c on it (`agent-team add`); both 24 GB cards at 300 W; OS updates on both machines. |
+| 10-06 | Request deadline and required recommendation; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; takeover; plain-text requests answered in Telegram; second RTX 3090 in, agent c on it (`agent-team add`); both 24 GB cards at 300 W; OS updates on both machines; `agent-watch` status line reads task name, then sprint done · being built · not started. |

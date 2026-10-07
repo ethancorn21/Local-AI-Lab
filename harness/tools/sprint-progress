@@ -89,17 +89,15 @@ def progress(project):
             "since": base[:8] if base else None}
 
 
-def position(p, tid):
-    """'4 of 6 in this sprint' for a task id (its place in build order = task-number order), or ''."""
-    return f"{p['tasks'].index(tid) + 1} of {p['total']} in this sprint" if tid in p["tasks"] else ""
-
-
 def line(p):
+    """'sprint 22/32 done · 4 being built · 6 not started'. Not started = written (by the planning task or a split),
+    claimed by no agent. (The task's place in number order, '30 of 32 in this sprint', was dropped 2026-10-06: the
+    scheduler goes by critical path, so the number read like progress and meant nothing.)"""
     s = f"sprint {p['done']}/{p['total']} done"
     if p["in_progress"]:
-        s += f", {len(p['in_progress'])} in progress"
+        s += f" · {len(p['in_progress'])} being built"
     if p["open"]:
-        s += f", {p['open']} to go"
+        s += f" · {p['open']} not started"
     return s
 
 
@@ -107,10 +105,4 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     p = progress(sys.argv[1])
-    if "--json" in sys.argv:
-        print(json.dumps(p))
-    elif "--task" in sys.argv:   # sprint-progress <dir> --task 214 : "4 of 6 in this sprint | sprint 1/6 done, ..."
-        pos = position(p, sys.argv[sys.argv.index("--task") + 1])
-        print(f"{pos} | {line(p)}" if pos else line(p))
-    else:
-        print(line(p))
+    print(json.dumps(p) if "--json" in sys.argv else line(p))

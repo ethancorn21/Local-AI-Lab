@@ -61,6 +61,7 @@ def snapshot():
         disp = [l.rstrip() for l in screen.display]
         return hist, disp, screen.lines, screen.columns
 FAIL = []
+STATUS = re.compile(r"^ (plan|e2e explore theme) \|")   # the status bar starts with the task name
 def check(cond, msg):
     print(("PASS " if cond else "FAIL ") + msg)
     if not cond:
@@ -69,11 +70,11 @@ def footer_ok(tag, activity_re=None):
     hist, disp, rows, cols = snapshot()
     used = [i for i, l in enumerate(disp) if l]
     last = used[-1] if used else -1
-    status_rows = [i for i, l in enumerate(disp) if l.startswith(" session 1 |") or l.startswith(" session 2 |")]
+    status_rows = [i for i, l in enumerate(disp) if STATUS.match(l)]
     hint_rows = [i for i, l in enumerate(disp) if "› message the agent" in l]
     check(len(status_rows) == 1 and status_rows[0] == last, f"{tag}: one status bar, last used row ({status_rows}, last {last})")
     check(len(hint_rows) == 1 and hint_rows[0] == last - 1, f"{tag}: one message line, just above it ({hint_rows})")
-    leaked = [l for l in hist if "› message the agent" in l or re.match(r"^ session \d+ \|", l)]
+    leaked = [l for l in hist if "› message the agent" in l or STATUS.match(l)]
     check(not leaked, f"{tag}: no footer rows in scrollback ({len(leaked)})")
     if activity_re:
         act = disp[last - 2] if last >= 2 else ""
@@ -132,8 +133,9 @@ footer_ok("loop stopped", r"■ loop stopped")
 # transcript checks
 hist, disp, rows, cols = snapshot()
 text = "\n".join(hist + disp)
-heads = [m.start() for m in re.finditer(r"── session \d", text)]
-check([text[h:h + 12] for h in heads] == ["── session 1", "── session 2"], f"session headers in order: {[text[h:h+12] for h in heads]}")
+found = list(re.finditer(r"── \d\d:\d\d · (plan|e2e explore theme) ", text))
+heads, names = [m.start() for m in found], [m.group(1) for m in found]
+check(names == ["plan", "e2e explore theme"], f"session headers (start time · task name) in order: {names}")
 check("◆" in text and "WARNING: DECISIONS.md is 94 KB" in text and "no agent commit (4/5)" in text, "loop lines shown")
 check(not re.search(r"◆ \d\d:\d\d:\d\d iteration \d+:", text), "iteration lines left to the session header")
 check("(thinking hidden)" in text and "(thinking shown)" in text, "thinking toggle notes shown")
@@ -169,7 +171,7 @@ except ChildProcessError:
     wpid = pid
 check(wpid == pid, "Ctrl-C ends the viewer")
 hist, disp, rows, cols = snapshot()
-check(not any("› message the agent" in l or l.startswith(" session ") for l in disp), "footer removed on exit")
+check(not any("› message the agent" in l or STATUS.match(l) for l in disp), "footer removed on exit")
 check(raw.rfind(b"\x1b[?25h") > raw.rfind(b"\x1b[?25l"), "cursor shown again on exit")
 open(os.path.join(S, "e2e-screen.txt"), "w").write("\n".join(hist[-60:] + ["=== display ==="] + disp))
 print("FAILED:" if FAIL else "ALL PASS", len(FAIL))
