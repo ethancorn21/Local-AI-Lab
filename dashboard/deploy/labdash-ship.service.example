@@ -1,0 +1,18 @@
+# /etc/systemd/system/labdash-ship.service on the harness VM: ships the agents' live work to the console
+# (dashboard/ship/labdash-ship) over one SSH connection, as the agent user (it reads the agents' files and writes
+# their inbox and requests, as agent-watch and agent-talk do).
+# Which projects: `--only <name>[,<name>]` ships those; without --only it ships every project except the ones named
+# in ~/.agent-kit/dashboard-hidden (one per line), and nothing at all until that file exists.
+[Unit]
+Description=Lab console shipper: agent sessions to the AI box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<agent-user>
+ExecStart=/usr/bin/python3 /opt/labdash/labdash-ship --target labdash-feed
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

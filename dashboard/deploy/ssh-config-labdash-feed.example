@@ -1,0 +1,12 @@
+# ~/.ssh/config of the agent user on the harness VM: the shipper's connection to the console server.
+# The key only runs labdash-ingest on the AI box (forced command); no shell, no forwarding.
+# The AI box's host key is already in ~/.ssh/known_hosts (the doorbell and the model tunnels verified it).
+Host labdash-feed
+  HostName <ai-box-address>
+  User <feed-account>
+  IdentityFile ~/.ssh/labdash_feed_ed25519
+  IdentitiesOnly yes
+  BatchMode yes
+  StrictHostKeyChecking yes
+  ServerAliveInterval 15
+  ServerAliveCountMax 3

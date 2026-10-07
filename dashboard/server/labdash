@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""labdash: the lab console's server, on the AI box.
+
+Serves the console (dashboard/web) on localhost only; the operator's Mac reaches it through an SSH tunnel. Keeps the
+agents' live streams that labdash-ship sends from the VM (through the forced command labdash-ingest and a Unix socket),
+samples the hardware itself (nvidia-smi, the temperature guard's log, the model servers' metrics), and pushes all of it
+to the browser over Server-Sent Events. The operator's messages and answers go back to the VM on the shipper's own
+connection; nothing on the AI box ever connects to the VM.
+
+The browser gets agent text as data and only ever renders it as text. Every request must name this server in its Host
+header (no DNS rebinding); every POST must carry X-Labdash: 1 and a same-origin Origin (no cross-site requests: a page
+on another site cannot send that header without a CORS preflight this server never grants).
+
+  labdash [config.json]      default /etc/labdash/config.json
+"""
+import collections
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import queue
+
+CONF_PATH = sys.argv[1] if len(sys.argv) > 1 else "/etc/labdash/config.json"
+CONF = json.load(open(CONF_PATH))
+HOSTS = set(CONF.get("hosts", ["localhost:8700", "127.0.0.1:8700"]))
+WEB = CONF.get("web", "/opt/labdash/web")
+SOCK = CONF.get("socket", "/run/labdash/ingest.sock")
+SERVERS = CONF.get("servers", {})          # port -> {gpu: uuid, kind: vllm|llama, ctx: tokens}
+MAX_EVENTS = 2500
+STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/app.css": ("app.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml")}
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+       "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+EV_TYPES = {"divider", "sys", "think", "say", "you", "tool"}
+NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def tidy(o, depth=0):
+    """Untrusted data from the VM, bounded: strings, lists and nesting capped. The browser renders it as text."""
+    if depth > 6:
+        return None
+    if isinstance(o, str):   # a whole thinking block arrives as one string when a channel is replayed
+        return o if len(o) <= 200000 else o[:200000] + " …"
+    if isinstance(o, bool) or o is None or isinstance(o, (int, float)):
+        return o
+    if isinstance(o, list):
+        return [tidy(x, depth + 1) for x in o[:600]]
+    if isinstance(o, dict):
+        return {str(k)[:40]: tidy(v, depth + 1) for k, v in list(o.items())[:60]}
+    return None
+
+
+# ------------------------------------------------------------------------------------------------ shared state
+
+class Hub:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.channels = {}       # name -> {meta, events, idx, snap, last}
+        self.boards = {}
+        self.feed = {"connected": False, "since": None, "host": None}
+        self.hw = {}
+        self.hist = {"temp": {}, "power": {}, "minutes": []}
+        self.clients = set()
+        self.feed_conn = None
+        self.feed_lock = threading.Lock()
+
+    # ---- browsers
+    def broadcast(self, msg):
+        data = json.dumps(msg, separators=(",", ":"))
+        for q in list(self.clients):
+            try:
+                q.put_nowait(data)
+            except queue.Full:   # a browser that fell this far behind starts over: its stream ends, it reconnects
+                q.dead = True
+                self.clients.discard(q)
+
+    def snapshot(self):
+        return {"channels": {n: {"meta": c["meta"], "events": c["events"], "snap": c["snap"], "last": c["last"]} for n, c in self.channels.items()},
+                "boards": self.boards, "feed": self.feed, "hw": self.hw, "hist": self.hist, "now": time.time()}
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=20000)
+        q.dead = False
+        with self.lock:
+            q.put(json.dumps({"type": "snapshot", **self.snapshot()}, separators=(",", ":")))
+            self.clients.add(q)
+        return q
+
+    # ---- the shipper's lines
+    def handle(self, o):
+        op, ch = o.get("op"), o.get("ch")
+        if ch is not None and (not isinstance(ch, str) or not NAME.match(ch)):
+            return
+        with self.lock:
+            now = time.time()
+            if op == "hello":
+                self.channels.clear()
+                self.boards.clear()
+                self.feed.update(connected=True, since=now, host=str(o.get("host", ""))[:64])
+                self.broadcast({"type": "snapshot", **self.snapshot()})
+            elif op == "reset":
+                self.channels[ch] = {"meta": tidy(o.get("meta") or {}), "events": [], "idx": {}, "snap": None, "last": now}
+                self.broadcast({"type": "reset", "ch": ch, "meta": self.channels[ch]["meta"], "last": now})
+            elif ch not in self.channels and op in ("meta", "ev", "upd", "task"):
+                return
+            elif op == "meta":
+                m = tidy(o.get("meta") or {})
+                self.channels[ch]["meta"].update(m)
+                self.channels[ch]["last"] = now   # activity lines count: a long tool call streams nothing else
+                self.broadcast({"type": "meta", "ch": ch, "meta": m, "last": now})
+            elif op == "ev":
+                ev = tidy(o.get("ev") or {})
+                if not isinstance(ev, dict) or ev.get("t") not in EV_TYPES or not isinstance(ev.get("id"), str):
+                    return
+                c = self.channels[ch]
+                if ev["id"] in c["idx"]:
+                    return
+                c["events"].append(ev)
+                c["idx"][ev["id"]] = ev
+                c["last"] = now
+                self.trim(c)
+                self.broadcast({"type": "ev", "ch": ch, "ev": ev, "last": now})
+            elif op == "upd":
+                c = self.channels[ch]
+                ev = c["idx"].get(o.get("id"))
+                if ev is None:
+                    return
+                st = tidy(o.get("set") or {})
+                ap = tidy(o.get("append") or {})
+                for k, v in (st or {}).items():
+                    if k not in ("id", "t"):
+                        ev[k] = v
+                for k, v in (ap or {}).items():
+                    if isinstance(v, str) and isinstance(ev.get(k, ""), str) and len(ev.get(k, "")) < 400000:
+                        ev[k] = ev.get(k, "") + v
+                c["last"] = now
+                self.broadcast({"type": "upd", "ch": ch, "id": ev["id"], "set": st, "append": ap, "last": now})
+            elif op == "task":
+                self.channels[ch]["snap"] = tidy(o.get("snap"))
+                self.broadcast({"type": "task", "ch": ch, "snap": self.channels[ch]["snap"]})
+            elif op == "board":
+                p = o.get("project")
+                if isinstance(p, str) and NAME.match(p):
+                    self.boards[p] = tidy(o.get("board"))
+                    self.broadcast({"type": "board", "project": p, "board": self.boards[p]})
+            elif op == "gone":
+                if self.channels.pop(ch, None) is not None:
+                    self.broadcast({"type": "gone", "ch": ch})
+            elif op == "ack":
+                self.broadcast({"type": "ack", "id": str(o.get("id", ""))[:32], "ok": bool(o.get("ok")), "error": str(o.get("error") or "")[:200]})
+
+    def trim(self, c):
+        """Keep the last two sessions, at most MAX_EVENTS events."""
+        ev = c["events"]
+        divs = [i for i, e in enumerate(ev) if e.get("t") == "divider"]
+        cut = divs[-2] if len(divs) > 2 else 0
+        cut = max(cut, len(ev) - MAX_EVENTS)
+        if cut > 0:
+            for e in ev[:cut]:
+                c["idx"].pop(e.get("id"), None)
+            del ev[:cut]
+
+    # ---- commands to the VM
+    def to_feed(self, obj):
+        with self.feed_lock:
+            conn = self.feed_conn
+            if conn is None:
+                return False
+            try:
+                conn.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode())
+                return True
+            except OSError:
+                return False
+
+
+HUB = Hub()
+
+
+# ------------------------------------------------------------------------------------------------ the ingest socket
+
+def feed_reader(conn):
+    fh = conn.makefile("rb")
+    try:
+        while True:
+            line = fh.readline(1 << 20)
+            if not line:
+                break
+            if not line.endswith(b"\n"):   # longer than the cap: skip the rest of it
+                while line and not line.endswith(b"\n"):
+                    line = fh.readline(1 << 20)
+                continue
+            try:
+                o = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(o, dict):
+                HUB.handle(o)
+    except OSError:
+        pass
+    finally:
+        with HUB.feed_lock:
+            if HUB.feed_conn is conn:
+                HUB.feed_conn = None
+                with HUB.lock:
+                    HUB.feed.update(connected=False)
+                    HUB.broadcast({"type": "feed", "feed": HUB.feed})
+        try:
+            conn.close()
+        except OSError:
+            pass
+        log("feed disconnected")
+
+
+def feed_server():
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o117)
+    srv.bind(SOCK)
+    os.umask(old)
+    os.chmod(SOCK, 0o660)
+    srv.listen(2)
+    while True:
+        conn, _ = srv.accept()
+        with HUB.feed_lock:   # one shipper at a time: the newest wins
+            if HUB.feed_conn is not None:
+                try:
+                    HUB.feed_conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            HUB.feed_conn = conn
+        log("feed connected")
+        threading.Thread(target=feed_reader, args=(conn,), daemon=True).start()
+
+
+# ------------------------------------------------------------------------------------------------ hardware
+
+def num(s):
+    try:
+        return float(str(s).strip().split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def short(name):
+    return re.sub(r"^(NVIDIA\s+)?(GeForce\s+)?", "", name.strip())
+
+
+def cpu_temp():
+    base = "/sys/class/hwmon"
+    try:
+        for d in os.listdir(base):
+            if open(f"{base}/{d}/name").read().strip() in ("coretemp", "k10temp"):
+                return int(open(f"{base}/{d}/temp1_input").read()) / 1000
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def mem():
+    m = {}
+    for l in open("/proc/meminfo"):
+        k, v = l.split(":", 1)
+        m[k] = int(v.split()[0]) / 1048576
+    return round(m["MemTotal"] - m["MemAvailable"], 1), round(m["MemTotal"], 1)
+
+
+LAST_GEN = {}
+
+
+def model_server(port, spec):
+    base = f"http://127.0.0.1:{port}"
+    try:
+        if spec.get("kind") == "llama":
+            s = json.load(urllib.request.urlopen(base + "/slots", timeout=1.5))[0]
+            dec = ((s.get("next_token") or [{}])[0]).get("n_decoded", 0)
+            now, last = time.time(), LAST_GEN.get(port)
+            LAST_GEN[port] = (now, dec, s.get("id_task"))
+            used, n_ctx = s.get("n_prompt_tokens", 0), s.get("n_ctx") or spec.get("ctx")
+            if not s.get("is_processing"):
+                return {"state": "idle", "ctx_used": used, "ctx_max": n_ctx}
+            if dec == 0:
+                done = s.get("n_prompt_tokens_processed", 0) + s.get("n_prompt_tokens_cache", 0)
+                return {"state": "reading", "prompt_pct": round(min(100, 100 * done / max(used, 1))), "ctx_used": used, "ctx_max": n_ctx}
+            rate = (dec - last[1]) / (now - last[0]) if last and last[2] == s.get("id_task") and dec > last[1] else None
+            return {"state": "generating", "tok_s": round(rate, 1) if rate else None, "ctx_used": used + dec, "ctx_max": n_ctx}
+        text = urllib.request.urlopen(base + "/metrics", timeout=1.5).read().decode()
+        vals = collections.defaultdict(float)
+        for ln in text.splitlines():
+            for key in ("vllm:generation_tokens_total", "vllm:num_requests_running", "vllm:kv_cache_usage_perc"):
+                if ln.startswith(key + "{") or ln.startswith(key + " "):
+                    vals[key] += float(ln.rsplit(" ", 1)[1])
+        now, gen = time.time(), vals["vllm:generation_tokens_total"]
+        last = LAST_GEN.get(port)
+        LAST_GEN[port] = (now, gen)
+        rate = (gen - last[1]) / (now - last[0]) if last and now > last[0] else 0.0
+        running = vals["vllm:num_requests_running"] > 0
+        state = "generating" if rate > 0 else ("reading" if running else "idle")   # tokens in the last 3 s count
+        return {"state": state, "tok_s": round(rate, 1) if rate > 0 else None, "kv_pct": round(100 * vals["vllm:kv_cache_usage_perc"]), "ctx_max": spec.get("ctx")}
+    except Exception:
+        return {"state": "down"}
+
+
+def backfill():
+    """The last hour from the temperature guard's log, one point a minute per card."""
+    path = CONF.get("hwtemps", "/var/log/hwtemps.csv")
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 400000))
+            rows = fh.read().decode(errors="replace").splitlines()[1:]
+    except OSError:
+        return
+    now = time.time()
+    cut, prev = now - 3600, None
+    acc = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r in reversed(rows):   # newest first; stop at the hour's edge or where the log's clock jumped
+        f = r.split(",")
+        if len(f) < 10:
+            continue
+        try:
+            t = time.mktime(time.strptime(f[0], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if t > now + 60:   # stamped in the future: a stretch written before a time zone change
+            continue
+        if t < cut or (prev is not None and t > prev + 120):
+            break
+        prev = t
+        minute = int(t // 60 * 60)
+        acc[minute][short(f[4])].append((num(f[5]), num(f[6])))
+    minutes = sorted(acc)[-60:]
+    names = sorted({n for m in minutes for n in acc[m]})
+    h = {"temp": {n: [] for n in names}, "power": {n: [] for n in names}, "minutes": minutes}
+    for m in minutes:
+        for n in names:
+            vals = [v for v in acc[m].get(n, []) if v[0] is not None]
+            h["temp"][n].append(round(sum(v[0] for v in vals) / len(vals), 1) if vals else None)
+            pw = [v[1] for v in vals if v[1] is not None]
+            h["power"][n].append(round(sum(pw) / len(pw)) if pw else None)
+    with HUB.lock:
+        HUB.hist = h
+
+
+def sampler():
+    backfill()
+    minute_acc = collections.defaultdict(list)
+    cur_minute = int(time.time() // 60 * 60)
+    while True:
+        gpus = []
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name,temperature.gpu,power.draw,power.limit,fan.speed,utilization.gpu,memory.used,memory.total",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout
+            for l in out.strip().splitlines():
+                f = [x.strip() for x in l.split(",")]
+                if len(f) < 10:
+                    continue
+                port = next((p for p, s in SERVERS.items() if s.get("gpu") == f[1]), None)
+                gpus.append({"index": int(f[0]), "uuid": f[1], "name": short(f[2]), "temp": num(f[3]), "power": num(f[4]), "cap": num(f[5]),
+                             "fan": num(f[6]), "util": num(f[7]), "mem_used": num(f[8]), "mem_total": num(f[9]), "port": port})
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            load = round(100 * os.getloadavg()[0] / (os.cpu_count() or 1))
+            used, total = mem()
+        except OSError:
+            load, used, total = None, None, None
+        servers = {p: model_server(p, s) for p, s in SERVERS.items()}
+        hw = {"gpus": gpus, "cpu": {"temp": cpu_temp(), "load": load, "ram_used": used, "ram_total": total}, "servers": servers, "t": time.time()}
+        with HUB.lock:
+            HUB.hw = hw
+            HUB.broadcast({"type": "hw", "hw": hw})
+        now_minute = int(time.time() // 60 * 60)
+        for g in gpus:
+            minute_acc[g["name"]].append((g["temp"], g["power"]))
+        if now_minute != cur_minute:
+            with HUB.lock:
+                h = HUB.hist
+                again = bool(h["minutes"]) and h["minutes"][-1] == cur_minute   # the backfill already has part of it
+                if not again:
+                    h["minutes"] = (h["minutes"] + [cur_minute])[-60:]
+                for name in set(h["temp"]) | set(minute_acc):
+                    vals = [v for v in minute_acc.get(name, []) if v[0] is not None]
+                    for key, i in (("temp", 0), ("power", 1)):
+                        series = h[key].setdefault(name, [None] * (len(h["minutes"]) - (0 if again else 1)))
+                        pts = [v[i] for v in vals if v[i] is not None]
+                        value = round(sum(pts) / len(pts), 1) if pts else None
+                        if again and len(series) == len(h["minutes"]):
+                            series[-1] = value if value is not None else series[-1]
+                        else:
+                            series.append(value)
+                        del series[:-60]
+                HUB.broadcast({"type": "hist", "hist": h})
+            minute_acc.clear()
+            cur_minute = now_minute
+        time.sleep(3)
+
+
+# ------------------------------------------------------------------------------------------------ HTTP
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "labdash"
+    sys_version = ""
+
+    def log_message(self, fmt, *a):
+        pass
+
+    def headers_common(self, ctype, extra=None):
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+
+    def reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.headers_common("application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def host_ok(self):
+        if self.headers.get("Host") in HOSTS:
+            return True
+        self.reply(421, {"error": "unknown host"})
+        return False
+
+    def do_GET(self):
+        if not self.host_ok():
+            return
+        path = self.path.split("?", 1)[0]
+        if path in STATIC:
+            name, ctype = STATIC[path]
+            try:
+                body = open(os.path.join(WEB, name), "rb").read()
+            except OSError:
+                return self.reply(404, {"error": "not found"})
+            self.send_response(200)
+            self.headers_common(ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/api/state":
+            with HUB.lock:
+                self.reply(200, HUB.snapshot())
+        elif path == "/api/stream":
+            self.stream()
+        else:
+            self.reply(404, {"error": "not found"})
+
+    def stream(self):
+        q = HUB.subscribe()
+        self.send_response(200)
+        self.headers_common("text/event-stream", {"X-Accel-Buffering": "no"})
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            while not q.dead:
+                try:
+                    data = q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(b"data: " + data.encode() + b"\n\n")
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            HUB.clients.discard(q)
+
+    def do_POST(self):
+        if not self.host_ok():
+            return
+        origin = self.headers.get("Origin")
+        if self.headers.get("X-Labdash") != "1" or (origin and origin != "http://" + self.headers.get("Host")):
+            return self.reply(403, {"error": "cross-site request refused"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 65536:   # read what was sent (up to 1 MiB) so the client gets the answer, not a reset connection
+                left = min(n, 1 << 20)
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 65536))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                self.close_connection = True
+                return self.reply(413, {"error": "too large"})
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self.reply(400, {"error": "bad JSON"})
+        path = self.path.split("?", 1)[0]
+        ch = body.get("ch")
+        with HUB.lock:
+            known = isinstance(ch, str) and ch in HUB.channels
+        if path in ("/api/message", "/api/answer"):
+            text = str(body.get("text") or "").strip()
+            if not known:
+                return self.reply(404, {"error": "that agent is not on the console"})
+            if not text or len(text) > 4000:
+                return self.reply(400, {"error": "a message is 1 to 4000 characters"})
+            cid = secrets.token_hex(6)
+            cmd = {"op": path.rsplit("/", 1)[1], "id": cid, "ch": ch, "text": text}
+            if path.endswith("message"):
+                cmd["stop"] = bool(body.get("stop"))
+            else:
+                ask = str(body.get("ask") or "")
+                if not re.fullmatch(r"\d{1,4}", ask):
+                    return self.reply(400, {"error": "bad request number"})
+                cmd["ask"] = ask
+            if not HUB.to_feed(cmd):
+                return self.reply(503, {"error": "the link to the VM is down; nothing was sent"})
+            return self.reply(202, {"id": cid})
+        if path == "/api/resync":
+            if ch is not None and not known:
+                return self.reply(404, {"error": "that agent is not on the console"})
+            if not HUB.to_feed({"op": "resync", **({"ch": ch} if ch else {})}):
+                return self.reply(503, {"error": "the link to the VM is down"})
+            return self.reply(202, {})
+        self.reply(404, {"error": "not found"})
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+    def server_bind(self):   # HTTPServer's own looks its address up in DNS first (getfqdn), which can hang startup
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+
+
+def main():
+    threading.Thread(target=feed_server, daemon=True).start()
+    threading.Thread(target=sampler, daemon=True).start()
+    host, port = CONF.get("listen", ["127.0.0.1", 8700])
+    log(f"listening on {host}:{port}")
+    Server((host, int(port)), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

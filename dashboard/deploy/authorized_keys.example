@@ -1,0 +1,7 @@
+# AI box, /var/lib/<feed-account>/.ssh/authorized_keys: the VM's shipper. Runs labdash-ingest and nothing else.
+# (The account needs a real shell, /bin/sh, for sshd to run the forced command; its password is locked.)
+from="<vm-address>",restrict,command="/usr/local/bin/labdash-ingest" ssh-ed25519 <key> <comment>
+
+# AI box, /var/lib/<view-account>/.ssh/authorized_keys: the operator's Mac. Opens the tunnel to the console and nothing
+# else (shell /usr/sbin/nologin; ssh -N never runs a command). from= is the home LAN, since the Mac's address is DHCP.
+from="<home-lan-cidr>",restrict,port-forwarding,permitopen="127.0.0.1:8700",command="/bin/false" ssh-ed25519 <key> <comment>

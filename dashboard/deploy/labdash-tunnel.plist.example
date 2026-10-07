@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ~/Library/LaunchAgents/local.labdash-tunnel.plist on the operator's Mac: keeps http://localhost:8700 open to the
+     console on the AI box. launchd restarts the tunnel whenever it drops (sleep, Wi-Fi change, AI box reboot).
+     Load:   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.labdash-tunnel.plist
+     Unload: launchctl bootout gui/$(id -u)/local.labdash-tunnel
+     The key only forwards to the console's port (permitopen) from the home LAN. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.labdash-tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>ServerAliveInterval=15</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-o</string><string>IdentitiesOnly=yes</string>
+    <string>-o</string><string>StrictHostKeyChecking=yes</string>
+    <string>-i</string><string>/Users/<you>/.ssh/labdash_view_ed25519</string>
+    <string>-L</string><string>127.0.0.1:8700:127.0.0.1:8700</string>
+    <string><view-account>@<ai-box-address></string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>/tmp/labdash-tunnel.log</string>
+</dict>
+</plist>

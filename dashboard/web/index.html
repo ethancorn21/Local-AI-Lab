@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Agent Lab Console</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Kode+Mono:wght@400..700&family=Tektur:wdth,wght@75..100,400..900&display=swap">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">agent<span>/</span>lab</div>
+    <nav class="nav" id="nav-main"></nav>
+    <nav class="nav" id="nav-agents"></nav>
+    <div class="rail-foot" id="rail-foot"></div>
+  </aside>
+  <main class="main" id="main">
+    <header class="top">
+      <h1 id="title" class="v-name">Live</h1>
+      <div class="status" id="status"></div>
+      <button class="act" id="reconnect-all" title="Drop every live stream and reconnect">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>
+        <span>Reconnect all</span></button>
+    </header>
+    <div id="banner"></div>
+    <div id="view"></div>
+  </main>
+</div>
+</body>
+</html>

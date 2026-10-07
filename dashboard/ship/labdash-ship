@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""labdash-ship: ships the agents' live work to the lab console on the AI box and brings the operator's messages back.
+
+Runs on the harness VM as the agent user (systemd unit labdash-ship). Holds one SSH connection to the AI box, where a
+forced command (labdash-ingest) hands the lines to the console's server. Upstream: one JSON object per line, the
+agents' sessions already turned into the console's events (thinking, answers, tool calls with their diffs and output,
+driver lines from loop.log), plus snapshots of each agent's task (task file, PROGRESS.md, open requests, history) and
+each project's sprint. Downstream, on the same connection: the operator's messages (written to the agent's
+.agent/inbox/, exactly as agent-watch does) and answers to requests (appended to .agent/asks/<n>.md, as agent-talk
+does), each acknowledged.
+
+Which projects: `--only frontpage,hollowdeep` ships those (and their team worktrees, frontpage.a ...). Without it,
+every project in ~/projects except the ones named in ~/.agent-kit/dashboard-hidden, one per line; that file must exist
+(empty is fine), or nothing is shipped. A hidden project is dropped by name before anything inside it is opened.
+
+  labdash-ship [--only a,b] [--target labdash-feed]   ship over SSH (Host alias in ~/.ssh/config)
+  labdash-ship --stdio [--only a,b]                    protocol on stdout, commands on stdin (tests)
+"""
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import threading
+import time
+import queue
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.environ.get("LABDASH_PROJECTS", os.path.join(HOME, "projects"))
+HIDDEN = os.environ.get("LABDASH_HIDDEN", os.path.join(HOME, ".agent-kit", "dashboard-hidden"))
+SPRINT_TOOL = os.environ.get("LABDASH_SPRINT", os.path.join(HOME, "bin", "sprint-progress"))
+RECENT = 6 * 3600          # a project whose loop stopped stays on the console this long after its last session
+FLUSH = 0.3                # streamed text goes up at most this often per event
+SNAP_EVERY = 10            # seconds between task / sprint snapshots (sent only when they changed)
+SCAN_EVERY = 20            # seconds between looks for new or stopped loops
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def clean(s, cap):
+    s = CTRL.sub("", str(s or "").replace("\t", "    "))
+    return s if len(s) <= cap else s[:cap] + " …"
+
+
+def read(path, cap=None):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read(cap) if cap else fh.read()
+    except OSError:
+        return None
+
+
+def pid_alive(path):
+    try:
+        os.kill(int(open(path).read().split()[0]), 0)
+        return True
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def task_parts(rel):
+    """'tasks/255-feed-batch-continuation.md' -> ('255', 'feed batch continuation')"""
+    m = re.match(r"(?:.*/)?(\d+[a-z]*)-(.+)\.md$", rel or "")
+    return (m.group(1), m.group(2).replace("-", " ")) if m else ("", rel or "")
+
+
+# ------------------------------------------------------------------------------------------------ which projects
+
+def visible(only):
+    """Project directory names to ship. Hidden ones are dropped by name, before anything inside them is opened."""
+    try:
+        names = sorted(n for n in os.listdir(PROJECTS) if NAME.match(n))
+    except OSError:
+        return []
+    if only:
+        return [n for n in names if any(n == o or n.startswith(o + ".") for o in only)]
+    if not os.path.exists(HIDDEN):
+        log(f"no {HIDDEN}: shipping nothing until it exists (one hidden project name per line; empty is fine)")
+        return []
+    hidden = {l.strip() for l in open(HIDDEN) if l.strip() and not l.startswith("#")}
+    return [n for n in names if not any(n == h or n.startswith(h + ".") for h in hidden)]
+
+
+def team_env(path):
+    env = {}
+    for l in (read(os.path.join(path, ".agent", "team.env")) or "").splitlines():
+        m = re.match(r"\s*(?:export\s+)?([A-Z_]+)=['\"]?([^'\"]*)['\"]?\s*$", l)
+        if m:
+            env[m.group(1)] = m.group(2)
+    return env
+
+
+# ------------------------------------------------------------------------------------------------ Pi events -> console events
+
+def result_text(e, key="result"):
+    content = (e.get(key) or {}).get("content") or []
+    return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+
+
+def first_line(s):
+    s = str(s or "").strip()
+    return s.splitlines()[0] if s else ""
+
+
+def tool_head(name, a):
+    a = a or {}
+    if name == "bash":
+        cmd = str(a.get("command", ""))
+        return "Bash", first_line(cmd) + (" …" if "\n" in cmd.strip() else ""), ""
+    if name in ("edit", "write"):
+        return name.capitalize(), str(a.get("path", "")), ""
+    if name == "read":
+        rng = ""
+        if a.get("offset") or a.get("limit"):
+            start = int(a.get("offset") or 1)
+            rng = f"lines {start}–{start + int(a['limit']) - 1}" if a.get("limit") else f"from line {start}"
+        return "Read", str(a.get("path", "")), rng
+    if name == "web_search":
+        return "Search", str(a.get("query", "")), ""
+    if name == "web_fetch":
+        return "Fetch", str(a.get("url", "")), ""
+    if name == "ask_human":
+        return "Ask", "a request to you" + (" (blocking)" if a.get("blocking") is not False else ""), ""
+    return str(name), json.dumps(a)[:160], ""
+
+
+def out_lines(text, head=20, tail=40):
+    lines = text.rstrip("\n").split("\n") if text.strip() else ["(no output)"]
+    if len(lines) > head + tail:
+        lines = lines[:head] + [f"… {len(lines) - head - tail} lines …"] + lines[-tail:]
+    return [clean(l, 400) for l in lines]
+
+
+def tool_result(name, a, e):
+    """(meta, body, error) for a finished tool call."""
+    a, text = a or {}, result_text(e)
+    if e.get("isError"):
+        return "error", {"out": [["f", l] for l in out_lines(text, 8, 8)]}, True
+    if name == "edit":
+        diff = ((e.get("result") or {}).get("details") or {}).get("diff") or ""
+        lines, adds, dels = [], 0, 0
+        for l in diff.split("\n")[:160]:
+            m = re.match(r"^([ +-])(\s*\d*)\s(.*)$", l)
+            if m:
+                lines.append([m.group(1), m.group(2).strip(), clean(m.group(3), 400)])
+                adds += m.group(1) == "+"
+                dels += m.group(1) == "-"
+            elif l.strip():
+                lines.append([" ", "", clean(l, 400)])
+        return {"add": adds, "del": dels}, {"diff": lines, "path": str(a.get("path", ""))}, False
+    if name == "write":
+        lines = str(a.get("content", "")).rstrip("\n").split("\n")
+        body = [clean(l, 400) for l in lines[:80]] + ([f"… {len(lines) - 80} more lines"] if len(lines) > 80 else [])
+        return {"add": len(lines), "del": 0}, {"code": body, "start": 1, "path": str(a.get("path", ""))}, False
+    if name == "read":
+        lines = text.rstrip("\n").split("\n") if text.strip() else []
+        start = int(a.get("offset") or 1)
+        body = [clean(l, 400) for l in lines[:60]] + ([f"… {len(lines) - 60} more lines"] if len(lines) > 60 else [])
+        return f"{len(lines)} lines", {"code": body, "start": start, "path": str(a.get("path", ""))}, False
+    if name == "web_search":
+        n = len(re.findall(r"^\d+\. ", text, re.M))
+        return f"{n} results", {"out": [["", l] for l in out_lines(text, 12, 0)]}, False
+    if name == "bash":
+        tailtext = "\n".join(text.rstrip().split("\n")[-6:])
+        p = re.findall(r"(\d+) passed", tailtext)
+        f = re.findall(r"(\d+) failed", tailtext)
+        meta = {"pass": int(p[-1]), "fail": int(f[-1]) if f else 0} if p or f else ""
+        if f and not p:
+            meta = {"pass": 0, "fail": int(f[-1])}
+        cls = lambda l: "f" if re.search(r"\b(FAILED|Error|error:|Traceback)\b", l) else ("p" if re.search(r"\b\d+ passed\b", l) and not re.search(r"failed", l) else "")
+        return meta, {"out": [[cls(l), l] for l in out_lines(text)]}, False
+    return "", {"out": [["", l] for l in out_lines(text, 12, 12)]}, False
+
+
+class Session:
+    """Turns one Pi session file's events into console events. emit(kind, payload) sends them."""
+
+    def __init__(self, n, emit, activity):
+        self.n, self.emit, self.activity = n, emit, activity
+        self.count, self.cur, self.buf, self.last_flush = 0, None, "", 0.0
+        self.tools, self.user_msgs, self.composing = {}, 0, None
+
+    def new_id(self):
+        self.count += 1
+        return f"{self.n}-{self.count}"
+
+    def flush(self, force=False):
+        """Streamed text goes up in pieces. A block is announced only once it has words: Pi opens empty text blocks
+        between tool calls."""
+        if not self.cur or not self.buf or not (force or time.time() - self.last_flush >= FLUSH):
+            return
+        if not self.cur[2]:
+            if not self.buf.strip():
+                return
+            self.emit("ev", {"id": self.cur[0], "t": self.cur[1], "text": self.buf.lstrip("\n"), "done": False})
+            self.cur[2] = True
+        else:
+            self.emit("upd", {"id": self.cur[0], "append": {"text": self.buf}})
+        self.buf, self.last_flush = "", time.time()
+
+    def close_stream(self):
+        if self.cur:
+            self.flush(force=True)
+            if self.cur[2]:
+                self.emit("upd", {"id": self.cur[0], "set": {"done": True}})
+            self.cur = None
+
+    def open_stream(self, kind):
+        self.close_stream()
+        self.cur, self.buf = [self.new_id(), kind, False], ""
+
+    def event(self, e):
+        t = e.get("type")
+        if t == "message_update":
+            d = e.get("assistantMessageEvent") or {}
+            dt = d.get("type")
+            if dt == "thinking_start":
+                self.open_stream("think")
+                self.activity("thinking")
+            elif dt in ("thinking_delta", "text_delta"):
+                kind = "think" if dt == "thinking_delta" else "say"
+                if not self.cur or self.cur[1] != kind:
+                    self.open_stream(kind)
+                self.buf += CTRL.sub("", d.get("delta", ""))
+                self.flush()
+            elif dt == "text_start":
+                self.open_stream("say")
+                self.activity("answering")
+            elif dt in ("thinking_end", "text_end"):
+                self.close_stream()
+            elif dt == "toolcall_start":
+                self.close_stream()
+                self.composing = [d.get("toolName") or "tool", 0, 0.0]
+                self.activity(f"writing a {self.composing[0]} call")
+            elif dt == "toolcall_delta" and self.composing:
+                self.composing[1] += len(d.get("delta", ""))
+                if time.time() - self.composing[2] > 2:
+                    self.composing[2] = time.time()
+                    self.activity(f"writing a {self.composing[0]} call · {self.composing[1] // 1000}k chars")
+        elif t == "message_end":
+            msg = e.get("message") or {}
+            if msg.get("role") == "user":
+                self.close_stream()
+                text = "".join(c.get("text", "") for c in (msg.get("content") or []) if isinstance(c, dict)).strip()
+                self.user_msgs += 1
+                if self.user_msgs == 1:   # the loop's prompt for this session
+                    _, sep, extra = text.partition("The human sent you")
+                    if sep:
+                        self.emit("ev", {"id": self.new_id(), "t": "you", "text": clean(sep + extra, 4000), "note": "in this session's prompt"})
+                elif text.startswith("[Message from the human"):   # human-messages.ts, from the inbox mid-session
+                    self.emit("ev", {"id": self.new_id(), "t": "you", "text": clean(text.partition("\n")[2].strip(), 4000), "note": "delivered"})
+                else:   # the harness's own nudges: [harness] lines, wrap-up and prep notices
+                    self.emit("ev", {"id": self.new_id(), "t": "sys", "text": clean(first_line(text), 400)})
+            elif msg.get("role") == "assistant" and isinstance(msg.get("usage"), dict):
+                total = msg["usage"].get("totalTokens")
+                if isinstance(total, int) and total > 0:   # an aborted request reports 0
+                    self.emit("meta", {"ctx": total})
+        elif t == "tool_execution_start":
+            self.close_stream()
+            self.composing = None
+            kind, target, meta = tool_head(e.get("toolName"), e.get("args"))
+            eid = self.new_id()
+            self.tools[e.get("toolCallId")] = (eid, e.get("toolName"), e.get("args") or {})
+            ev = {"id": eid, "t": "tool", "kind": kind, "target": clean(target, 300), "meta": meta, "running": True}
+            if e.get("toolName") == "ask_human":
+                ev["body"] = {"out": [["", clean(l, 400)] for l in str((e.get("args") or {}).get("request", "")).splitlines()[:40]]}
+            self.emit("ev", ev)
+            self.activity(f"running {kind}")
+        elif t == "tool_execution_update":
+            tool = self.tools.get(e.get("toolCallId"))
+            lines = [l.strip() for l in result_text(e, "partialResult").splitlines() if l.strip()]
+            if tool and lines:
+                self.activity(f"running {tool_head(tool[1], tool[2])[0]} · {clean(lines[-1], 120)}")
+        elif t == "tool_execution_end":
+            eid, name, args = self.tools.pop(e.get("toolCallId"), (None, e.get("toolName"), {}))
+            meta, body, err = tool_result(name, args, e)
+            if eid is None:   # its start was before this file's replay window
+                kind, target, _ = tool_head(name, args)
+                eid = self.new_id()
+                self.emit("ev", {"id": eid, "t": "tool", "kind": kind, "target": clean(target, 300), "meta": "", "running": True})
+            upd = {"running": False, "meta": meta, "body": body}
+            if err:
+                upd["error"] = True
+            self.emit("upd", {"id": eid, "set": upd})
+            if not self.tools:
+                self.activity("thinking")
+        elif t in ("compaction_start", "auto_retry_start"):
+            self.close_stream()
+            self.emit("ev", {"id": self.new_id(), "t": "sys", "text": clean(f"{t.replace('_', ' ')}: {e.get('reason') or e.get('errorMessage') or ''}", 400)})
+        elif t == "agent_end":
+            self.close_stream()
+            self.activity("session finished")
+
+
+# ------------------------------------------------------------------------------------------------ one loop = one channel
+
+def parse_task(text):
+    """A task file -> its parts for the console's task panel."""
+    if text is None:
+        return None
+    lines = text.splitlines()
+    t = {"status": "", "title": "", "depends": [], "touches": [], "goal": "", "checks": []}
+    m = re.match(r"\s*Status:\s*(\S+)", lines[0] if lines else "", re.I)
+    t["status"] = m.group(1).lower() if m else ""
+    section, item = None, None
+    goal = []
+    for l in lines:
+        if l.startswith("# ") and not t["title"]:
+            t["title"] = re.sub(r"^\d+[a-z]*[:.)]?\s*", "", l[2:].strip())
+            continue
+        dm = re.match(r"Depends on:\s*(.*)", l, re.I)
+        if dm and section is None:
+            t["depends"] = re.findall(r"\b\d+[a-z]*\b", dm.group(1))
+            continue
+        tm = re.match(r"Touches:\s*(.*)", l, re.I)
+        if tm and section is None:
+            t["touches"] = [x.strip() for x in tm.group(1).split(",") if x.strip()][:20]
+            continue
+        if l.startswith("## "):
+            section = l[3:].strip().lower()
+            item = None
+            continue
+        if section == "goal":
+            goal.append(l)
+        elif section and section.startswith("acceptance"):
+            cm = re.match(r"\s*[-*]\s*\[([ xX])\]\s*(.*)", l)
+            if cm and len(t["checks"]) < 30:
+                item = [cm.group(1).lower() == "x", cm.group(2).strip()]
+                t["checks"].append(item)
+            elif item and l.strip() and l.startswith((" ", "\t")) and len(item[1]) < 400:
+                item[1] += " " + l.strip()
+            else:
+                item = None
+    paras, cur = [], []
+    for l in goal:
+        if l.strip():
+            cur.append(l.strip())
+        elif cur:
+            paras.append(" ".join(cur))
+            cur = []
+    if cur:
+        paras.append(" ".join(cur))
+    t["goal"] = clean("\n\n".join(paras), 2400)
+    t["checks"] = [[d, clean(x, 400)] for d, x in t["checks"]]
+    return t
+
+
+def task_status(path):
+    m = re.match(r"\s*Status:\s*(\S+)", read(path, 200) or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
+def task_file(tasks_dir, tid):
+    try:
+        for f in os.listdir(tasks_dir):
+            if f.startswith(tid + "-") and f.endswith(".md"):
+                return os.path.join(tasks_dir, f)
+    except OSError:
+        pass
+    return None
+
+
+class Channel:
+    def __init__(self, name, path, send):
+        self.name, self.path, self.send = name, path, send
+        env = team_env(path)
+        self.team_dir = env.get("TEAM_DIR") or None
+        self.agent = env.get("AGENT_ID") or ""
+        url = env.get("LLM_URL") or ""
+        m = re.search(r":(\d+)", url)
+        self.port = m.group(1) if m else ""
+        self.project = os.path.basename(self.team_dir) if self.team_dir else name
+        self.sess_path, self.sess_off, self.sess_part, self.sess = None, 0, b"", None
+        self.log_off, self.log_part = 0, b""
+        self.meta = {}
+        self.snap_hash = None
+        self.hist_cache = (None, [])
+
+    def agent_dir(self, *p):
+        return os.path.join(self.path, ".agent", *p)
+
+    def set_meta(self, **kw):
+        changed = {k: v for k, v in kw.items() if self.meta.get(k) != v}
+        if changed:
+            self.meta.update(changed)
+            self.send({"op": "meta", "ch": self.name, "meta": changed})
+
+    def emit(self, kind, payload):
+        if kind == "meta":
+            self.set_meta(**payload)
+        else:
+            self.send({"op": kind, "ch": self.name, **({"ev": payload} if kind == "ev" else payload)})
+
+    def newest_session(self):
+        try:
+            files = sorted(f for f in os.listdir(self.agent_dir("sessions")) if re.match(r"iter-\d+\.jsonl$", f))
+        except OSError:
+            return None
+        return self.agent_dir("sessions", files[-1]) if files else None
+
+    def iteration_line(self, n):
+        """(start epoch, task file) for session n, from loop.log, and the byte offset just after that line."""
+        start, task, off = None, "", 0
+        try:
+            with open(self.agent_dir("loop.log"), "rb") as fh:
+                pos = 0
+                for raw in fh:
+                    pos += len(raw)
+                    l = raw.decode(errors="replace")
+                    if f" iteration {n}: " in l:
+                        task = l.split(f"iteration {n}: ", 1)[-1].split(" (harness")[0].strip()
+                        try:
+                            start = time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S"))
+                        except ValueError:
+                            pass
+                        off = pos
+        except OSError:
+            pass
+        return start, task, off
+
+    def reset(self):
+        """Send this channel from scratch: meta, then the current session replayed and the driver lines since it began."""
+        self.sess_path, self.sess = None, None
+        self.meta = {}
+        self.snap_hash = None
+        self.send({"op": "reset", "ch": self.name, "meta": {"agent": self.agent, "project": self.project, "port": self.port, "team": bool(self.team_dir)}})
+        self.poll(replay=True)
+
+    def start_session(self, path):
+        n = int(re.search(r"iter-(\d+)", path).group(1))
+        start, task, off = self.iteration_line(n)
+        start = start or os.path.getmtime(path)
+        tid, tname = task_parts(task)
+        self.sess_path, self.sess_off, self.sess_part = path, 0, b""
+        self.log_off, self.log_part = off, b""
+        self.sess = Session(n, self.emit, lambda a: self.set_meta(activity=a))
+        self.emit("ev", {"id": f"{n}-0", "t": "divider", "time": time.strftime("%H:%M", time.localtime(start)), "task": tname})
+        self.set_meta(session=n, task_file=task, task_id=tid, task=tname, start=int(start), activity="reading prompt", ctx=None)
+
+    def read_new(self, path, off, part):
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(off)
+                data = fh.read(4 << 20)
+        except OSError:
+            return off, part, []
+        off += len(data)
+        data = part + data
+        lines = data.split(b"\n")
+        return off, lines[-1], lines[:-1]
+
+    def poll(self, replay=False):
+        newest = self.newest_session()
+        if newest and newest != self.sess_path:
+            if self.sess:
+                self.sess.close_stream()
+            self.start_session(newest)
+        if self.sess:
+            self.sess_off, self.sess_part, lines = self.read_new(self.sess_path, self.sess_off, self.sess_part)
+            for raw in lines:
+                try:
+                    e = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(e, dict):
+                    self.sess.event(e)
+            self.sess.flush(force=replay)
+            self.log_off, self.log_part, lines = self.read_new(self.agent_dir("loop.log"), self.log_off, self.log_part)
+            for raw in lines:
+                l = raw.decode(errors="replace").rstrip()
+                if not l or re.search(r" iteration \d+: ", l):
+                    continue
+                text = re.sub(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+", "", l)
+                good = bool(re.search(r"\b(verified|merged)\b", text, re.I)) and not re.search(r"\b(not|rejected|conflict)\b", text, re.I)
+                self.emit("ev", {"id": f"{self.sess.n}-L{self.log_off}-{len(text)}", "t": "sys", "text": clean(text, 400), "good": good})
+        alive_loop, alive_pi = pid_alive(self.agent_dir("loop.pid")), pid_alive(self.agent_dir("pi.pid"))
+        self.set_meta(loop=alive_loop, running=alive_pi)
+        if self.sess and not alive_pi and self.meta.get("activity") not in ("session finished", "between sessions"):
+            self.set_meta(activity="between sessions")
+
+    # ---- the task panel
+    def history(self, task_file):
+        path = self.agent_dir("iterations.jsonl")
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return []
+        if self.hist_cache[0] != (mt, task_file):
+            rows = []
+            for l in (read(path) or "").splitlines():
+                if f'"{task_file}"' not in l:
+                    continue
+                try:
+                    r = json.loads(l)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("task") == task_file:
+                    rows.append({k: r.get(k) for k in ("iter", "start", "end", "status_after", "verify", "agent_commits", "wrapup", "timed_out")})
+            self.hist_cache = ((mt, task_file), rows[-12:])
+        return self.hist_cache[1]
+
+    def asks(self):
+        out = []
+        d = self.agent_dir("asks")
+        try:
+            files = sorted(f for f in os.listdir(d) if re.match(r"\d+\.md$", f))
+        except OSError:
+            return out
+        for f in files[-20:]:
+            text = read(os.path.join(d, f), 20000) or ""
+            field = lambda k: (re.search(rf"^{k}:\s*(.*)$", text, re.M) or [None, ""])[1].strip()
+            if field("status") != "open":
+                continue
+            body = text.split("## Request", 1)[-1].split("\n## ", 1)[0].strip() if "## Request" in text else text
+            out.append({"id": f[:-3], "task": field("task"), "asked": field("asked"), "blocking": field("blocking"), "text": clean(body, 6000)})
+        return out
+
+    def snapshot(self):
+        tf = self.meta.get("task_file") or ""
+        tid = self.meta.get("task_id") or ""
+        main = self.team_dir or self.path
+        task = parse_task(read(os.path.join(self.path, tf), 60000)) if tf else None
+        if task:
+            for key in ("depends",):
+                task[key] = [[d, (lambda p: task_status(p) if p else "missing")(task_file(os.path.join(main, "tasks"), d.zfill(3) if d.isdigit() else d))] for d in task[key]]
+            unlocks = []
+            try:
+                for f in sorted(os.listdir(os.path.join(main, "tasks"))):
+                    if not f.endswith(".md") or f.startswith(tid + "-"):
+                        continue
+                    head = read(os.path.join(main, "tasks", f), 1500) or ""
+                    dm = re.search(r"^Depends on:\s*(.*)$", head, re.M | re.I)
+                    if dm and any(d.lstrip("0") == tid.lstrip("0") for d in re.findall(r"\b\d+[a-z]*\b", dm.group(1))):
+                        if task_status(os.path.join(main, "tasks", f)) not in ("done", "dropped"):
+                            unlocks.append(list(task_parts(f)))
+            except OSError:
+                pass
+            task["unlocks"] = unlocks[:12]
+        snap = {"task": task, "progress": clean(read(os.path.join(self.path, "PROGRESS.md"), 12000) or "", 8000),
+                "history": self.history(tf) if tf else [], "asks": self.asks(),
+                "prep": clean(read(os.path.join(main, "tasks", "prep", f"{tid}.md"), 6000) or "", 4000) if tid else ""}
+        h = hash(json.dumps(snap, sort_keys=True))
+        if h != self.snap_hash:
+            self.snap_hash = h
+            self.send({"op": "task", "ch": self.name, "snap": snap})
+
+    # ---- commands from the console
+    def message(self, text, stop):
+        inbox = self.agent_dir("inbox")
+        os.makedirs(inbox, exist_ok=True)
+        ms = int(time.time() * 1000)
+        final = os.path.join(inbox, f"{ms}{'.now' if stop else ''}.md")
+        tmp = os.path.join(inbox, f".labdash-{ms}.tmp")
+        with open(tmp, "w") as fh:
+            fh.write(text.rstrip() + "\n")
+        os.replace(tmp, final)
+
+    def answer(self, ask, text):
+        path = self.agent_dir("asks", f"{ask}.md")
+        body = read(path)
+        if body is None:
+            raise ValueError(f"request {ask} not found")
+        if not re.search(r"^status: open$", body, re.M):
+            raise ValueError(f"request {ask} is not open any more")
+        body = re.sub(r"^status: open$", "status: answered", body, count=1, flags=re.M)
+        body = body.rstrip("\n") + f"\n\n## Answer ({time.strftime('%Y-%m-%d %H:%M')}, console)\n{text.rstrip()}\n"
+        tmp = path + ".labdash.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------------------------ sprint boards
+
+def board(main):
+    try:
+        p = json.loads(subprocess.run([SPRINT_TOOL, main, "--json"], capture_output=True, text=True, timeout=30).stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    tasks_dir = os.path.join(main, "tasks")
+    files = {}
+    try:
+        for f in os.listdir(tasks_dir):
+            if f.endswith(".md"):
+                files[f.split("-")[0]] = f
+    except OSError:
+        pass
+
+    def info(tid):
+        f = files.get(tid)
+        text = read(os.path.join(tasks_dir, f), 4000) if f else ""
+        title = next((re.sub(r"^\d+[a-z]*[:.)]?\s*", "", l[2:].strip()) for l in (text or "").splitlines() if l.startswith("# ")), task_parts(f or "")[1])
+        dm = re.search(r"^Depends on:\s*(.*)$", text or "", re.M | re.I)
+        deps = re.findall(r"\b\d+[a-z]*\b", dm.group(1)) if dm else []
+        return f, clean(title, 200), deps
+
+    done, building, opened = [], [], []
+    for tid in p.get("tasks", []):
+        f, title, deps = info(tid)
+        status = task_status(os.path.join(tasks_dir, f)) if f else ""
+        if status == "done":
+            done.append({"id": tid, "title": title})
+        elif tid in p.get("in_progress", []):
+            agent = (p.get("by_agent") or {}).get(tid)
+            boxes = None
+            if agent:   # its live copy, in the agent's worktree
+                wt = f"{main}.{agent}"
+                t = parse_task(read(os.path.join(wt, "tasks", f), 60000)) if f and os.path.isdir(wt) else None
+                if t and t["checks"]:
+                    boxes = [sum(1 for c in t["checks"] if c[0]), len(t["checks"])]
+            building.append({"id": tid, "title": title, "agent": agent, "status": status, "boxes": boxes})
+        else:
+            waits = []
+            for d in deps:
+                df = files.get(d.zfill(3) if d.isdigit() else d)
+                if not df or task_status(os.path.join(tasks_dir, df)) not in ("done", "dropped"):
+                    waits.append(d)
+            opened.append({"id": tid, "title": title, "waits": waits})
+    done.reverse()
+    return {"total": p.get("total"), "done": done, "building": building, "open": opened}
+
+
+# ------------------------------------------------------------------------------------------------ the link
+
+class Link:
+    """The connection to the AI box: lines up, commands down. Reconnects with backoff; every new connection gets a full
+    resync."""
+
+    def __init__(self, target, stdio):
+        self.target, self.stdio, self.proc, self.out = target, stdio, None, None
+        self.cmds = queue.Queue()
+        self.generation = 0
+
+    def connect(self):
+        if self.stdio:
+            self.out = sys.stdout
+            threading.Thread(target=self.reader, args=(sys.stdin, self.generation), daemon=True).start()
+            return True
+        self.proc = subprocess.Popen(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", self.target],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.out = self.proc.stdin
+        self.generation += 1
+        threading.Thread(target=self.reader, args=(self.proc.stdout, self.generation), daemon=True).start()
+        return True
+
+    def reader(self, fh, gen):
+        for line in fh:
+            try:
+                c = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(c, dict):
+                self.cmds.put(c)
+        if self.stdio:
+            self.cmds.put({"op": "_eof"})
+
+    def alive(self):
+        return self.stdio or (self.proc is not None and self.proc.poll() is None)
+
+    def send(self, obj):
+        try:
+            self.out.write(json.dumps(obj, separators=(",", ":")) + "\n")
+            self.out.flush()
+            return True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+
+def main():
+    args = sys.argv[1:]
+    only = args[args.index("--only") + 1].split(",") if "--only" in args else []
+    target = args[args.index("--target") + 1] if "--target" in args else "labdash-feed"
+    stdio = "--stdio" in args
+    link = Link(target, stdio)
+    channels, boards = {}, {}
+    broken = [False]
+
+    def send(obj):
+        if not link.send(obj):
+            broken[0] = True
+
+    def scan():
+        """Loops that run now, or ran in the last RECENT seconds."""
+        found = {}
+        for n in visible(only):
+            path = os.path.join(PROJECTS, n)
+            a = os.path.join(path, ".agent")
+            if not os.path.isdir(os.path.join(a, "sessions")):
+                continue
+            recent = False
+            try:
+                recent = time.time() - max(os.path.getmtime(os.path.join(a, "sessions", f)) for f in os.listdir(os.path.join(a, "sessions"))) < RECENT
+            except (OSError, ValueError):
+                pass
+            if pid_alive(os.path.join(a, "loop.pid")) or (recent and not os.path.exists(os.path.join(a, "team-main"))):
+                found[n] = path
+        for n in list(channels):
+            if n not in found:
+                del channels[n]
+                send({"op": "gone", "ch": n})
+        for n, path in found.items():
+            if n not in channels:
+                channels[n] = Channel(n, path, send)
+                channels[n].reset()
+
+    def mains():
+        return sorted({c.team_dir or c.path for c in channels.values()})
+
+    def resync():
+        send({"op": "hello", "version": 1, "host": os.uname().nodename})
+        channels.clear()
+        boards.clear()
+        scan()
+
+    backoff = 2
+    while True:
+        broken[0] = False
+        t_connect = time.time()
+        link.connect()
+        log("connected" if not stdio else "stdio")
+        resync()
+        t_snap = t_scan = 0.0
+        while link.alive() and not broken[0]:
+            for c in list(channels.values()):
+                c.poll()
+            now = time.time()
+            if now - t_scan > SCAN_EVERY:
+                t_scan = now
+                scan()
+            if now - t_snap > SNAP_EVERY:
+                t_snap = now
+                for c in list(channels.values()):
+                    c.snapshot()
+                for m in mains():
+                    b = board(m)
+                    if b is not None and b != boards.get(m):
+                        boards[m] = b
+                        send({"op": "board", "project": os.path.basename(m), "board": b})
+            try:
+                cmd = link.cmds.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            op, cid = cmd.get("op"), str(cmd.get("id", ""))[:32]
+            if op == "_eof":
+                return
+            if op == "resync":
+                ch = cmd.get("ch")
+                if ch in channels:
+                    channels[ch].reset()
+                    channels[ch].snapshot()
+                else:
+                    resync()
+                    t_snap = 0.0
+                continue
+            if op not in ("message", "answer"):
+                continue
+            ch = channels.get(cmd.get("ch"))
+            text = clean(cmd.get("text", ""), 4000).strip()
+            try:
+                if ch is None:
+                    raise ValueError("that agent is not on the console")
+                if not text:
+                    raise ValueError("empty message")
+                if op == "message":
+                    ch.message(text, bool(cmd.get("stop")))
+                else:
+                    ask = str(cmd.get("ask", ""))
+                    if not re.fullmatch(r"\d{1,4}", ask):
+                        raise ValueError("bad request number")
+                    ch.answer(ask, text)
+                    ch.snapshot()
+                send({"op": "ack", "id": cid, "ok": True})
+            except (ValueError, OSError) as e:
+                send({"op": "ack", "id": cid, "ok": False, "error": str(e)[:200]})
+        if stdio:
+            return
+        log(f"link down; reconnecting in {backoff}s")
+        try:
+            link.proc.kill()
+        except (OSError, AttributeError):
+            pass
+        backoff = 2 if time.time() - t_connect > 60 else min(60, backoff * 2)
+        time.sleep(backoff)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

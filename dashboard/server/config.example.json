@@ -1,0 +1,12 @@
+{
+  "listen": ["127.0.0.1", 8700],
+  "hosts": ["localhost:8700", "127.0.0.1:8700"],
+  "socket": "/run/labdash/ingest.sock",
+  "web": "/opt/labdash/web",
+  "hwtemps": "/var/log/hwtemps.csv",
+  "servers": {
+    "8080": {"gpu": "GPU-<uuid of the card behind port 8080>", "kind": "vllm", "ctx": 150000},
+    "8081": {"gpu": "GPU-<uuid of the card behind port 8081>", "kind": "vllm", "ctx": 150000},
+    "8082": {"gpu": "GPU-<uuid of the card behind port 8082>", "kind": "llama", "ctx": 114688}
+  }
+}

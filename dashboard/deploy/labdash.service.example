@@ -1,0 +1,38 @@
+# /etc/systemd/system/labdash.service on the AI box: the lab console's server (dashboard/server/labdash).
+# Listens on 127.0.0.1:8700 only; the operator's Mac reaches it through an SSH tunnel (the viewing account).
+# The shipper on the VM reaches it through /run/labdash/ingest.sock (the feed account, forced command).
+[Unit]
+Description=Lab console: agents, requests and hardware on one page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<console-user>
+Group=<console-group>
+ExecStart=/usr/bin/python3 /opt/labdash/labdash /etc/labdash/config.json
+Restart=always
+RestartSec=3
+# the ingest socket's directory: the service owns it, its group (the feed account is a member) can reach the socket
+RuntimeDirectory=labdash
+RuntimeDirectoryMode=0750
+UMask=0007
+# hardening: read-only system, no home directories, no privilege gain. No PrivateDevices: nvidia-smi needs /dev/nvidia*.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

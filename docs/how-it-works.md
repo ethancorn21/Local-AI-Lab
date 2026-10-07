@@ -30,6 +30,7 @@ hardware and model serving are in [ai-lab.md](ai-lab.md). Terms in **bold** are 
 | **Driver** | `agent-loop` and helpers: bash, no model | Picks tasks, starts sessions, enforces limits, verifies done claims, merges finished work, logs every session | Make a judgment call |
 | **Agents** | Qwen3.8-27B (open weights) in the Pi coding agent, one per GPU | Plan, split tasks, write code and tests, run them, take notes, commit | Change what "done" means |
 | **Model servers** | vLLM on the RTX 3090 Ti and the RTX 3090, llama.cpp on the RTX 5060 Ti | Serve the model to the agents over SSH tunnels | Anything else: they only answer requests |
+| **Console** | A web page on the AI box ([dashboard/](../dashboard/README.md)) | Shows the operator every agent live, its task, the requests, the sprint and the hardware; carries the operator's messages and answers to the agents | Decide anything: it only shows, and delivers what the human types |
 
 ```mermaid
 flowchart LR
@@ -347,6 +348,7 @@ dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 t
   was decided against), commands.
 - [experiments.md](experiments.md): what was measured and what it decided.
 - [ai-lab.md](ai-lab.md): hardware, model serving, network and security, changelog.
+- [dashboard/](../dashboard/README.md): the lab console, how its data gets from the agents to the page, and its security.
 - [history/](history/): the first build, team mode's first run, the detailed changelog.
 - Code: [harness/driver/](../harness/driver/) (driver), [harness/pi-extensions/](../harness/pi-extensions/) (agent-side
   extensions), [harness/template/AGENTS.md](../harness/template/AGENTS.md) (the rules every agent reads),

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# dashboard/deploy/push [aibox|vm]: install the console's code from this checkout and restart it. Default: both ends.
+# The one-time setup (accounts, keys, config, systemd units, the Mac's tunnel) is in dashboard/README.md.
+# Hosts are your ssh aliases: AIBOX (default aibox) and VM (default harnessvm); both need sudo.
+set -euo pipefail
+AIBOX=${AIBOX:-aibox}
+VM=${VM:-harnessvm}
+D=$(cd "$(dirname "$0")/.." && pwd)
+what=${1:-both}
+
+if [[ $what == both || $what == aibox ]]; then
+  tar -C "$D" -czf - server/labdash server/labdash-ingest web | ssh "$AIBOX" 'set -e
+    t=$(mktemp -d); trap "rm -rf $t" EXIT; tar -C "$t" -xzf -
+    sudo install -m 0755 "$t/server/labdash" /opt/labdash/labdash
+    sudo install -m 0755 "$t/server/labdash-ingest" /usr/local/bin/labdash-ingest
+    sudo install -m 0644 "$t"/web/* /opt/labdash/web/
+    sudo systemctl restart labdash
+    sleep 3; echo "AI box: labdash $(systemctl is-active labdash)"'
+fi
+if [[ $what == both || $what == vm ]]; then
+  ssh "$VM" 'set -e
+    sudo install -d -m 0755 /opt/labdash
+    sudo tee /opt/labdash/labdash-ship >/dev/null; sudo chmod 0755 /opt/labdash/labdash-ship
+    sudo systemctl restart labdash-ship
+    sleep 3; echo "VM: labdash-ship $(systemctl is-active labdash-ship)"' < "$D/ship/labdash-ship"
+fi

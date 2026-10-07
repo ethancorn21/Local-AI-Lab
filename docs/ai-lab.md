@@ -111,6 +111,7 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 | 8081 | vLLM on the 3090 (agent c) |
 | 8082 | llama.cpp on the 5060 Ti |
 | 8090 | Reserved: the type-1 log triage model |
+| 8700 | The lab console ([dashboard/](../dashboard/README.md)), on the AI box's localhost; the operator's Mac reaches it through its own SSH tunnel |
 
 ### Lessons from serving
 
@@ -124,6 +125,10 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 - **Segmentation.** The AI box is on the trusted network; the harness VM is in an isolated lab network. The firewall
   allows only VM to AI box over SSH. The model API is never exposed.
 - **The tunnel key does one thing:** forward the listed model ports, from the VM's address only, with no shell.
+- **The lab console** shows the agents' work to the operator without a shell anywhere: the VM pushes over SSH to a
+  forced command that can only hand lines to the console, and the Mac's key can only forward to the console's port.
+  Agent text is rendered as text only; the page refuses foreign `Host` headers and cross-site requests
+  ([details](../dashboard/README.md#security)).
 - **Separate identities** for the operator, Claude, the model service, the tunnel and the agents, so every action in
   the auth log is attributable and each can be revoked on its own.
 - **The agents' permissions on their VM:** `sudo apt-get` (root-equivalent there, a deliberate choice) and web
@@ -178,3 +183,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
 | 10-06 | Request deadline and required recommendation; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; takeover; plain-text requests answered in Telegram; second RTX 3090 in, agent c on it (`agent-team add`); both 24 GB cards at 300 W; OS updates on both machines; `agent-watch` status line reads task name, then sprint done · being built · not started. |
+| 10-07 | The lab console: one web page with every agent live, its task, requests, the sprint board and the hardware; message agents and answer requests from it ([dashboard/](../dashboard/README.md)). |

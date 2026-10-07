@@ -43,6 +43,7 @@ them while they work.
 | [docs/history/](docs/history/) | The first build, team mode's first run, the detailed changelog |
 | [server/](server/) | The GPU box: power limits, the thermal guard, vLLM and llama.cpp configs, the encrypted doorbell relay, benchmarks |
 | [harness/](harness/) | The agents' VM: the driver, Pi extensions, the project template, operator tools, config examples |
+| [dashboard/](dashboard/README.md) | The lab console: every agent live, requests, the sprint board and the hardware on one web page |
 | [analysis/](analysis/) | Session-log analysers behind every number in the docs, experiment kits, the driver's tests |
 
 ## Using it
@@ -58,7 +59,8 @@ The pieces assume the setup in [docs/ai-lab.md](docs/ai-lab.md): model servers r
 3. **A team:** one settings file per agent in `~/.agent-kit/agents/` (from `harness/agents/*.env.example`), then
    `agent-team init <name>` and `agent-team start <name>`; `agent-team add <name> <id>` brings in another agent
    later.
-4. Watch and steer with `agent-watch <name>`; stop with `agent-stop <name>` or `agent-team stop <name>`.
+4. Watch and steer with `agent-watch <name>`, or all agents at once in the [lab console](dashboard/README.md); stop
+   with `agent-stop <name>` or `agent-team stop <name>`.
 
 Configs ending in `.example` have placeholders (`<...>`, `CHANGE-ME`) in place of addresses, account names and secrets.
 

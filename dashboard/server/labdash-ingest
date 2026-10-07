@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""labdash-ingest: the forced command of the AI box's feed account (authorized_keys command=..., from the VM
+only, no shell, no forwarding). Joins the SSH session to the console server's Unix socket: the shipper's lines in,
+the operator's commands out. Lines longer than 1 MiB are dropped. Nothing else can be run with that key."""
+import os
+import socket
+import sys
+import threading
+
+SOCK = os.environ.get("LABDASH_SOCKET", "/run/labdash/ingest.sock")
+CAP = 1 << 20
+
+
+def up(conn):
+    inp = sys.stdin.buffer
+    try:
+        while True:
+            line = inp.readline(CAP)
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                while line and not line.endswith(b"\n"):
+                    line = inp.readline(CAP)
+                continue
+            conn.sendall(line)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+def main():
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.connect(SOCK)
+    except OSError as e:
+        sys.exit(f"labdash-ingest: the console server is not running ({e})")
+    threading.Thread(target=up, args=(conn,), daemon=True).start()
+    out = sys.stdout.buffer
+    try:
+        while True:
+            data = conn.recv(65536)
+            if not data:
+                break
+            out.write(data)
+            out.flush()
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
