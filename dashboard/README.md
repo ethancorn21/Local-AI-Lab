@@ -12,10 +12,18 @@ launchd keeps up.
 
 | View | What it shows |
 |---|---|
-| **Live** | All agents at once, like terminal windows on one monitor: one tall pane, the others stacked beside it (the arrows button swaps which one is tall). Each pane: the agent's GPU, task, speed, context, KV pool, session time, its feed, and a message box. |
+| **Live** | All agents at once, like terminal windows on one monitor: one tall pane, the others stacked beside it (the arrows button swaps which one is tall). Each pane: a chip saying what the agent is doing right now, its GPU, task, speed, context, KV pool, session time, its feed, and a message box. |
+| **Timeline** | The sprint so far as a node canvas: time left to right, a row per agent and one for `main`. Each edit or write is a node (click it for its diff and the file's other changes); sessions are bands (prep sessions dashed, a green end = done), test runs are ✓/✗ pills, merges arc up into `main`, waiting for other agents is hatched, and the driver's events (handed over, split, new task, stalled) sit above. Drag or swipe to pan; pinch, Ctrl+wheel or the wheel to zoom; "Follow now" keeps the right edge at the present. |
 | **Board** | Requests waiting for you, with an answer box, then each project's sprint as three columns: done, being built (with its agent and acceptance boxes ticked), not started (with what it waits for, or "ready to start"). |
 | **Hardware** | One card per GPU (temperature, power against its cap, fan, load, memory, model server speed) and the CPU; the last hour of temperature and power as charts, with the temperature guard's thresholds; a table view. |
 | **Agent** (one per agent) | The full feed with a composer (Send, or Stop session & send), and the task panel: goal, acceptance boxes, depends on / unlocks, files it touches, every session on this task, prep notes, `PROGRESS.md`, open requests, this session's numbers. |
+
+What the colours mean. The page is quiet on purpose and only the labels are loud, so a glance says what each agent is
+doing: violet = thinking, lime = answer, orange = bash, sky = read, yellow = edit, teal = write, blue = web search or
+fetch, hot pink-red = a request to you, magenta = the driver (the harness between sessions), grey = waiting for other
+agents. Red and green never label anything: they mean failed and passed. The pane header's chip is the same set for
+the agent's state right now, plus PREP (outlined) during a prep session. The sun/moon button switches between the
+off-white and the dark brown theme (remembered per browser); the page tells Dark Reader to leave it alone.
 
 What the numbers mean:
 
@@ -47,7 +55,11 @@ flowchart LR
 1. **labdash-ship** runs on the VM as the agent user. It follows each agent's newest Pi session file and its
    `loop.log`, turns Pi's raw events into the console's events (a thinking block, a tool call and later its result),
    and sends one JSON object per line. Every 10 seconds it also sends each agent's task panel and each project's sprint,
-   only when they changed.
+   only when they changed. For the timeline, a background thread reads the sprint's earlier sessions (since the commit
+   `sprint-progress` counts the sprint from): their edits, writes and test runs, and `loop.log`'s merges and waits.
+   Pi's events carry no clock, so a past session's changes are placed by their position in its file between the
+   session's start and end ("≈" times); changes in the running session carry their real time. Finished sessions are
+   cached in `~/.cache/labdash/` on the VM, so a restart rereads only the running one.
 2. It sends them over **one SSH connection** to the AI box. The key it uses can run exactly one program there,
    `labdash-ingest` (a *forced command*: `command=` in `authorized_keys` runs that program whatever the client asks
    for, so the key cannot open a shell or forward ports). Ingest just joins the SSH session to the server's Unix
@@ -97,7 +109,7 @@ been written by an agent. The design follows from that.
 | [server/labdash](server/labdash) | The server (AI box) |
 | [server/labdash-ingest](server/labdash-ingest) | The forced command that joins SSH to the server's socket |
 | [server/config.example.json](server/config.example.json) | Server config: which GPU serves which model port |
-| [web/](web/) | The page: `index.html`, `app.js`, `app.css` (no build step, no libraries) |
+| [web/](web/) | The page: `index.html`, `theme.js` (light or dark before the first paint), `app.js`, `app.css` (no build step, no libraries) |
 | [deploy/](deploy/) | systemd units, `authorized_keys` lines, the VM's SSH config, the Mac's launchd tunnel, and `push` |
 | [tests/test_e2e.py](tests/test_e2e.py) | End-to-end test: shipper, ingest, server and the page, against a fake projects tree |
 
@@ -149,6 +161,7 @@ shipper restart. It checks everything between the agent's files and the page (ab
 | Red banner "console server is unreachable" | The page lost the server: the tunnel or the AI box is down | The page retries every 2 seconds and launchd restarts the tunnel; `/tmp/labdash-tunnel.log` on the Mac says why |
 | Banner "link from the agent VM is down" | The shipper's SSH connection dropped; streams stay where they stopped, hardware stays live | The shipper reconnects on its own; `journalctl -u labdash-ship` on the VM |
 | An amber pane, "stream stuck" | No events for 90 s while the model works | Reconnect on that pane (or `R` on an agent's page) replays its session from the file |
+| Timeline says "loading history" for minutes | The first read of a sprint (~1 GB of session files) after the shipper's cache was cleared | It pauses between files to leave the disk to the agents; later restarts use the cache |
 | A driver line "console: skipped … it could not read" | The shipper met a line it cannot show; that one line is missing, the rest of the stream is fine | `journalctl -u labdash-ship` on the VM has the error (`fault in <agent> …`); worth a fix in `labdash-ship` and a case in the e2e test |
 | The banner flips up and down every ~10 s | The shipper is crashing and systemd restarts it | `journalctl -u labdash-ship` on the VM; this should not happen any more (see the line above) |
 | A message stays "sending…" | No acknowledgement from the shipper | The link is down; nothing was written. Send it again when it is back |

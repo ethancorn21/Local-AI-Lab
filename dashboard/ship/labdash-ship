@@ -18,6 +18,7 @@ every project in ~/projects except the ones named in ~/.agent-kit/dashboard-hidd
 """
 import json
 import os
+import zlib
 import re
 import select
 import subprocess
@@ -26,11 +27,13 @@ import threading
 import time
 import traceback
 import queue
+from datetime import datetime
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.environ.get("LABDASH_PROJECTS", os.path.join(HOME, "projects"))
 HIDDEN = os.environ.get("LABDASH_HIDDEN", os.path.join(HOME, ".agent-kit", "dashboard-hidden"))
 SPRINT_TOOL = os.environ.get("LABDASH_SPRINT", os.path.join(HOME, "bin", "sprint-progress"))
+CACHE = os.environ.get("LABDASH_CACHE", os.path.join(HOME, ".cache", "labdash"))   # finished sessions' timeline entries
 RECENT = 6 * 3600          # a project whose loop stopped stays on the console this long after its last session
 FLUSH = 0.3                # streamed text goes up at most this often per event
 SNAP_EVERY = 10            # seconds between task / sprint snapshots (sent only when they changed)
@@ -200,6 +203,16 @@ def tool_result(name, a, e):
     return "", {"out": [["", l] for l in out_lines(text, 12, 12)]}, False
 
 
+def change(name, args, meta, body):
+    """A tool call the timeline shows: a file change (edit, write) with its diff, or a test run (bash output with a
+    passed/failed count). (series, node, body) or None."""
+    if name in ("edit", "write") and isinstance(meta, dict):
+        return "e", {"kind": name.capitalize(), "path": clean((args or {}).get("path", ""), 300), "add": meta.get("add", 0), "del": meta.get("del", 0)}, body
+    if name == "bash" and isinstance(meta, dict):
+        return "t", {"kind": "Test", "pass": meta.get("pass", 0), "fail": meta.get("fail", 0), "cmd": clean(first_line((args or {}).get("command", "")), 160)}, None
+    return None
+
+
 class Session:
     """Turns one Pi session file's events into console events. emit(kind, payload) sends them."""
 
@@ -207,6 +220,7 @@ class Session:
         self.n, self.emit, self.activity = n, emit, activity
         self.count, self.cur, self.buf, self.last_flush = 0, None, "", 0.0
         self.tools, self.user_msgs, self.composing = {}, 0, None
+        self.live, self.counts = False, {}
 
     def new_id(self):
         self.count += 1
@@ -310,6 +324,12 @@ class Session:
             if err:
                 upd["error"] = True
             self.emit("upd", {"id": eid, "set": upd})
+            c = None if err else change(name, args, meta, body)
+            if c:   # numbered as session_changes numbers them, so the history and the live stream name the same entries
+                self.counts[c[0]] = self.counts.get(c[0], 0) + 1
+                if self.live:
+                    self.emit("flow_node", {"node": {**c[1], "id": f"{self.n}:{c[0]}{self.counts[c[0]]}", "iter": self.n,
+                                                     "t": round(time.time(), 1), "approx": False}, "body": c[2]})
             if not self.tools:
                 self.activity("thinking")
         elif t in ("compaction_start", "auto_retry_start"):
@@ -403,6 +423,7 @@ class Channel:
         self.meta = {}
         self.snap_hash = None
         self.hist_cache = (None, [])
+        self.rows_mtime = None
 
     def agent_dir(self, *p):
         return os.path.join(self.path, ".agent", *p)
@@ -468,12 +489,15 @@ class Channel:
         n = int(re.search(r"iter-(\d+)", path).group(1))
         start, task, off = self.iteration_line(n)
         start = start or os.path.getmtime(path)
+        prep = task.startswith("prep for ")
+        task = task[len("prep for "):] if prep else task
         tid, tname = task_parts(task)
         self.sess_path, self.sess_off, self.sess_part = path, 0, b""
         self.log_off, self.log_part = off, b""
         self.sess = Session(n, self.emit, lambda a: self.set_meta(activity=a))
-        self.emit("ev", {"id": f"{n}-0", "t": "divider", "time": time.strftime("%H:%M", time.localtime(start)), "task": tname})
-        self.set_meta(session=n, task_file=task, task_id=tid, task=tname, start=int(start), activity="reading prompt", ctx=None)
+        self.emit("ev", {"id": f"{n}-0", "t": "divider", "time": time.strftime("%H:%M", time.localtime(start)), "task": tname, "prep": prep})
+        self.set_meta(session=n, task_file=task, task_id=tid, task=tname, start=int(start), activity="reading prompt", ctx=None, prep=prep)
+        self.send({"op": "flow_sess", "ch": self.name, "sess": {"iter": n, "task_id": tid, "task": tname, "start": int(start), "end": None, "prep": prep}})
 
     def read_new(self, path, off, part):
         try:
@@ -495,6 +519,7 @@ class Channel:
             self.start_session(newest)
         if self.sess:
             self.sess_off, self.sess_part, lines = self.read_new(self.sess_path, self.sess_off, self.sess_part)
+            self.sess.live = not replay   # replayed changes reach the timeline from the history, placed by file position
             for raw in lines:
                 try:
                     e = json.loads(raw)
@@ -511,6 +536,10 @@ class Channel:
                 text = re.sub(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+", "", l)
                 good = bool(re.search(r"\b(verified|merged)\b", text, re.I)) and not re.search(r"\b(not|rejected|conflict)\b", text, re.I)
                 self.emit("ev", {"id": f"{self.sess.n}-L{self.log_off}-{len(text)}", "t": "sys", "text": clean(text, 400), "good": good})
+                self.set_meta(driver=clean(text, 200))
+                m = log_mark(l)
+                if m:
+                    self.send({"op": "flow_mark", "ch": self.name, "mark": m})
         alive_loop, alive_pi = pid_alive(self.agent_dir("loop.pid")), pid_alive(self.agent_dir("pi.pid"))
         self.set_meta(loop=alive_loop, running=alive_pi)
         if self.sess and not alive_pi and self.meta.get("activity") not in ("session finished", "between sessions"):
@@ -581,6 +610,24 @@ class Channel:
         if h != self.snap_hash:
             self.snap_hash = h
             self.send({"op": "task", "ch": self.name, "snap": snap})
+
+    def flow_rows(self):
+        """Sessions that ended since the last look: their end and outcome, for the timeline."""
+        p = self.agent_dir("iterations.jsonl")
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            return
+        if mt == self.rows_mtime:
+            return
+        self.rows_mtime = mt
+        for l in (read(p) or "").splitlines()[-5:]:
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and isinstance(r.get("iter"), int) and r.get("end"):
+                self.send({"op": "flow_sess", "ch": self.name, "sess": session_row(r)})
 
     # ---- commands from the console
     def message(self, text, stop):
@@ -658,6 +705,158 @@ def board(main):
     return {"total": p.get("total"), "done": done, "building": building, "open": opened}
 
 
+# ------------------------------------------------------------------------------------------------ the timeline
+
+MARKS = [(re.compile(r"team: (tasks/\S+) merged into main"), "merged"), (re.compile(r"team: (tasks/\S+) handed over to agent"), "handed"),
+         (re.compile(r"team: (tasks/\S+) split\b"), "split"), (re.compile(r"NEW TASK by agent: (tasks/\S+)"), "new task"),
+         (re.compile(r"team: nothing to take now"), "wait"), (re.compile(r"STALLED: (tasks/\S+)"), "stalled"),
+         (re.compile(r"iteration \d+ hit the \d+s timeout"), "timeout"), (re.compile(r"PAUSE file found"), "paused")]
+
+
+def stamp_epoch(s):
+    try:
+        return time.mktime(time.strptime(s[:19], "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def iso_epoch(s):
+    try:
+        return datetime.fromisoformat(str(s)).timestamp()
+    except ValueError:
+        return None
+
+
+def log_mark(line):
+    """A loop.log line the timeline marks (merged, handed over, split, new task, waiting, stalled, timeout, paused)."""
+    t = stamp_epoch(line)
+    if t is None:
+        return None
+    text = line[20:]
+    for rx, kind in MARKS:
+        m = rx.search(text)
+        if m:
+            return {"id": f"{int(t)}:{zlib.crc32(line.encode()) & 0xffffffff:x}", "t": int(t), "kind": kind,
+                    "task_id": task_parts(m.group(1))[0] if m.groups() else "", "text": clean(text, 300)}
+    return None
+
+
+def session_changes(path, start, end, cache_dir):
+    """[[node, body]] for one session file: its file changes and test runs, numbered as Session numbers them, each placed
+    in time by where it sits in the file (Pi's events carry no clock). A finished session's list is cached."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = os.path.join(cache_dir, os.path.basename(path) + ".json")
+    if end is not None:
+        try:
+            c = json.load(open(key))
+            if [c["size"], c["mtime"], c["start"], c["end"]] == [st.st_size, st.st_mtime, start, end]:
+                return c["changes"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    n = int(re.search(r"iter-(\d+)", path).group(1))
+    out, args, counts, pos, stop = [], {}, {}, 0, end if end is not None else time.time()
+    with open(path, "rb") as fh:
+        for raw in fh:
+            pos += len(raw)
+            if b'"tool_execution_' not in raw:   # most lines are streamed text: skip them unparsed
+                continue
+            try:
+                e = json.loads(raw)
+                t = e.get("type") if isinstance(e, dict) else None
+                if t == "tool_execution_start":
+                    args[e.get("toolCallId")] = e.get("args") or {}
+                elif t == "tool_execution_end":
+                    name, a = e.get("toolName"), args.pop(e.get("toolCallId"), {})
+                    if name not in ("edit", "write", "bash"):
+                        continue
+                    meta, body, err = tool_result(name, a, e)
+                    c = None if err else change(name, a, meta, body)
+                    if c:
+                        counts[c[0]] = counts.get(c[0], 0) + 1
+                        at = start + (stop - start) * pos / max(st.st_size, 1)
+                        out.append([{**c[1], "id": f"{n}:{c[0]}{counts[c[0]]}", "iter": n, "t": round(at, 1), "approx": True}, c[2]])
+            except Exception as exc:
+                fault(f"{os.path.basename(path)} (timeline)", exc)
+    if end is not None:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(key + ".tmp", "w") as fh:
+                json.dump({"size": st.st_size, "mtime": st.st_mtime, "start": start, "end": end, "changes": out}, fh)
+            os.replace(key + ".tmp", key)
+        except OSError:
+            pass
+    return out
+
+
+def sprint_start(main):
+    """When the project's current sprint began: the commit sprint-progress counts it from."""
+    try:
+        since = json.loads(subprocess.run([SPRINT_TOOL, main, "--json"], capture_output=True, text=True, timeout=30).stdout)["since"]
+        return int(subprocess.run(["git", "-C", main, "log", "-1", "--format=%ct", str(since)], capture_output=True, text=True, timeout=10).stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+
+
+def session_row(r):
+    """iterations.jsonl row -> what the timeline keeps of a finished session"""
+    return {"iter": r["iter"], "end": int(iso_epoch(r["end"]) or 0) or None, "status": r.get("status_after"), "verify": r.get("verify"), "wrapup": r.get("wrapup")}
+
+
+def history(name, path, main, out):
+    """The sprint so far for one agent: its sessions, their file changes and test runs, the driver's markers. Runs in a
+    thread (a sprint is hundreds of MB of session files); the lines go to `out` for the main loop to send."""
+    try:
+        since = sprint_start(main) or time.time() - 86400
+        agent = os.path.join(path, ".agent")
+        rows = {}
+        for l in (read(os.path.join(agent, "iterations.jsonl")) or "").splitlines():
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and isinstance(r.get("iter"), int):
+                rows[r["iter"]] = r
+        sessions = []
+        out.put({"op": "flow_span", "ch": name, "since": int(since)})
+        for l in (read(os.path.join(agent, "loop.log")) or "").splitlines():
+            m = re.match(r"(\S+ \S+) iteration (\d+): (.*?)(?: \(harness \S+\))?$", l)
+            t = stamp_epoch(l)
+            if t is None or t < since:
+                continue
+            if m:
+                sessions.append((int(m.group(2)), t, m.group(3)))
+            else:
+                mk = log_mark(l)
+                if mk:
+                    out.put({"op": "flow_mark", "ch": name, "mark": mk})
+        newest = max((n for n, _, _ in sessions), default=0)
+        for n, t, task in sessions:
+            prep = task.startswith("prep for ")
+            task = task[len("prep for "):] if prep else task
+            r = rows.get(n)
+            f = os.path.join(agent, "sessions", f"iter-{n:04d}.jsonl")
+            end = iso_epoch(r["end"]) if r and r.get("end") else None
+            if end is None and n != newest:   # a prep session (no row) or one cut short: it ended when its file stopped growing
+                try:
+                    end = os.path.getmtime(f)
+                except OSError:
+                    end = t
+            tid, tname = task_parts(task)
+            sess = {"iter": n, "task_id": tid, "task": tname, "start": int(t), "end": int(end) if end else None, "prep": prep}
+            if r:
+                sess.update({k: v for k, v in session_row(r).items() if v is not None})
+            out.put({"op": "flow_sess", "ch": name, "sess": sess})
+            for node, body in session_changes(f, t, int(end) if end else None, os.path.join(CACHE, name)):
+                out.put({"op": "flow_node", "ch": name, "node": node, "body": body})
+            time.sleep(0.05)   # the first read of a sprint is ~1 GB: leave the disk to the agents' test runs in between
+        out.put({"op": "flow_done", "ch": name})
+    except Exception as exc:
+        fault(f"{name} (timeline history)", exc)
+
+
 # ------------------------------------------------------------------------------------------------ the link
 
 class Link:
@@ -712,6 +911,7 @@ def main():
     link = Link(target, stdio)
     channels, boards = {}, {}
     broken = [False]
+    flow_q, hist_threads = queue.Queue(), {}
 
     def send(obj):
         if not link.send(obj):
@@ -740,6 +940,9 @@ def main():
             if n not in channels:
                 channels[n] = Channel(n, path, send)
                 channels[n].guarded("its session", channels[n].reset)
+                if not (n in hist_threads and hist_threads[n].is_alive()):
+                    hist_threads[n] = threading.Thread(target=history, args=(n, path, channels[n].team_dir or path, flow_q), daemon=True)
+                    hist_threads[n].start()
 
     def mains():
         return sorted({c.team_dir or c.path for c in channels.values()})
@@ -749,6 +952,7 @@ def main():
         send({"op": "hello", "version": 2, "host": os.uname().nodename})
         channels.clear()
         boards.clear()
+        hist_threads.clear()   # a restarted server has no timeline: every agent's history is sent again
         scan()
         send({"op": "synced", "channels": sorted(channels), "projects": [os.path.basename(m) for m in mains()]})
 
@@ -763,6 +967,13 @@ def main():
         while link.alive() and not broken[0]:
             for c in list(channels.values()):
                 c.guarded("its stream", c.poll)
+            for _ in range(400):   # the timeline's history, a slice per turn so the live streams stay live
+                try:
+                    item = flow_q.get_nowait()
+                except queue.Empty:
+                    break
+                if item.get("ch") in channels:
+                    send(item)
             now = time.time()
             if now - t_scan > SCAN_EVERY:
                 t_scan = now
@@ -771,6 +982,7 @@ def main():
                 t_snap = now
                 for c in list(channels.values()):
                     c.guarded("its task panel", c.snapshot)
+                    c.guarded("its timeline", c.flow_rows)
                 for m in mains():
                     try:
                         b = board(m)

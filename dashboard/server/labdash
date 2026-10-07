@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import queue
 
@@ -35,7 +36,9 @@ WEB = CONF.get("web", "/opt/labdash/web")
 SOCK = CONF.get("socket", "/run/labdash/ingest.sock")
 SERVERS = CONF.get("servers", {})          # port -> {gpu: uuid, kind: vllm|llama, ctx: tokens}
 MAX_EVENTS = 2500
+MAX_FLOW_NODES = 4000      # timeline entries kept per agent (a sprint so far is ~1000)
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml")}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
        "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
@@ -68,6 +71,8 @@ class Hub:
     def __init__(self):
         self.lock = threading.RLock()
         self.channels = {}       # name -> {meta, events, idx, snap, last}
+        self.flow = {}           # name -> the timeline: {since, sessions, nodes, marks, done}; diffs in flow_bodies
+        self.flow_bodies = {}    # (name, node id) -> the node's diff or code, fetched when the operator opens it
         self.boards = {}
         self.feed = {"connected": False, "since": None, "host": None}
         self.hw = {}
@@ -88,7 +93,51 @@ class Hub:
 
     def snapshot(self):
         return {"channels": {n: {"meta": c["meta"], "events": c["events"], "snap": c["snap"], "last": c["last"]} for n, c in self.channels.items()},
+                "flow": {n: {"since": f["since"], "done": f["done"], "sessions": list(f["sessions"].values()), "nodes": list(f["nodes"].values()),
+                             "marks": list(f["marks"].values())} for n, f in self.flow.items()},
                 "boards": self.boards, "feed": self.feed, "hw": self.hw, "hist": self.hist, "now": time.time()}
+
+    def drop(self, ch):
+        self.flow.pop(ch, None)
+        for k in [k for k in self.flow_bodies if k[0] == ch]:
+            del self.flow_bodies[k]
+
+    def flow_op(self, op, ch, o):
+        """The timeline: sessions, file changes and test runs, the driver's markers. Upserts: the history and the live
+        stream may both send an entry; an exact time (from the live stream) wins over one placed by file position."""
+        f = self.flow.setdefault(ch, {"since": None, "done": False, "sessions": {}, "nodes": {}, "marks": {}})
+        if op == "flow_span" and isinstance(o.get("since"), (int, float)):
+            f["since"] = int(o["since"])
+            self.broadcast({"type": "flow_span", "ch": ch, "since": f["since"]})
+        elif op == "flow_done":
+            f["done"] = True
+            self.broadcast({"type": "flow_done", "ch": ch})
+        elif op == "flow_sess":
+            sess = tidy(o.get("sess"))
+            if isinstance(sess, dict) and isinstance(sess.get("iter"), int):
+                cur = f["sessions"].setdefault(sess["iter"], {})
+                cur.update({k: v for k, v in sess.items() if v is not None})
+                self.broadcast({"type": "flow_sess", "ch": ch, "sess": cur})
+        elif op == "flow_node":
+            node = tidy(o.get("node"))
+            if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not isinstance(node.get("t"), (int, float)):
+                return
+            old = f["nodes"].get(node["id"])
+            if old and not old.get("approx") and node.get("approx"):
+                return
+            f["nodes"][node["id"]] = node
+            if o.get("body") is not None:
+                self.flow_bodies[(ch, node["id"])] = tidy(o.get("body"))
+            if len(f["nodes"]) > MAX_FLOW_NODES:
+                for nid in sorted(f["nodes"], key=lambda i: f["nodes"][i]["t"])[:len(f["nodes"]) - MAX_FLOW_NODES]:
+                    del f["nodes"][nid]
+                    self.flow_bodies.pop((ch, nid), None)
+            self.broadcast({"type": "flow_node", "ch": ch, "node": node})
+        elif op == "flow_mark":
+            mark = tidy(o.get("mark"))
+            if isinstance(mark, dict) and isinstance(mark.get("id"), str) and isinstance(mark.get("t"), (int, float)):
+                f["marks"][mark["id"]] = mark
+                self.broadcast({"type": "flow_mark", "ch": ch, "mark": mark})
 
     def subscribe(self):
         q = queue.Queue(maxsize=20000)
@@ -114,6 +163,7 @@ class Hub:
                     return
                 for n in [n for n in self.channels if n not in keep]:
                     del self.channels[n]
+                    self.drop(n)
                     self.broadcast({"type": "gone", "ch": n})
                 for p in [p for p in self.boards if p not in projects]:
                     del self.boards[p]
@@ -121,8 +171,10 @@ class Hub:
             elif op == "reset":
                 self.channels[ch] = {"meta": tidy(o.get("meta") or {}), "events": [], "idx": {}, "snap": None, "last": now}
                 self.broadcast({"type": "reset", "ch": ch, "meta": self.channels[ch]["meta"], "last": now})
-            elif ch not in self.channels and op in ("meta", "ev", "upd", "task"):
+            elif ch not in self.channels and op in ("meta", "ev", "upd", "task", "flow_span", "flow_sess", "flow_node", "flow_mark", "flow_done"):
                 return
+            elif str(op).startswith("flow_"):
+                self.flow_op(op, ch, o)
             elif op == "meta":
                 m = tidy(o.get("meta") or {})
                 self.channels[ch]["meta"].update(m)
@@ -164,6 +216,7 @@ class Hub:
                     self.boards[p] = tidy(o.get("board"))
                     self.broadcast({"type": "board", "project": p, "board": self.boards[p]})
             elif op == "gone":
+                self.drop(ch)
                 if self.channels.pop(ch, None) is not None:
                     self.broadcast({"type": "gone", "ch": ch})
             elif op == "ack":
@@ -479,6 +532,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, HUB.snapshot())
         elif path == "/api/stream":
             self.stream()
+        elif path == "/api/flow/body":
+            q = urllib.parse.parse_qs(self.path.partition("?")[2])
+            key = ((q.get("ch") or [""])[0], (q.get("id") or [""])[0])
+            with HUB.lock:
+                body = HUB.flow_bodies.get(key)
+            self.reply(200, {"body": body}) if body is not None else self.reply(404, {"error": "no diff for that entry"})
         else:
             self.reply(404, {"error": "not found"})
 

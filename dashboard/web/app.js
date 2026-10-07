@@ -37,25 +37,31 @@ const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", 
 const kTok = n => n == null ? "—" : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
 const cap1 = t => t ? t[0].toUpperCase() + t.slice(1) : "";
 const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+/* labels: one vivid chip per kind of event (colours in app.css, --k-*) */
+const KIND = { Bash: "k-bash", Read: "k-read", Edit: "k-edit", Write: "k-write", Search: "k-web", Fetch: "k-web", Ask: "k-ask" };
+const chip = (k, text, more) => h("span", { class: `chip ${k}${more ? " " + more : ""}` }, text);
 
 /* ================================================================ state from the server */
-const S = { channels: {}, boards: {}, feed: {}, hw: {}, hist: { minutes: [], temp: {}, power: {} }, skew: 0, online: false };
+const S = { channels: {}, flow: {}, boards: {}, feed: {}, hw: {}, hist: { minutes: [], temp: {}, power: {} }, skew: 0, online: false };
 const SUBS = new Set(), TICKERS = new Set(), ACKS = new Map();
 const nowS = () => Date.now() / 1000 + S.skew;
 function notify(ch, kind, ev, extra) { for (const f of [...SUBS]) f(ch, kind, ev, extra); }
 
 function indexChannel(c) { c.idx = new Map(c.events.map(e => [e.id, e])); return c; }
+function flowOf(ch) { return S.flow[ch] || (S.flow[ch] = { since: null, done: false, sessions: new Map(), nodes: new Map(), marks: new Map() }); }
 function handle(m) {
   switch (m.type) {
     case "snapshot":
       S.channels = {}; for (const [n, c] of Object.entries(m.channels || {})) S.channels[n] = indexChannel(c);
+      S.flow = {}; for (const [n, f] of Object.entries(m.flow || {})) S.flow[n] = { since: f.since, done: f.done,
+        sessions: new Map((f.sessions || []).map(x => [x.iter, x])), nodes: new Map((f.nodes || []).map(x => [x.id, x])), marks: new Map((f.marks || []).map(x => [x.id, x])) };
       Object.assign(S, { boards: m.boards || {}, feed: m.feed || {}, hw: m.hw || {}, hist: m.hist || S.hist, skew: (m.now || Date.now() / 1000) - Date.now() / 1000 });
       return go(route, true);
     case "reset":
       S.channels[m.ch] = indexChannel({ meta: m.meta || {}, events: [], snap: null, last: m.last });
       return (route === "live" || route === m.ch) ? go(route, true) : renderChrome();
     case "gone":
-      delete S.channels[m.ch];
+      delete S.channels[m.ch]; delete S.flow[m.ch];
       return (route === "live" || route === m.ch) ? go(route, true) : renderChrome();
     case "meta": {
       const c = S.channels[m.ch]; if (!c) return;
@@ -85,6 +91,12 @@ function handle(m) {
     case "hw": S.hw = m.hw; return notify(null, "hw");
     case "hist": S.hist = m.hist; return notify(null, "hist");
     case "ack": { const f = ACKS.get(m.id); if (f) { ACKS.delete(m.id); f(m); } return; }
+    case "flow_span": flowOf(m.ch).since = m.since; return notify(m.ch, "flow");
+    case "flow_done": flowOf(m.ch).done = true; return notify(m.ch, "flow");
+    case "flow_sess": flowOf(m.ch).sessions.set(m.sess.iter, m.sess); return notify(m.ch, "flow");
+    case "flow_mark": flowOf(m.ch).marks.set(m.mark.id, m.mark); return notify(m.ch, "flow");
+    case "flow_node": { const f = flowOf(m.ch), old = f.nodes.get(m.node.id);
+      if (!(old && !old.approx && m.node.approx)) f.nodes.set(m.node.id, m.node); return notify(m.ch, "flow"); }
   }
 }
 let es = null;
@@ -111,7 +123,7 @@ function colorKey(name) {
   const others = chNames().filter(n => !["a", "b", "c"].includes((S.channels[n].meta.agent || "").toLowerCase()));
   return free[others.indexOf(name)] || null;
 }
-const chStyle = name => { const k = colorKey(name); return k ? `--ch: var(--ch-${k}); --tint: var(--tint-${k})` : "--ch: var(--fg-2); --tint: var(--sunk)"; };
+const chStyle = name => { const k = colorKey(name); return k ? `--ch: var(--ch-${k}); --tint: color-mix(in oklab, var(--ch-${k}) var(--wash), var(--raise))` : "--ch: var(--fg-2); --tint: var(--sunk)"; };
 const letter = name => (S.channels[name]?.meta.agent || name)[0].toUpperCase();
 const label = name => { const m = S.channels[name]?.meta || {}; return m.agent ? `agent ${m.agent}` : name; };
 const server = name => (S.hw.servers || {})[S.channels[name]?.meta.port] || null;
@@ -140,6 +152,30 @@ function liveValue(kind, name) {
   if (kind === "kv") return sv?.kv_pct != null ? `${sv.kv_pct}%` : "—";
   if (kind === "gpu") return g ? `${g.name} · ${Math.round(g.temp)} °C · ${Math.round(g.power)} W` : "—";
   return "";
+}
+/* what an agent is doing right now, as one chip: the pane headers, the agent page, the board */
+function stateOf(name) {
+  const m = S.channels[name]?.meta || {}, a = String(m.activity || "");
+  if (!m.running) {
+    if (!m.loop) return { k: "k-wait", text: "loop stopped", quiet: true };
+    if (/nothing to take now|waiting (up to|for)/.test(m.driver || "")) return { k: "k-wait", text: "waiting" };
+    return { k: "k-driver", text: "driver", live: true };
+  }
+  if (stale(name)) return { k: "k-stuck", text: "stuck?" };
+  if (/^thinking/.test(a)) return { k: "k-think", text: "thinking", live: true };
+  if (/^answering/.test(a)) return { k: "k-say", text: "answering", live: true };
+  const t = a.match(/^(?:running|writing an? )\s*(\w+)/i);
+  if (t) { const raw = t[1].toLowerCase(), kind = { web_search: "Search", web_fetch: "Fetch", ask_human: "Ask" }[raw] || cap1(raw);
+    return { k: KIND[kind] || "k-tool", text: /^writing/.test(a) ? `writing ${kind}` : kind, live: true }; }
+  if (/reading prompt/.test(a)) return { k: "k-tool", text: "reading prompt", live: true };
+  if (/finished/.test(a)) return { k: "k-driver", text: "driver", live: true };
+  return { k: "k-tool", text: a || "working", live: true };
+}
+function stateChip(name, extra) {
+  const st = stateOf(name);
+  const el = chip(st.k, [h("i"), st.text], `state${st.live ? " live" : ""}${st.quiet ? " quiet" : ""}${extra ? " " + extra : ""}`);
+  el.title = S.channels[name]?.meta.running ? S.channels[name].meta.activity || "" : S.channels[name]?.meta.driver || "";
+  return el;
 }
 function openAsks() { const out = []; for (const n of chNames()) for (const a of S.channels[n].snap?.asks || []) out.push({ ch: n, ...a }); return out; }
 
@@ -178,19 +214,19 @@ function meta(ev) {
 }
 const tokens = text => Math.round(String(text || "").length / 3.7);
 function thinkHead(ev, node, compact) {
-  const sm = h("summary", { class: "label" }, `${ev.done ? "thought" : "thinking"} · ${tokens(ev.text)} tokens`);
+  const sm = h("summary", {}, chip("k-think", ev.done ? "thought" : "thinking", "lead" + (ev.done ? "" : " live")), h("span", { class: "muted" }, `${tokens(ev.text)} tokens`));
   sm.addEventListener("click", e => { if (compact) { e.preventDefault(); node.classList.toggle("open"); } });
   return sm;
 }
 function render(ev, compact) {
   switch (ev.t) {
-    case "divider": return h("div", { class: "divider" }, h("span", { class: "dial" }, ev.time), h("b", {}, ev.task || ""));
-    case "sys": return h("div", { class: "sys" + (ev.good ? " good" : "") }, h("span", { class: "label" }, "driver"), h("span", {}, ev.text));
+    case "divider": return h("div", { class: "divider" }, h("span", { class: "dial" }, ev.time), ev.prep ? chip("k-prep", "prep") : null, h("b", {}, ev.task || ""));
+    case "sys": return h("div", { class: "sys" + (ev.good ? " good" : "") }, chip("k-driver", "driver", "lead"), h("span", {}, ev.text));
     case "you": return h("div", { class: "you" }, h("p", {}, ev.text), h("small", {}, `you · ${ev.note || ""}`));
     case "say": {
       const p = h("p", { class: "say" }, ev.text || "");
       if (!ev.done) p.append(h("span", { class: "caret" }));
-      return p;
+      return h("div", { class: "sayblock" }, chip("k-say", ev.done ? "answer" : "answering", "lead" + (ev.done ? "" : " live")), p);
     }
     case "think": {
       const p = h("p", {}, ev.text || "");
@@ -203,7 +239,7 @@ function render(ev, compact) {
       const failed = ev.meta && typeof ev.meta === "object" && ev.meta.fail;
       const open = compact ? ["Edit", "Write", "Ask"].includes(ev.kind) || !!failed || !!ev.error : true;
       return h("details", { class: "tool" + (ev.error ? " err" : ""), open },
-        h("summary", {}, h("span", { class: "kind label " + ev.kind }, ev.kind), h("span", { class: "target v-code", title: ev.target }, ev.target), meta(ev)),
+        h("summary", {}, chip(KIND[ev.kind] || "k-tool", ev.kind, "kind lead" + (ev.running ? " live" : "")), h("span", { class: "target v-code", title: ev.target }, ev.target), meta(ev)),
         body(ev.body));
     }
   }
@@ -211,10 +247,11 @@ function render(ev, compact) {
 }
 function updateNode(node, ev, compact, m) {
   if (ev.t === "think" || ev.t === "say") {
-    const p = ev.t === "think" ? node.querySelector("p") : node;
+    const p = node.querySelector("p");
     const caret = p.querySelector(".caret");
     p.firstChild && p.firstChild.nodeType === 3 ? (p.firstChild.textContent = ev.text) : p.prepend(ev.text);
     if (ev.t === "think") node.firstChild.replaceWith(thinkHead(ev, node, compact));
+    if (ev.t === "say" && ev.done) node.firstChild.replaceWith(chip("k-say", "answer", "lead"));
     if (ev.done) { if (caret) caret.remove(); if (compact && ev.t === "think") node.classList.add("past"); }
     return node;
   }
@@ -354,6 +391,7 @@ function renderChrome() {
   const boards = Object.entries(S.boards);
   $("#nav-main").replaceChildren(h("span", { class: "label" }, "Lab"),
     item("live", h("span", { class: "led " + (chNames().length ? "on" : "") }), "Live", "all agents at once"),
+    item("flow", h("span", { class: "led " + (chNames().length ? "on" : "") }), "Timeline", "file changes · sprint"),
     item("board", h("span", { class: "led" }), "Board", boards.length ? boards.map(([p, b]) => `${p} ${b.done.length}/${b.total}`).join(" · ") : "no sprint yet", asks ? h("span", { class: "n", title: `${asks} request${asks > 1 ? "s" : ""} waiting` }, asks) : null),
     item("hardware", h("span", { class: "led " + (hot ? "warn" : "") }), "Hardware", `GPUs ${tempText}`));
   $("#nav-agents").replaceChildren(h("span", { class: "label" }, "Agents"),
@@ -390,8 +428,10 @@ function channel(name, slot) {
   sc.addEventListener("scroll", () => { if (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80) jump.hidden = true; });
   jump.addEventListener("click", () => { f.toBottom(); jump.hidden = true; });
   const card = h("span", { class: "ch-card v-dial" });
+  const stateHost = h("span", { class: "ch-state" });
   const paint = () => {
     const m = S.channels[name]?.meta || {};
+    stateHost.replaceChildren(...[stateChip(name), m.prep && m.running ? chip("k-prep", "prep") : null].filter(Boolean));
     card.textContent = [gpuOf(name)?.name, m.project].filter(Boolean).join(" · ");
     task.replaceChildren(h("button", { onclick: () => go(name), title: "Open this agent and its task" }, m.task || "no task yet"));
     metaRow.replaceChildren(...[
@@ -412,7 +452,7 @@ function channel(name, slot) {
   input.addEventListener("keydown", e => { if (e.key === "Enter" && input.value.trim()) { sendMsg(name, input.value.trim(), false, f); input.value = ""; } });
   return h("section", { class: "channel " + slot, style: chStyle(name) },
     h("div", { class: "ch-head" },
-      h("div", { class: "ch-row" }, h("span", { class: "ch-letter" }, letter(name)), card, growBtn, reBtn),
+      h("div", { class: "ch-row" }, h("span", { class: "ch-letter" }, letter(name)), stateHost, card, growBtn, reBtn),
       task, metaRow),
     warn, sc, jump, h("div", { class: "ch-say" }, input));
 }
@@ -466,7 +506,7 @@ function boardColumns(project, b) {
   const build = b.building.map(t => { const n = t.agent && chFor(t.agent); const m = n ? S.channels[n].meta : null;
     return h("li", { style: n ? chStyle(n) : null }, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
       h("span", { class: "note" }, t.agent ? [h("span", { class: "tag", style: "background: var(--ch, var(--fg-2)); width: 18px; height: 18px; font-size: 10.5px" }, t.agent),
-        m && m.task_id === t.id ? (stale(n) ? "stream stuck" : (m.running ? m.activity || "working" : "between sessions")) : "claimed",
+        m && m.task_id === t.id ? stateChip(n) : "claimed",
         t.boxes ? h("span", { class: "boxes", title: `${t.boxes[0]} of ${t.boxes[1]} acceptance boxes ticked` }, Array.from({ length: Math.min(t.boxes[1], 12) }, (_, i) => h("i", { class: i < t.boxes[0] ? "on" : "" }))) : null]
         : (t.status === "split" ? "split: waits for its subtasks" : t.status || "in progress"))); });
   const open = b.open.map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
@@ -541,6 +581,218 @@ function hardware() {
       h("section", {}, h("div", { class: "sec-h" }, h("h2", {}, "Power draw"), h("span", { class: "label" }, "W · last hour")), pc)));
 }
 
+/* ---- timeline: each agent's file changes over the sprint, like a node canvas. Time runs left to right; one row per
+   agent and one for main. A node is an edit or a write (click: its diff); sessions are bands, tests are ✓/✗ pills,
+   merges arc up into main, waiting is hatched. Drag or swipe to pan, pinch / Ctrl+wheel / the wheel to zoom.
+   History sessions place their changes by position in the session file (no clock in Pi's events): "≈" times. */
+const TL = { spp: 30, right: null, follow: true, project: null, open: null };   // seconds per pixel; right edge (null = now)
+const TL_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+// a lane, top to bottom: the driver's marks, session bands, rows of changes, "+N" for changes with no room, test runs
+const LANE = { marks: 22, bands: 24, row: 30, rows: 3, more: 20, tests: 22, pad: 8 }, MAIN_H = 44, AXIS_H = 26, GUTTER = 156;
+LANE.head = LANE.marks + LANE.bands;
+const laneH = LANE.head + LANE.row * LANE.rows + LANE.more + LANE.tests + LANE.pad;
+/* a row of labels in time order without overlaps: important ones placed first, the rest where they still fit */
+function packRow(items, gap = 4) {
+  const taken = [], fits = (a, b) => taken.every(([l, r]) => b + gap <= l || a >= r + gap);
+  const out = [];
+  for (const pass of [true, false]) for (const it of items) if (!!it.important === pass && fits(it.x, it.x + it.w)) { taken.push([it.x, it.x + it.w]); out.push(it); }
+  return out;
+}
+const textW = (str, px = 6.4) => 14 + px * String(str).length;
+const base = p => String(p || "").split("/").pop();
+const MARKS = { merged: ["tl-merged", "merged"], handed: ["tl-handed", "handed over"], split: ["tl-quiet", "split"], "new task": ["tl-quiet", "new task"],
+  stalled: ["tl-bad", "stalled"], timeout: ["tl-bad", "timed out"], paused: ["tl-quiet", "paused"] };
+function timeline() {
+  const projects = [...new Set(chNames().map(n => S.channels[n].meta.project))];
+  if (!projects.length) return h("div", { class: "empty" }, h("p", {}, h("b", {}, "No agents on the console yet. "), "The timeline fills in once the shipper sends a project's agents."));
+  if (!projects.includes(TL.project)) TL.project = projects[0];
+  const lanes = chNames().filter(n => S.channels[n].meta.project === TL.project);
+  const stage = h("div", { class: "tl-stage" }), world = h("div", { class: "tl-world" }), svg = s("svg", { class: "tl-svg" });
+  world.append(svg); stage.append(world);
+  const drawer = h("aside", { class: "tl-drawer", hidden: true });
+  const status = h("span", { class: "label" }), followBtn = h("button", { class: "act", "aria-pressed": "true" }, "Follow now");
+  const rightT = () => (TL.follow || TL.right == null) ? nowS() + 50 * TL.spp : TL.right;
+  const setView = (spp, right, follow) => { TL.spp = Math.max(2, Math.min(3600, spp)); TL.right = right; TL.follow = follow; schedule(); };
+  const span = () => { const all = lanes.map(n => S.flow[n]?.since).filter(Boolean); return all.length ? Math.min(...all) : nowS() - 6 * 3600; };
+  const fit = () => { const w = Math.max(200, stage.clientWidth - GUTTER - 40); setView((nowS() - span()) / w, null, true); };
+  const zoomBy = (f, cx) => {   // keep the time under cx where it is
+    const w = stage.clientWidth, left = rightT() - (w - GUTTER) * TL.spp, ta = left + ((cx ?? w) - GUTTER) * TL.spp;
+    const spp = Math.max(2, Math.min(3600, TL.spp * f)), nl = ta - ((cx ?? w) - GUTTER) * spp, nr = nl + (w - GUTTER) * spp;
+    setView(spp, nr, TL.follow && cx == null);
+  };
+  let raf = 0;
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); };
+  function el(cls, x, y, kids, attrs) { const e = h("div", { class: "tl-el " + cls, ...(attrs || {}) }, kids); e.style.left = `${x}px`; e.style.top = `${y}px`; world.append(e); return e; }
+  function draw() {
+    if (!stage.isConnected) return;
+    followBtn.setAttribute("aria-pressed", String(TL.follow)); followBtn.classList.toggle("on", TL.follow);
+    const loadingLanes = lanes.filter(n => !S.flow[n]?.done).map(label);
+    status.textContent = loadingLanes.length ? `loading history: ${loadingLanes.join(", ")}…` : `since ${S.flow[lanes[0]]?.since ? new Date(span() * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }) : "—"}`;
+    const W = stage.clientWidth; if (!W) return;
+    const right = rightT(), left = right - (W - GUTTER) * TL.spp, x = t => GUTTER + (t - left) / TL.spp;
+    const H = AXIS_H + MAIN_H + lanes.length * laneH;
+    world.querySelectorAll(".tl-el").forEach(e => e.remove());
+    svg.replaceChildren(); svg.setAttribute("width", W); svg.setAttribute("height", H); world.style.height = `${H}px`;
+    const defs = s("defs"), pat = s("pattern", { id: "tl-hatch", width: 7, height: 7, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
+    pat.append(s("rect", { width: 7, height: 7, style: "fill: var(--raise)" }), s("line", { x1: 0, y1: 0, x2: 0, y2: 7, style: "stroke: var(--line-2); stroke-width: 2.5" }));
+    defs.append(pat); svg.append(defs);
+    // time axis and grid
+    const step = TL_STEPS.find(st => st / TL.spp >= 96) || 86400, tzo = new Date().getTimezoneOffset() * 60;
+    for (let t = Math.ceil((left - tzo) / step) * step + tzo; t <= right; t += step) {
+      const xx = x(t); if (xx < GUTTER) continue;
+      const midnight = (t - tzo) % 86400 === 0;
+      svg.append(s("line", { x1: xx, x2: xx, y1: AXIS_H - 4, y2: H, style: `stroke: var(--line); stroke-width: ${midnight ? 2 : 1}` }));
+      el("tl-tick v-dial", xx + 4, 5, midnight ? new Date(t * 1000).toLocaleDateString([], { weekday: "short", day: "numeric" }) : clock(t));
+    }
+    // main: merges from every agent
+    const mainY = AXIS_H, mid = mainY + MAIN_H / 2;
+    svg.append(s("line", { x1: GUTTER, x2: W, y1: mid, y2: mid, style: "stroke: var(--good); stroke-width: 2; opacity: 0.55" }));
+    el("tl-gutter", 0, mainY, [h("span", { class: "tl-main-tag" }, "main"), h("span", { class: "muted" }, "merged work")]).style.height = `${MAIN_H}px`;
+    const merges = [];
+    lanes.forEach((n, li) => {
+      const f = S.flow[n] || flowOf(n), y0 = AXIS_H + MAIN_H + li * laneH, sty = chStyle(n);
+      if (li % 2 === 0) svg.append(s("rect", { x: GUTTER, y: y0, width: W - GUTTER, height: laneH, style: "fill: var(--sunk); opacity: 0.35" }));
+      svg.append(s("line", { x1: 0, x2: W, y1: y0, y2: y0, style: "stroke: var(--line)" }));
+      const sessions = [...f.sessions.values()].sort((a, b) => a.start - b.start);
+      const endOf = (sx, i) => Math.max(sx.start + 30, sx.end ?? sessions[i + 1]?.start ?? nowS());   // a clock jump can put the end before the start
+      // waiting: hatched from the driver's "nothing to take" to the next session
+      for (const m of f.marks.values()) if (m.kind === "wait") {
+        const nxt = sessions.find(sx => sx.start > m.t), e = nxt ? nxt.start : nowS();
+        if (e < left || m.t > right) continue;
+        const x1 = Math.max(GUTTER, x(m.t)), x2 = Math.min(W, x(e));
+        if (x2 - x1 < 2) continue;
+        svg.append(s("rect", { class: "tl-wait", x: x1, y: y0 + 3, width: x2 - x1, height: laneH - 6, fill: "url(#tl-hatch)", opacity: 0.8 }));
+        if (x2 - x1 > 70) el("tl-waitlbl v-dial", x1 + 6, y0 + LANE.marks + 5, `waiting ${dur(e - m.t)}`);
+      }
+      // sessions as bands
+      sessions.forEach((sx, i) => {
+        const e = endOf(sx, i); if (e < left || sx.start > right) return;
+        const x1 = Math.max(GUTTER, x(sx.start)), x2 = Math.min(W + 2, x(e)); if (x2 - x1 < 1) return;
+        const st = sx.status === "done" ? " done" : /blocked|stalled/.test(sx.status || "") ? " blocked" : "";
+        const b = el(`tl-band${sx.prep ? " prep" : ""}${st}`, x1, y0 + LANE.marks + 3, x2 - x1 > 46 ? `${sx.prep ? "prep " : ""}${sx.task_id} ${sx.task || ""}` : "",
+          { title: `${sx.prep ? "prep · " : ""}${sx.task_id} ${sx.task || ""} · session ${sx.iter} · ${clock(sx.start)}–${sx.end ? clock(e) : "now"}${sx.status ? " · " + sx.status : ""}` });
+        b.style.cssText += `;width:${x2 - x1}px;${sty}`;
+        b.addEventListener("click", () => { TL.open = { type: "sess", ch: n, iter: sx.iter }; openDrawer(); });
+      });
+      // file changes, packed into rows; edges join a session's changes in order
+      const nodes = [...f.nodes.values()].filter(nd => nd.kind !== "Test" && nd.t >= left - 4000 * TL.spp && nd.t <= right).sort((a, b) => a.t - b.t);
+      const rowEnd = Array(LANE.rows).fill(-1e9), placed = new Map();
+      let over = null;   // changes with no free row: counted into one "+N" (click zooms in there)
+      const flush = () => { if (!over) return; const o = over; over = null;
+        const e2 = el("tl-more v-dial", o.x, y0 + LANE.head + LANE.rows * LANE.row + 1, `+${o.n}`, { title: `${o.n} more changes here: click to zoom in` });
+        e2.addEventListener("click", ev => { ev.stopPropagation(); zoomBy(0.25, o.x); }); };
+      for (const nd of nodes) {
+        const xx = x(nd.t), text = base(nd.path), w = Math.min(190, 40 + 6.2 * text.length + 7 * String(nd.add ?? "").length);
+        const r = rowEnd.findIndex(end => end + 6 <= xx);
+        if (r < 0) { if (xx >= GUTTER) { if (over && xx - over.x < 40) over.n++; else { flush(); over = { x: xx, n: 1 }; } } continue; }
+        rowEnd[r] = xx + w;
+        if (xx + w < GUTTER) continue;   // off the left edge: it only takes its row
+        flush();
+        const yy = y0 + LANE.head + r * LANE.row + 2;
+        placed.set(nd.id, { x: xx, y: yy + 11, w });
+        const k = nd.kind === "Write" ? "k-write" : "k-edit";
+        const node = el(`tl-node${TL.open?.id === nd.id ? " sel" : ""}`, xx, yy, [chip(k, nd.kind === "Write" ? "W" : "E"), h("span", { class: "nm" }, text),
+          h("span", { class: "plus" }, `+${nd.add ?? 0}`), h("span", { class: "minus" }, `−${nd.del ?? 0}`)],
+          { title: `${nd.path} · ${nd.approx ? "≈ " : ""}${clock(nd.t)} · session ${nd.iter}` });
+        node.style.maxWidth = `${w}px`;
+        node.addEventListener("click", ev => { ev.stopPropagation(); TL.open = { type: "node", ch: n, id: nd.id }; openDrawer(); schedule(); });
+      }
+      flush();
+      let prev = null;
+      for (const nd of nodes) { const p = placed.get(nd.id); if (!p) { prev = null; continue; }
+        if (prev && prev.iter === nd.iter) { const a = prev.p, bx = p.x, mx = (a.x + a.w + bx) / 2;
+          svg.append(s("path", { d: `M${a.x + a.w},${a.y} C${mx},${a.y} ${mx},${p.y} ${bx},${p.y}`, style: "fill: none; stroke: var(--line-2); stroke-width: 1.3" })); }
+        prev = { iter: nd.iter, p }; }
+      // test runs
+      const yt = y0 + LANE.head + LANE.rows * LANE.row + LANE.more + 1;
+      const tests = [...f.nodes.values()].filter(q => q.kind === "Test" && q.t >= left && q.t <= right).sort((a, b) => b.t - a.t)
+        .map(nd => ({ nd, x: x(nd.t), w: textW(nd.fail || nd.pass, 7) + 8, important: !!nd.fail })).filter(it => it.x >= GUTTER);
+      for (const { nd, x: xx } of packRow(tests))
+        el(`tl-test v-dial ${nd.fail ? "f" : "p"}`, xx, yt, nd.fail ? `✗ ${nd.fail}` : `✓ ${nd.pass}`, { title: `${nd.cmd || "tests"} · ${nd.pass} passed, ${nd.fail} failed · ${nd.approx ? "≈ " : ""}${clock(nd.t)}` });
+      // the driver's marks; merges arc up into main
+      const laneMarks = [];
+      for (const m of f.marks.values()) {
+        if (!MARKS[m.kind] || m.t < left || m.t > right) continue;
+        const xx = x(m.t); if (xx < GUTTER) continue;
+        if (m.kind === "merged") {
+          svg.append(s("path", { d: `M${xx},${y0 + LANE.marks + 3} C${xx},${y0 - 18} ${xx},${mid + 18} ${xx},${mid + 6}`, style: "fill: none; stroke: var(--good); stroke-width: 1.6; opacity: 0.8" }));
+          merges.push({ m, x: xx - 4, w: textW(`⇡ ${m.task_id}`, 6.6), sty });
+        } else { const txt = `${MARKS[m.kind][1]}${m.task_id ? " " + m.task_id : ""}`;
+          laneMarks.push({ m, txt, x: xx, w: textW(txt, 6.4), important: ["stalled", "timeout", "handed"].includes(m.kind) }); }
+      }
+      for (const { m, txt, x: xx } of packRow(laneMarks.sort((a, b) => b.m.t - a.m.t)))
+        el(`tl-mark ${MARKS[m.kind][0]} v-dial`, xx, y0 + 2, txt, { title: `${clock(m.t)} · ${m.text}` });
+      const g = el("tl-gutter", 0, y0, [h("span", { class: "tag", style: `background: var(--ch-${colorKey(n) || "x"}, var(--fg-2))` }, letter(n)),
+        h("span", { class: "tl-gname" }, label(n)), stateChip(n)], { style: sty });
+      g.style.height = `${laneH}px`;
+    });
+    for (const { m, x: xx, sty } of packRow(merges.sort((a, b) => b.m.t - a.m.t)))
+      el("tl-mark tl-merged v-dial", xx, mid - 9, `⇡ ${m.task_id}`, { title: `${clock(m.t)} · ${m.text}`, style: sty });
+    const nx = x(nowS());
+    if (nx >= GUTTER && nx <= W) { svg.append(s("line", { x1: nx, x2: nx, y1: AXIS_H - 6, y2: H, style: "stroke: var(--k-driver); stroke-width: 1.5; stroke-dasharray: 3 3" }));
+      el("tl-now v-dial", nx - 14, 5, "now"); }
+  }
+  function openDrawer() {
+    const o = TL.open; if (!o) { drawer.hidden = true; return; }
+    const f = S.flow[o.ch], close = h("button", { class: "icon-btn", "aria-label": "Close", onclick: () => { TL.open = null; drawer.hidden = true; schedule(); } }, "✕");
+    drawer.hidden = false;
+    if (o.type === "sess") {
+      const sx = f?.sessions.get(o.iter); if (!sx) { drawer.hidden = true; return; }
+      const ch = [...f.nodes.values()].filter(nd => nd.iter === sx.iter).sort((a, b) => a.t - b.t);
+      drawer.replaceChildren(h("div", { class: "tl-dh" }, sx.prep ? chip("k-prep", "prep") : null, h("b", {}, `${sx.task_id} ${sx.task || ""}`), close),
+        h("p", { class: "v-dial muted" }, `${label(o.ch)} · session ${sx.iter} · ${clock(sx.start)}–${sx.end ? clock(sx.end) : "now"}${sx.end ? ` (${dur(sx.end - sx.start)})` : ""}`),
+        h("dl", { class: "kv v-dial" }, ...[["outcome", sx.status], ["verify", sx.verify], ["hand-over", sx.wrapup]].filter(r => r[1]).flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, String(v))])),
+        h("ul", { class: "tl-list" }, ch.map(nd => h("li", { onclick: () => { if (nd.kind !== "Test") { TL.open = { type: "node", ch: o.ch, id: nd.id }; openDrawer(); schedule(); } } },
+          nd.kind === "Test" ? chip(nd.fail ? "k-ask" : "k-say", nd.fail ? `✗ ${nd.fail}` : `✓ ${nd.pass}`) : chip(nd.kind === "Write" ? "k-write" : "k-edit", nd.kind),
+          h("span", { class: "v-code" }, nd.kind === "Test" ? nd.cmd || "tests" : nd.path), h("span", { class: "v-dial muted" }, `${nd.approx ? "≈" : ""}${clock(nd.t)}`)))));
+      return;
+    }
+    const nd = f?.nodes.get(o.id); if (!nd) { drawer.hidden = true; return; }
+    const sx = f.sessions.get(nd.iter), bodyHost = h("div", {}, h("p", { class: "muted" }, "Loading the diff…"));
+    const same = [...f.nodes.values()].filter(q => q.path === nd.path && q.id !== nd.id).sort((a, b) => b.t - a.t).slice(0, 12);
+    drawer.replaceChildren(h("div", { class: "tl-dh" }, chip(nd.kind === "Write" ? "k-write" : "k-edit", nd.kind), h("b", { class: "v-code", title: nd.path }, base(nd.path)), close),
+      h("p", { class: "v-code muted tl-path" }, nd.path),
+      h("p", { class: "v-dial" }, h("span", { class: "plus" }, `+${nd.add ?? 0}`), " ", h("span", { class: "minus" }, `−${nd.del ?? 0}`),
+        h("span", { class: "muted" }, ` · ${label(o.ch)} · ${nd.approx ? "≈ " : ""}${clock(nd.t)} · session ${nd.iter}${sx ? ` · ${sx.task_id} ${sx.task || ""}` : ""}`)),
+      bodyHost,
+      same.length ? h("section", {}, h("span", { class: "label" }, "other changes to this file"), h("ul", { class: "tl-list" }, same.map(q => h("li", { onclick: () => { TL.open = { type: "node", ch: o.ch, id: q.id }; openDrawer(); schedule(); } },
+        chip(q.kind === "Write" ? "k-write" : "k-edit", q.kind), h("span", { class: "v-dial" }, `+${q.add} −${q.del}`), h("span", { class: "v-dial muted" }, `${q.approx ? "≈" : ""}${clock(q.t)} · s${q.iter}`))))) : null);
+    fetch(`/api/flow/body?ch=${encodeURIComponent(o.ch)}&id=${encodeURIComponent(nd.id)}`).then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(j => { if (TL.open?.id === nd.id) bodyHost.replaceChildren(body(j.body) || h("p", { class: "muted" }, "Nothing to show.")); })
+      .catch(() => { if (TL.open?.id === nd.id) bodyHost.replaceChildren(h("p", { class: "muted" }, "The diff is not on the server (it keeps the sprint's changes since it last started).")); });
+  }
+  // panning and zooming
+  let drag = null;
+  stage.addEventListener("pointerdown", e => { if (e.target.closest(".tl-node, .tl-band, .tl-more, .tl-gutter, .tl-drawer")) return;
+    drag = { x: e.clientX, r: rightT() }; stage.setPointerCapture(e.pointerId); stage.classList.add("dragging"); });
+  stage.addEventListener("pointermove", e => { if (!drag) return; setView(TL.spp, drag.r - (e.clientX - drag.x) * TL.spp, false); });
+  stage.addEventListener("pointerup", () => { drag = null; stage.classList.remove("dragging"); if (TL.right != null && TL.right >= nowS()) TL.follow = true; });
+  stage.addEventListener("wheel", e => {
+    const r = stage.getBoundingClientRect(), cx = e.clientX - r.left;
+    if (e.ctrlKey || e.metaKey || (Math.abs(e.deltaY) > Math.abs(e.deltaX) && !e.shiftKey && stage.scrollHeight <= stage.clientHeight + 2)) {
+      e.preventDefault(); zoomBy(Math.exp(e.deltaY * (e.ctrlKey ? 0.012 : 0.002)), cx);
+    } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey) {
+      e.preventDefault(); const d = e.deltaX || e.deltaY; setView(TL.spp, rightT() + d * TL.spp, false);
+    }
+  }, { passive: false });
+  followBtn.addEventListener("click", () => setView(TL.spp, null, !TL.follow));
+  const toolbar = h("div", { class: "tl-bar" },
+    projects.length > 1 ? projects.map(p => h("button", { class: "act" + (p === TL.project ? " on" : ""), onclick: () => { TL.project = p; go("flow"); } }, p)) : h("b", { class: "v-name tl-proj" }, TL.project),
+    h("div", { class: "row" },
+      h("button", { class: "act", onclick: () => zoomBy(1 / 1.6), title: "Zoom in" }, "+"), h("button", { class: "act", onclick: () => zoomBy(1.6), title: "Zoom out" }, "−"),
+      h("button", { class: "act", onclick: () => setView(3600 / Math.max(200, stage.clientWidth - GUTTER - 40), null, true) }, "1 h"),
+      h("button", { class: "act", onclick: () => setView(6 * 3600 / Math.max(200, stage.clientWidth - GUTTER - 40), null, true) }, "6 h"),
+      h("button", { class: "act", onclick: fit }, "Whole sprint"), followBtn),
+    h("div", { class: "tl-legend" }, chip("k-edit", "edit"), chip("k-write", "write"), h("span", { class: "tl-test p v-dial" }, "✓ tests"), h("span", { class: "tl-test f v-dial" }, "✗ failing"),
+      h("span", { class: "tl-mark tl-merged v-dial" }, "⇡ merged"), h("span", { class: "tl-mark tl-handed v-dial" }, "handed over"), h("span", { class: "tl-hatch-key" }, "waiting")),
+    status);
+  SUBS.add((ch, kind) => { if (kind === "flow" || kind === "meta" || kind === "add") { schedule(); if (kind === "flow" && TL.open && TL.open.ch === ch && TL.open.type === "sess") openDrawer(); } });
+  TICKERS.add(() => { if (TL.follow) schedule(); });
+  requestAnimationFrame(() => { draw(); if (TL.open) openDrawer(); });
+  return h("div", { class: "tl" }, toolbar, h("div", { class: "tl-body" }, stage, drawer));
+}
+let tlResize; window.addEventListener("resize", () => { clearTimeout(tlResize); tlResize = setTimeout(() => { if (route === "flow") notify(null, "flow"); }, 120); });
+
 /* ---- one agent: its full feed, and everything about its task beside it */
 function historyRows(rows) {
   return rows.map(r => {
@@ -578,11 +830,12 @@ function agentPage(name) {
   const sc = h("div", { class: "agent-feed" });
   const f = feed(name, false, () => sc);
   sc.append(f.el);
-  const conn = h("span", { class: "conn v-dial" });
+  const conn = h("span", { class: "conn v-dial" }), stateHost = h("span", { class: "ch-state" });
   const reBtn = h("button", { class: "act", title: "Drop this stream and reconnect (R)" }, reloadIcon(), "Reconnect");
   const paintConn = () => {
     const c = S.channels[name]; if (!c) return;
     const st = stale(name), age = nowS() - (c.last || 0);
+    stateHost.replaceChildren(...[stateChip(name), c.meta.prep && c.meta.running ? chip("k-prep", "prep") : null].filter(Boolean));
     conn.className = "conn v-dial" + (st ? " stale" : "");
     reBtn.className = "act" + (st ? " attn" : "");
     conn.replaceChildren(h("span", { class: "led " + (st ? "warn" : c.meta.running ? "on" : "") }),
@@ -592,6 +845,7 @@ function agentPage(name) {
   reBtn.addEventListener("click", () => reconnect(name, reBtn));
   agentPage.reconnect = () => reconnect(name, reBtn);
   paintConn(); TICKERS.add(paintConn);
+  SUBS.add((ch, kind) => { if (ch === name && kind === "meta") paintConn(); });
   const side = h("aside", { class: "side" }, ...taskPanel(name));
   SUBS.add((ch, kind) => { if (ch === name && (kind === "task" || (kind === "meta" && side.dataset.task !== S.channels[name]?.meta.task_id))) {
     side.dataset.task = S.channels[name]?.meta.task_id || ""; side.replaceChildren(...taskPanel(name).filter(Boolean)); } });
@@ -601,7 +855,7 @@ function agentPage(name) {
   ta.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(false); } });
   return h("div", { class: "agent", style: chStyle(name) },
     h("div", { class: "agent-main" },
-      h("div", { class: "agent-bar" }, conn, reBtn), sc,
+      h("div", { class: "agent-bar" }, stateHost, conn, reBtn), sc,
       h("div", { class: "composer" }, ta, h("div", { class: "row" }, h("small", {}, "Enter sends · read after its current step · Shift+Enter for a new line"),
         h("div", { class: "row" }, h("button", { class: "act danger", onclick: () => send(true), title: "Ends the running session now; the next one starts with your message" }, "Stop session & send"),
           h("button", { class: "act primary", onclick: () => send(false) }, "Send"))))),
@@ -610,17 +864,30 @@ function agentPage(name) {
 
 /* ================================================================ routing, ticking */
 function go(id, keepScroll) {
-  if (!["live", "board", "hardware"].includes(id) && !S.channels[id] && Object.keys(S.channels).length) id = "live";
+  if (!["live", "board", "hardware", "flow"].includes(id) && !S.channels[id] && Object.keys(S.channels).length) id = "live";
   route = id; SUBS.clear(); TICKERS.clear();
   const ch = S.channels[id];
-  $("#title").textContent = { live: "Live", board: "Board", hardware: "Hardware" }[id] || (ch ? `${label(id)} · ${ch.meta.project || ""}` : id);
-  $("#view").replaceChildren(id === "live" ? live() : id === "board" ? board() : id === "hardware" ? hardware() : agentPage(id));
-  $("#main").dataset.route = id === "live" ? "live" : ["board", "hardware"].includes(id) ? "page" : "agent";
+  $("#title").textContent = { live: "Live", board: "Board", hardware: "Hardware", flow: "Timeline" }[id] || (ch ? `${label(id)} · ${ch.meta.project || ""}` : id);
+  $("#view").replaceChildren(id === "live" ? live() : id === "board" ? board() : id === "hardware" ? hardware() : id === "flow" ? timeline() : agentPage(id));
+  $("#main").dataset.route = ["live", "flow"].includes(id) ? "live" : ["board", "hardware"].includes(id) ? "page" : "agent";
   if (!keepScroll) $("#main").scrollTop = 0;
   renderChrome();
   store.set("lab-console-route", id);
   if (decodeURIComponent(location.hash.slice(1)) !== id) history.pushState(null, "", "#" + encodeURIComponent(id));
 }
+const sunIcon = () => icon(["M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7", "M8 1v1.5", "M8 13.5V15", "M1 8h1.5", "M13.5 8H15", "M3 3l1 1", "M12 12l1 1", "M3 13l1-1", "M12 4l1-1"]);
+const moonIcon = () => icon(["M13.5 9.5A5.5 5.5 0 1 1 6.5 2.5a4.5 4.5 0 0 0 7 7z"]);
+function paintTheme() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  $("#theme").replaceChildren(dark ? sunIcon() : moonIcon());
+  $("#theme").title = dark ? "Switch to light" : "Switch to dark";
+}
+$("#theme").addEventListener("click", () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = t; store.set("lab-console-theme", t); paintTheme();
+  if (route === "hardware") notify(null, "hist");   // the charts read colours when drawn
+});
+paintTheme();
 $("#reconnect-all").addEventListener("click", async () => {
   const b = $("#reconnect-all"); b.classList.add("spin"); b.disabled = true;
   connect();

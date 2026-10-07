@@ -21,8 +21,14 @@ w.addEventListener("error", e => errors.push(String(e.error?.stack || e.message)
 
 let es;
 w.EventSource = class { constructor(url) { es = this; this.url = url; setTimeout(() => { this.onopen?.(); }, 0); } close() {} };
-const posts = [];
-w.fetch = async (url, opts) => { posts.push({ url, body: JSON.parse(opts.body), headers: opts.headers }); return { ok: true, status: 202, json: async () => ({ id: "c" + posts.length }) }; };
+const posts = [], gets = [];
+w.fetch = async (url, opts) => {
+  if (!opts || opts.method !== "POST") { gets.push(url); return { ok: true, status: 200, json: async () => ({ body: { diff: [["-", "4", "old"], ["+", "4", "new()"]], path: "web/feed.py" } }) }; }
+  posts.push({ url, body: JSON.parse(opts.body), headers: opts.headers }); return { ok: true, status: 202, json: async () => ({ id: "c" + posts.length }) };
+};
+// jsdom has no layout: the timeline's canvas gets a width so it draws
+Object.defineProperty(w.HTMLElement.prototype, "clientWidth", { configurable: true, get() { return this.classList?.contains("tl-stage") ? 1400 : 0; } });
+const navTo = name => [...d.querySelectorAll("#nav-main button")].find(b => b.textContent.startsWith(name))?.click();
 const push = m => es.onmessage({ data: JSON.stringify(m) });
 const tick = (ms = 30) => new Promise(r => setTimeout(r, ms));
 const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
@@ -46,6 +52,9 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   check("nav: agent listed, request counted", text("#nav-agents button").length === names.length && d.querySelector("#nav-main .n")?.textContent === "1");
   const chrome = () => text("#view .ch-head, #view .side dl, #view .agent-bar, #nav-main, #nav-agents, #status, #view .gauge, #view .board .note").join(" ");
   check("live: no null or undefined in headers", !/\b(null|undefined|NaN)\b/.test(chrome()), chrome().match(/.{30}\b(null|undefined|NaN)\b.{0,10}/)?.[0]);
+  check("labels: vivid chips for thinking, tools, driver", ["k-think", "k-bash", "k-driver"].every(k => pane().querySelector(`.chip.${k}`)),
+        ["k-think", "k-bash", "k-driver", "k-read", "k-edit", "k-say"].map(k => `${k}:${pane().querySelectorAll(".chip." + k).length}`).join(" "));
+  check("labels: a state chip in every pane header", d.querySelectorAll("#view .ch-head .chip.state").length === names.length);
   check("status: streaming count", d.getElementById("status").textContent.includes(`${names.length} streaming`), d.getElementById("status").textContent);
 
   // live updates: a new block, streamed text, a finished tool call
@@ -79,7 +88,7 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   check("message: pending replaced by the delivered one", !d.querySelector("#view .you.pending") && text("#view .you").some(t => t.includes("hello there")));
 
   // board
-  d.querySelectorAll("#nav-main button")[1].click();
+  navTo("Board");
   await tick();
   check("board: no null or undefined", !/\b(null|undefined|NaN)\b/.test(chrome()), chrome().match(/.{30}\b(null|undefined|NaN)\b.{0,10}/)?.[0]);
   check("board: request waiting", d.querySelectorAll("#view .ask").length === 1 && d.querySelector("#view .ask-text").textContent === ch.snap.asks[0].text);
@@ -100,14 +109,39 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
     cpu: { temp: 55, load: 12, ram_used: 20.1, ram_total: 62.6 }, servers: { "8080": { state: "generating", tok_s: 31.4, kv_pct: 42, ctx_max: 150000 } } } });
   push({ type: "hist", hist: { minutes, temp: { "RTX 3090": minutes.map((_, i) => 60 + i % 7), "RTX 3090 Ti": minutes.map((_, i) => i === 5 ? null : 70 + i % 5) },
                                 power: { "RTX 3090": minutes.map(() => 240), "RTX 3090 Ti": minutes.map(() => 245) } } });
-  d.querySelectorAll("#nav-main button")[2].click();
+  navTo("Hardware");
   await tick(80);
   check("hardware: no null or undefined", !/\b(null|undefined|NaN)\b/.test(chrome()), chrome().match(/.{30}\b(null|undefined|NaN)\b.{0,10}/)?.[0]);
   check("hardware: a card per GPU plus the CPU", d.querySelectorAll("#view .gauge").length === 3, d.querySelectorAll("#view .gauge").length);
   check("hardware: card names its agent", text("#view .gauge-h").some(t => t.includes("RTX 3090 Ti") && t.includes("agent a")), text("#view .gauge-h"));
   check("hardware: two charts drawn, gap left open", d.querySelectorAll("#view .chart svg").length === 2
         && [...d.querySelectorAll("#view .chart svg path")].some(p => (p.getAttribute("d").match(/M/g) || []).length === 2));
-  check("hardware: hot card lights the nav", d.querySelector("#nav-main button:nth-of-type(3) .led.warn") != null);
+  check("hardware: hot card lights the nav", [...d.querySelectorAll("#nav-main button")].find(b => b.textContent.startsWith("Hardware"))?.querySelector(".led.warn") != null);
+
+  // timeline
+  navTo("Timeline");
+  await tick(80);
+  const fl = state.flow || {};
+  check("timeline: a row per agent plus main", d.querySelectorAll("#view .tl-gutter").length === names.length + 1, d.querySelectorAll("#view .tl-gutter").length);
+  check("timeline: file changes drawn as nodes", d.querySelectorAll("#view .tl-node").length > 0, d.querySelectorAll("#view .tl-node").length);
+  check("timeline: sessions as bands, a past one done", d.querySelectorAll("#view .tl-band").length >= 2 && d.querySelector("#view .tl-band.done") != null, d.querySelectorAll("#view .tl-band").length);
+  check("timeline: failing test run and merge marked", d.querySelector("#view .tl-test.f") != null && d.querySelector("#view .tl-world .tl-merged") != null);
+  check("timeline: waiting hatched", d.querySelector("#view rect.tl-wait") != null);
+  check("timeline: no null or undefined", !/\b(null|undefined|NaN)\b/.test(d.getElementById("view").textContent), d.getElementById("view").textContent.match(/.{30}\b(null|undefined|NaN)\b.{0,10}/)?.[0]);
+  d.querySelector("#view .tl-node").click();
+  await tick(60);
+  check("timeline: a node opens its diff", !d.querySelector("#view .tl-drawer").hidden && gets.at(-1)?.startsWith("/api/flow/body?ch=") && d.querySelectorAll("#view .tl-drawer .ln.add").length === 1,
+        gets.at(-1));
+  const nb = d.querySelectorAll("#view .tl-node").length;
+  const ch0 = names.find(n => (fl[n]?.nodes || []).length);
+  push({ type: "flow_node", ch: ch0, node: { id: "99:e1", iter: 99, t: Date.now() / 1000 - 2 * 3600, kind: "Write", path: "web/new_file.py", add: 12, del: 0, approx: false } });
+  await tick(60);
+  check("timeline: a live change appears", d.querySelectorAll("#view .tl-node").length === nb + 1 && text("#view .tl-node").some(t => t.includes("new_file.py")));
+
+  // theme
+  const t0 = d.documentElement.dataset.theme;
+  d.getElementById("theme").click();
+  check("theme: toggles and is remembered", d.documentElement.dataset.theme !== t0 && w.localStorage.getItem("lab-console-theme") === d.documentElement.dataset.theme);
 
   // one agent
   d.querySelector("#nav-agents button").click();

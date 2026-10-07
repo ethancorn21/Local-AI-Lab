@@ -121,14 +121,26 @@ def tool_pair(i, name, args, text):
 
 
 write(f"{WT_B}/.agent/team.env", f"TEAM_DIR={MAIN}\nAGENT_ID=b\nLLM_URL=http://127.0.0.1:8081/v1\n")
+EDIT_B = [ev_line({"type": "tool_execution_start", "toolCallId": "t0", "toolName": "edit", "args": {"path": "web/feed.py"}}),
+          ev_line({"type": "tool_execution_end", "toolCallId": "t0", "toolName": "edit", "isError": False,
+                   "result": {"content": [{"type": "text", "text": "ok"}], "details": {"diff": "-4 old_row()\n+4 new_row()\n+5 age()"}}})]
 SESS_B = b"".join(
-    tool_pair(1, "bash", {"command": "pytest -q"}, "FAILED tests/test_rows.py::test_one - Assertio...\n2 failed, 4 warnings in 11.50s")
+    EDIT_B
+    + tool_pair(1, "bash", {"command": "pytest -q"}, "FAILED tests/test_rows.py::test_one - Assertio...\n2 failed, 4 warnings in 11.50s")
     + [ev_line({"type": "tool_execution_start", "toolCallId": "t2", "toolName": "bash", "args": ["not", "a", "dict"]})]
     + tool_pair(3, "read", {"path": "web/feed.py", "limit": "forty"}, "line one\nline two")
     + [ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_start"}}),
        ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "after the bad line"}}),
        ev_line({"type": "message_update", "assistantMessageEvent": {"type": "text_end"}})])
 write(f"{WT_B}/.agent/sessions/iter-0001.jsonl", SESS_B.decode())
+# b's session is a finished one from an hour ago: the timeline gets it from the history (loop.log, iterations.jsonl)
+T_B = time.time() - 3600
+stamp_b = lambda dt: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(T_B + dt))
+write(f"{WT_B}/.agent/loop.log", f"{stamp_b(0)} iteration 1: tasks/002-feed-rows.md (harness abc)\n"
+                                 f"{stamp_b(600)} team: tasks/002-feed-rows.md merged into main (abc1234)\n"
+                                 f"{stamp_b(610)} team: nothing to take now - waiting for the other agent(s): 003 waits for 002\n")
+write(f"{WT_B}/.agent/iterations.jsonl", json.dumps({"iter": 1, "task": "tasks/002-feed-rows.md", "start": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(T_B)),
+                                                      "end": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(T_B + 590)), "status_after": "done"}) + "\n")
 
 HTML_REPLY = '<img src=x onerror="window.PWNED=1"><b>bold?</b>'
 SPLICE = [ev_line({"type": "message_end", "message": {"role": "user", "content": [
@@ -236,7 +248,7 @@ def state():
     return json.loads(http("GET", "/api/state")[2])
 
 
-env = {**os.environ, "LABDASH_PROJECTS": P, "LABDASH_HIDDEN": f"{S}/hidden", "LABDASH_SPRINT": SPRINT, "LABDASH_SOCKET": SOCK}
+env = {**os.environ, "LABDASH_CACHE": f"{S}/cache", "LABDASH_PROJECTS": P, "LABDASH_HIDDEN": f"{S}/hidden", "LABDASH_SPRINT": SPRINT, "LABDASH_SOCKET": SOCK}
 ship = subprocess.Popen([PY, SHIP, "--stdio"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(f"{S}/ship.log", "w"))
 ingest = subprocess.Popen([PY, INGEST], env=env, stdin=ship.stdout, stdout=ship.stdin)
 
@@ -305,12 +317,38 @@ try:
     check("pytest summary with failures and no 'passed' counted", any(e["t"] == "tool" and e["target"] == "pytest -q"
           and e.get("meta") == {"pass": 0, "fail": 2} for e in evb), [e.get("meta") for e in evb if e["t"] == "tool"])
     check("read with a non-numeric limit shown", any(e["t"] == "tool" and e["kind"] == "Read" and e.get("meta") == "2 lines" for e in evb))
-    check("unreadable line skipped and noted in b's feed", [e["text"][:40] for e in evb if e["t"] == "sys"] == ["console: skipped a session event it coul"],
+    check("unreadable line skipped and noted in b's feed", [e["text"][:40] for e in evb if e["t"] == "sys" and e["text"].startswith("console")] == ["console: skipped a session event it coul"],
           [e["text"] for e in evb if e["t"] == "sys"])
     check("b's stream goes on after it", bool(cb))
     check("shipper logged the fault once", open(f"{S}/ship.log").read().count("fault in demo.b (a session event): AttributeError") == 1,
           open(f"{S}/ship.log").read()[-400:])
     check("main checkout is not a channel", "demo" not in state()["channels"])
+
+    # ---- the timeline
+    fl = wait_for(lambda: (lambda f: f if all(f.get(n, {}).get("done") for n in ("demo.a", "demo.b")) else None)(state()["flow"]), 30) or state()["flow"]
+    want_changes = sum(1 for raw in FED if b'"tool_execution_end"' in raw and (lambda e: e.get("toolName") in ("edit", "write") and not e.get("isError"))(json.loads(raw)))
+    na = sorted((n for n in fl.get("demo.a", {}).get("nodes", []) if n["kind"] in ("Edit", "Write")), key=lambda n: int(n["id"].split(":e")[1]))
+    check(f"timeline: every file change of a's session ({want_changes}), numbered in order", [n["id"] for n in na] == [f"1:e{i}" for i in range(1, want_changes + 1)],
+          [n["id"] for n in na][:5])
+    check("timeline: live changes carry their real time", na and sum(1 for n in na if not n["approx"]) >= len(na) // 2 and all(abs(n["t"] - time.time()) < 600 for n in na if not n["approx"]),
+          [(n["id"], n["approx"]) for n in na][:6])
+    fb = fl.get("demo.b", {})
+    sb = {x["iter"]: x for x in fb.get("sessions", [])}.get(1, {})
+    check("timeline: b's past session from the history, with its end and outcome", sb.get("task_id") == "002" and sb.get("status") == "done"
+          and abs(sb.get("start", 0) - T_B) < 2 and abs(sb.get("end", 0) - (T_B + 590)) < 2, sb)
+    nb = {n["id"]: n for n in fb.get("nodes", [])}
+    check("timeline: b's edit placed inside its session (by file position)", nb.get("1:e1", {}).get("approx") and T_B <= nb["1:e1"]["t"] <= T_B + 590
+          and nb["1:e1"]["path"] == "web/feed.py" and nb["1:e1"]["add"] == 2, nb.get("1:e1"))
+    check("timeline: b's failing test run", nb.get("1:t1", {}).get("fail") == 2 and nb["1:t1"]["pass"] == 0, nb.get("1:t1"))
+    check("timeline: merge and wait marked", sorted(m["kind"] for m in fb.get("marks", [])) == ["merged", "wait"]
+          and [m["task_id"] for m in fb["marks"] if m["kind"] == "merged"] == ["002"], fb.get("marks"))
+    st_, _, body_ = http("GET", "/api/flow/body?ch=demo.b&id=1:e1")
+    check("timeline: the diff is served on demand", st_ == 200 and json.loads(body_)["body"]["diff"][1] == ["+", "4", "new_row()"], (st_, body_[:200]))
+    check("timeline: unknown entry refused", http("GET", "/api/flow/body?ch=demo.b&id=9:e9")[0] == 404)
+    check("timeline: b's finished session cached", os.path.exists(f"{S}/cache/demo.b/iter-0001.jsonl.json"))
+    check("timeline: snapshot carries no diffs", '"diff"' not in json.dumps(fl))
+    cb2 = state()["channels"]["demo.b"]["meta"]
+    check("b's state for the chip: waiting, from the driver's last line", "nothing to take now" in (cb2.get("driver") or ""), cb2.get("driver"))
     check("hidden project never shipped", not any(n.startswith("secret") for n in state()["channels"]) and "secret" not in state()["boards"]
           and not any(b"SECRET-MARKER" in r for r in RAW))
     write(f"{S}/state.json", json.dumps(state()))
@@ -380,6 +418,8 @@ try:
     st, _, body = post("/api/message", {"ch": "demo.a", "text": "back again"})
     check("reconnect: commands work", st == 202 and wait_for(lambda: msgs(type="ack", id=json.loads(body).get("id"), ok=True)), (st, body))
     check("reconnect: board kept", "demo" in state()["boards"])
+    check("reconnect: a's timeline kept, b's dropped with it", state()["flow"].get("demo.a", {}).get("nodes") and "demo.b" not in state()["flow"]
+          and http("GET", "/api/flow/body?ch=demo.b&id=1:e1")[0] == 404)
 
     check("server log clean", "Traceback" not in open(f"{S}/server.log").read(), open(f"{S}/server.log").read()[-400:])
     for lg in ("ship.log", "ship2.log"):
