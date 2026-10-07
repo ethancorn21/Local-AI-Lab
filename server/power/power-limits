@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # power-limits: boot-time power policy for the AI box, applied before llama-server starts.
 # CPU: Intel RAPL package limits. The i9-14900KF has a degradation history and is on temporary cooling.
-# GPUs: persistence mode + per-model caps. The EVGA 1300 G2 has 6 VGA sockets for two 3090 Tis + a 5060 Ti, so one
-# 3090 Ti shares a daisy-chained cable: the cap is what keeps that cable in spec.
+# GPUs: persistence mode + per-model caps. The EVGA 1300 G2 has 6 VGA sockets for a 3090 Ti, a 3090 and a 5060 Ti;
+# the 3090 Ti shares a daisy-chained cable, and the caps keep cables and PSU in spec. Cards are matched by name.
 # Every limit is read back; any mismatch exits non-zero, and llama-server (Requires=power-limits.service) stays down.
 set -uo pipefail
 CPU_PL1_W=125   # sustained
 CPU_PL2_W=125   # burst
-declare -A GPU_PL_W=(["NVIDIA GeForce RTX 3090 Ti"]=300)
+declare -A GPU_PL_W=(["NVIDIA GeForce RTX 3090 Ti"]=300 ["NVIDIA GeForce RTX 3090"]=300)
 R=/sys/class/powercap/intel-rapl:0
 fail=0
 echo $((CPU_PL1_W * 1000000)) > $R/constraint_0_power_limit_uw

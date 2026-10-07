@@ -27,12 +27,13 @@ Related notes:
 | Item | Now | Notes |
 |---|---|---|
 | CPU | Intel i9-14900KF | Unstable under Windows (suspected Raptor Lake degradation). P-cores capped, power limited to 125 W. No hardware errors under Linux so far. |
-| GPU 0 | RTX 3090 Ti 24 GB, slot 1 (x16) | Production model (vLLM). Capped at 300 W since 2026-10-06 (350 W before). |
-| GPU 1 | RTX 5060 Ti 16 GB, slot 3 (PCIe 4.0 x4) | Second coding agent since 2026-10-02 (dense 27B on llama.cpp). Stock 180 W. |
-| GPU 2 | RTX 3090 24 GB (used) | Arrived 2026-10-06; drying out for a day after condensation at unboxing. A third agent, as fast as the 3090 Ti. Its memory chips sit on the back under the backplate, so it needs air there. |
+| GPU 0 | RTX 3090 24 GB (used), slot 1 (PCIe 4.0 x16) | Installed 2026-10-06. A third agent, as fast as the 3090 Ti. Capped at 300 W (stock 350, max 400). Its memory chips sit on the back under the backplate, so it needs air there. |
+| GPU 1 | RTX 5060 Ti 16 GB, a PCIe 3.0 x1 slot | Second coding agent since 2026-10-02 (dense 27B on llama.cpp). Stock 180 W. x1 only slows model loading: the model sits fully in its memory. |
+| GPU 2 | RTX 3090 Ti 24 GB, slot 3 (PCIe 4.0 x4) | Production model (vLLM). Capped at 300 W since 2026-10-06 (350 W before). |
 | RAM | 32 GB DDR5 | Upgrade as a 2-stick kit, not 4 sticks (two DIMMs per channel slows DDR5). |
-| Board | MSI PRO Z790-P WIFI | Slot 1 PCIe 5.0 x16 (CPU), slot 3 PCIe 4.0 x4 (chipset), the rest PCIe 3.0 x1. |
-| PSU | EVGA SuperNOVA 1300 G2 (single rail, 6 PCIe power sockets) | Enough for all three cards with the power caps. Check the new card's plug count against the free sockets. |
+| Board | MSI PRO Z790-P WIFI | Slot 1 PCIe 5.0 x16 (CPU), slot 3 PCIe 4.0 x4 (chipset), the rest PCIe 3.0 x1. GPU numbers follow the PCI bus, so they change when cards move; every service picks its card by UUID. |
+| PSU | EVGA SuperNOVA 1300 G2 (single rail, 6 PCIe power sockets) | Enough for all three cards with the power caps. |
+| Network | Onboard NIC, DHCP from the core switch | Fixed by a DHCP reservation on client ID `01` + MAC. Netplan sends the MAC (`dhcp-identifier: mac`): the default ID follows the NIC's PCI path, so moving GPUs changed it and the box got a new address. |
 | Storage | 1.8 TB NVMe, LVM | Root 200 GB, a separate volume for models, ~50 GB free for snapshots. |
 | Chassis | Open frame (since 2026-10-02), CPU water cooler | Risers for three cards planned. |
 
@@ -173,4 +174,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 arrived; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |
+| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 installed in slot 1 at 300 W (3090 Ti to slot 3, 5060 Ti to an x1 slot), DHCP client ID = MAC; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |
