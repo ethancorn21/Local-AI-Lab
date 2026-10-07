@@ -149,8 +149,8 @@ is gone is ignored and removed. Why: the human wants every GPU pointed at one pr
 
 ## Team mode
 
-Several agents build one project at once, one per GPU: agent a on the 3090 Ti (vLLM, 150k window), agent b on the
-5060 Ti (llama.cpp, 114k window), the same model on both. `main` holds only finished, verified work; each agent works in
+Several agents build one project at once, one per GPU: agent a on the 3090 Ti and agent c on the 3090 (vLLM, 150k
+window each), agent b on the 5060 Ti (llama.cpp, 114k window), the same model on all three. `main` holds only finished, verified work; each agent works in
 its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`), with its settings in `.agent/team.env`.
 
 ### The rules (enforced by the driver)
@@ -217,6 +217,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
+| `test_team_add.sh` | Adding an agent to an existing team: its checkout, its settings, and who owns each task |
 | `test_team_split.sh`, `test_team_handover.sh`, `test_team_deps.sh`, `test_team_restart.sh`, `test_replan.sh` | Splitting for the small agent, handing tasks over, dependency edge cases, restarts, re-planning |
 | `test_ask_deadline.sh`, `test_ask_human_ext.mjs` | The request deadline and the recommendation rule |
 | `test_gpu_lease.sh` | One project per GPU |
@@ -290,6 +291,7 @@ From hollowdeep, a browser game the agent built over ~40 hours (7,368 lines of c
 |---|---|
 | Start or resume a project | `agent-start <project>` (runs in the background, survives logout; pauses another project's loop on the same GPU) |
 | Start a team | `agent-team init <name>`, then `agent-team start <name>` |
+| Add an agent to a team (a new GPU) | `agent-team add <name> <id>` (settings in `~/.agent-kit/agents/<id>.env`), then `agent-team start <name>` |
 | Watch live and talk to the agent | `agent-watch <project>` (type a message and press Enter; Esc stops the session with the message; Ctrl-C leaves the view) |
 | Stop | `agent-stop <project>` (after the current session; `--now` immediately), or `agent-team stop <name>` |
 | Restart a team after a harness change | `agent-team restart <name>` (each agent finishes its session first) |

@@ -107,7 +107,7 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 | Port | Service |
 |---|---|
 | 8080 | vLLM on the 3090 Ti (production) |
-| 8081 | Reserved: the second 24 GB card |
+| 8081 | vLLM on the 3090 (agent c) |
 | 8082 | llama.cpp on the 5060 Ti |
 | 8090 | Reserved: the type-1 log triage model |
 
@@ -151,7 +151,6 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 
 ## Plans
 
-- **The second 24 GB card:** a third agent in team mode on port 8081, capped at ~280-300 W, as fast as agent a.
 - **The 5060 Ti** goes to the SIEM work and the type-1 log triage model when that starts.
 - **Less idle time in team mode:** a streamed plan; later a bigger model on both 24 GB cards for planning.
 - **Open-frame rig** with risers for three cards; re-check temperatures after the move.
@@ -174,4 +173,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 installed in slot 1 at 300 W (3090 Ti to slot 3, 5060 Ti to an x1 slot), DHCP client ID = MAC; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |
+| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 installed in slot 1 at 300 W (3090 Ti to slot 3, 5060 Ti to an x1 slot), DHCP client ID = MAC; agent c's vLLM on the 3090 (8081) and `agent-team add`; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |

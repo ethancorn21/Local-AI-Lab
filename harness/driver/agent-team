@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # agent-team : several coding agents on one project at the same time.
 #   agent-team init <name> [ids...]   set up ~/projects/<name> (a folder with a GOAL.md) for a team (default ids: a b)
-#   agent-team start <name>           start every agent's loop in the background
+#   agent-team add <name> <id>        add an agent to an existing team (a new GPU); start it with agent-team start
+#   agent-team start <name>         start every agent's loop in the background
 #   agent-team stop <name> [--now]    stop them (after the current sessions, or now)
 #   agent-team restart <name>         after a harness change: running agents finish their session, then start again
 #   agent-team status <name>          who works on what, waits, merges and conflicts
@@ -13,21 +14,29 @@
 set -euo pipefail
 export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
 cmd=${1:-}; name=${2:-}
-[ -n "$cmd" ] && [ -n "$name" ] || { sed -n '2,7p' "$0" | sed 's/^# //'; exit 1; }
+[ -n "$cmd" ] && [ -n "$name" ] || { sed -n '2,8p' "$0" | sed 's/^# //'; exit 1; }
 P=$HOME/projects/$name; TEAM=$P/.agent/team
 ids() { ls "$TEAM/agents" 2>/dev/null; }
 wt() { echo "$HOME/projects/$name.$1"; }
+check_id() {
+  [[ $1 =~ ^[a-z]$ ]] || { echo "agent ids are single letters (a, b, ...): $1"; exit 1; }
+  [ -f "$HOME/.agent-kit/agents/$1.env" ] || { echo "missing $HOME/.agent-kit/agents/$1.env (that agent's model server and settings)"; exit 1; }
+  [ ! -e "$(wt "$1")" ] || { echo "$(wt "$1") already exists"; exit 1; }
+}
+new_worktree() {   # $1 id, $2 the command, for the header: the agent's checkout on branch agent/<id> with its team.env
+  W=$(wt "$1")
+  git -C "$P" worktree add -q -b "agent/$1" "$W" main
+  mkdir -p "$W/.agent"
+  { echo "# team mode ($2 $(date +%F)): read by agent-loop"; echo "TEAM_DIR=$P"; echo "AGENT_ID=$1"
+    grep -v '^[[:space:]]*#' "$HOME/.agent-kit/agents/$1.env" | grep .; } > "$W/.agent/team.env" || true
+}
 
 case $cmd in
 init)
   shift 2; [ $# -gt 0 ] || set -- a b
   [ -d "$P" ] || { echo "No folder $P: create it with a GOAL.md (what you want built)."; exit 1; }
   [ -f "$P/.agent/team-main" ] && { echo "$P is already a team project (agent-team status $name)."; exit 1; }
-  for id in "$@"; do
-    [[ $id =~ ^[a-z]$ ]] || { echo "agent ids are single letters (a, b, ...): $id"; exit 1; }
-    [ -f "$HOME/.agent-kit/agents/$id.env" ] || { echo "missing $HOME/.agent-kit/agents/$id.env (that agent's model server and settings)"; exit 1; }
-    [ ! -e "$(wt "$id")" ] || { echo "$(wt "$id") already exists"; exit 1; }
-  done
+  for id in "$@"; do check_id "$id"; done
   if [ ! -e "$P/.git" ]; then   # the usual GOAL.md set-up, on branch main, with the team planning criteria
     [ -f "$P/GOAL.md" ] || { echo "Put a GOAL.md in $P first."; exit 1; }
     INIT_BRANCH=main TEAM_PLAN=1 AGENT_LOOP_INIT_ONLY=1 agent-loop "$P" > /dev/null
@@ -51,11 +60,7 @@ EOF
   mkdir -p "$TEAM/claims" "$TEAM/loops" "$TEAM/agents"; : > "$TEAM/events.jsonl"; touch .agent/team-main
   first=1
   for id in "$@"; do
-    W=$(wt "$id")
-    git worktree add -q -b "agent/$id" "$W" main
-    mkdir -p "$W/.agent"
-    { echo "# team mode (agent-team init $(date +%F)): read by agent-loop"; echo "TEAM_DIR=$P"; echo "AGENT_ID=$id"
-      grep -v '^[[:space:]]*#' "$HOME/.agent-kit/agents/$id.env" | grep .; } > "$W/.agent/team.env" || true
+    new_worktree "$id" "agent-team init"
     # The human's tasks are the ones present now (000, and later the goal check 999): register them in every checkout
     # before any agent starts, so tasks that arrive through merges stay the agents'.
     (cd "$W" && task-audit init > /dev/null)
@@ -65,6 +70,28 @@ EOF
   done
   echo "Team project ready: main checkout $P, agents: $(echo "$@")."
   echo "  Start: agent-team start $name    Watch one agent: agent-watch $name.<id>    Overview: agent-team status $name"
+  ;;
+add)
+  id=${3:-}; [ -n "$id" ] || { echo "usage: agent-team add <name> <id>"; exit 1; }
+  [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project (agent-team init $name)"; exit 1; }
+  check_id "$id"; [ ! -e "$TEAM/agents/$id" ] || { echo "agent $id is already in $name"; exit 1; }
+  others=$(ids); [ -n "$others" ] || { echo "$name has no agents to learn task ownership from"; exit 1; }
+  new_worktree "$id" "agent-team add"
+  # Who owns each task, from the other agents' registries (a task any of them holds as the human's stays the human's).
+  # A plain `task-audit init` here would register every task in main as the human's, the agents' own tasks too.
+  python3 - "$W/.agent/tasks.json" $(for o in $others; do echo "$(wt "$o")/.agent/tasks.json"; done) <<'PY'
+import json, os, sys
+reg = {}
+for p in sys.argv[2:]:
+    if os.path.exists(p):
+        for tid, e in json.load(open(p)).items():
+            if tid not in reg or e["owner"] == "human":
+                reg[tid] = e
+json.dump(reg, open(sys.argv[1], "w"), indent=1, sort_keys=True)
+PY
+  echo "$W" > "$TEAM/agents/$id"
+  echo "Agent $id added to $name ($W, $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$W/.agent/tasks.json") tasks registered)."
+  echo "  Start: agent-team start $name (starts the stopped agents; running ones keep going)"
   ;;
 start)
   [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project (agent-team init $name)"; exit 1; }

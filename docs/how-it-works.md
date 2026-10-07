@@ -305,12 +305,12 @@ stays quiet.
 
 Per agent, in `~/.agent-kit/agents/<id>.env` (copied into every new team project by `agent-team init`):
 
-| Setting | What it does | Agent a (3090 Ti) | Agent b (5060 Ti) |
-|---|---|---|---|
-| `LLM_URL` | Its model server | port 8080 (vLLM) | port 8082 (llama.cpp) |
-| `TEAM_SPEED` | Relative speed for task picking | 4 | 1 |
-| `TEAM_MAX_TOUCHES` | Build size limit (files on a task's `Touches:` line) | none | 8 |
-| `WRAPUP_SOFT_TOKENS` / `WRAPUP_HARD_TOKENS` | Hand-over starts / session ends at this context size | 120k / 142k | 75k / 100k |
+| Setting | What it does | Agent a (3090 Ti) | Agent b (5060 Ti) | Agent c (3090) |
+|---|---|---|---|---|
+| `LLM_URL` | Its model server | port 8080 (vLLM) | port 8082 (llama.cpp) | port 8081 (vLLM) |
+| `TEAM_SPEED` | Relative speed for task picking | 4 | 1 | 4 |
+| `TEAM_MAX_TOUCHES` | Build size limit (files on a task's `Touches:` line) | none | 8 | none |
+| `WRAPUP_SOFT_TOKENS` / `WRAPUP_HARD_TOKENS` | Hand-over starts / session ends at this context size | 120k / 142k | 75k / 100k | 120k / 142k |
 
 Driver-wide (environment, defaults shown): `ITER_TIMEOUT` 2700 s per session, `TEAM_STALE_MIN` 120 (minutes before a
 dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 turns prep off),

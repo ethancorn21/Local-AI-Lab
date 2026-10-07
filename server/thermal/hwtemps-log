@@ -38,6 +38,8 @@ STOPS = {   # GPU UUID -> (what runs on it, command that stops it, command that 
                                                  "sudo docker start hyperqwen-single-1"),
     "GPU-ccdfa1bc-3062-ad1c-36ad-77e6bcdb7f3a": ("llama-5060ti (agent b)", ["systemctl", "stop", "llama-5060ti"],
                                                  "sudo systemctl start llama-5060ti"),
+    "GPU-0f9757bb-934e-8f17-6839-ccc72e99f1cb": ("the vLLM container (agent c)", ["docker", "stop", "hyperqwen-c-single-1"],
+                                                 "sudo docker start hyperqwen-c-single-1"),
 }
 QUERY = ("index,uuid,name,temperature.gpu,power.draw,fan.speed,utilization.gpu,"
          "clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown")
