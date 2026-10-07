@@ -1,8 +1,7 @@
 # AI Lab
 
-The hub for the local AI lab: the GPU server, the model it serves, the isolated VM where the coding agents work, how
-they are connected and secured, and what is planned. Kept up to date after every change (see the changelog at the end).
-Internal addresses, VLAN numbers, account names and key material are left out on purpose.
+The GPU server, the model it serves, the isolated VM the coding agents work in, how the two are connected and secured,
+and what is planned. Internal addresses, VLAN numbers, account names and keys are left out on purpose.
 
 Related notes:
 - [How the harness works](how-it-works.md): the guide to the agent system, start here.
@@ -27,13 +26,13 @@ Related notes:
 | Item | Now | Notes |
 |---|---|---|
 | CPU | Intel i9-14900KF | Unstable under Windows (suspected Raptor Lake degradation). P-cores capped, power limited to 125 W. No hardware errors under Linux so far. |
-| GPU 0 | RTX 3090 24 GB (used), slot 1 (PCIe 4.0 x16) | Installed 2026-10-06. A third agent, as fast as the 3090 Ti. Capped at 300 W (stock 350, max 400). Its memory chips sit on the back under the backplate, so it needs air there. |
-| GPU 1 | RTX 5060 Ti 16 GB, a PCIe 3.0 x1 slot | Second coding agent since 2026-10-02 (dense 27B on llama.cpp). Stock 180 W. x1 only slows model loading: the model sits fully in its memory. |
-| GPU 2 | RTX 3090 Ti 24 GB, slot 3 (PCIe 4.0 x4) | Production model (vLLM). Capped at 300 W since 2026-10-06 (350 W before). |
+| GPU 0 | RTX 3090 24 GB (used), slot 1 (PCIe 4.0 x16) | Agent c (vLLM), since 2026-10-06. 300 W cap (stock 350). Its memory chips sit under the backplate, so it needs air on the back. |
+| GPU 1 | RTX 5060 Ti 16 GB, a PCIe 3.0 x1 slot | Agent b (llama.cpp), since 2026-10-02. Stock 180 W. The x1 link only slows loading: the model stays in the card's memory. |
+| GPU 2 | RTX 3090 Ti 24 GB, slot 3 (PCIe 4.0 x4) | Agent a (vLLM). 300 W cap since 2026-10-06 (350 W before). |
 | RAM | 32 GB DDR5 | Upgrade as a 2-stick kit, not 4 sticks (two DIMMs per channel slows DDR5). |
-| Board | MSI PRO Z790-P WIFI | Slot 1 PCIe 5.0 x16 (CPU), slot 3 PCIe 4.0 x4 (chipset), the rest PCIe 3.0 x1. GPU numbers follow the PCI bus, so they change when cards move; every service picks its card by UUID. |
-| PSU | EVGA SuperNOVA 1300 G2 (single rail, 6 PCIe power sockets) | Enough for all three cards with the power caps. |
-| Network | Onboard NIC, DHCP from the core switch | Fixed by a DHCP reservation on client ID `01` + MAC. Netplan sends the MAC (`dhcp-identifier: mac`): the default ID follows the NIC's PCI path, so moving GPUs changed it and the box got a new address. |
+| Board | MSI PRO Z790-P WIFI | Slot 1 PCIe 5.0 x16 (CPU), slot 3 PCIe 4.0 x4 (chipset), the rest PCIe 3.0 x1. GPU numbers follow the PCI bus and change when cards move, so every service picks its card by UUID. |
+| PSU | EVGA SuperNOVA 1300 G2 (single rail, 6 PCIe power sockets) | Enough for all three cards with the caps. |
+| Network | Onboard NIC, DHCP from the core switch | A reservation keyed on the MAC. Netplan sends the MAC as the DHCP client ID (`dhcp-identifier: mac`): the default ID follows the NIC's PCI path, which changed when the GPUs moved. |
 | Storage | 1.8 TB NVMe, LVM | Root 200 GB, a separate volume for models, ~50 GB free for snapshots. |
 | Chassis | Open frame (since 2026-10-02), CPU water cooler | Risers for three cards planned. |
 
@@ -44,8 +43,8 @@ Related notes:
 - **Temperature guard.** Every 15 s it logs CPU and per-GPU temperature, power, fan and throttle flags. It alerts the
   phone when a card sits at 83 C for 2 minutes, throttles, or runs its fan at 95% for 5 minutes. A card at 88 C for a
   minute gets its model server stopped; the CPU at 95 C stops all of them.
-- **Observed** at the old 350 W cap: the 3090 Ti ran 64-75 C at 77-85% fan, never throttling (it slows at 94 C). In
-  the open frame it sits above the 5060 Ti's exhaust, which costs a few degrees.
+- **Observed** with all three cards busy (2026-10-06, 24 GB cards at 300 W): 3090 67 C at 44% fan, 3090 Ti 64 C at
+  77%, 5060 Ti 68 C at 61%, no throttling.
 
 ## Operating system
 
@@ -55,13 +54,15 @@ Related notes:
 
 ## Model serving
 
-**Production:** Qwen3.8-27B, 4-bit (W4A16 AutoRound), on vLLM with the HyperQwen patches, in Docker on the 3090 Ti.
-The model is a hybrid: most layers use linear attention with a fixed-size state and only 16 use full attention, so
-context memory grows slowly.
+**Production:** Qwen3.8-27B, 4-bit (W4A16 AutoRound), on vLLM with the HyperQwen patches, in Docker: one copy on the
+3090 Ti (port 8080) and one on the 3090 (8081). The second copy is its own compose project (`hyperqwen-c`,
+[override](../server/vllm-hyperqwen/docker-compose.c.yml)) with its own env file and compile cache. The model is a
+hybrid: most layers use linear attention with a fixed-size state and only 16 use full attention, so context memory
+grows slowly.
 
 | Setting | Value |
 |---|---|
-| Speed | ~106 tok/s with short prompts, ~99 tok/s at ~52k tokens of context |
+| Speed | ~106 tok/s with short prompts, ~99 at ~52k tokens of context (benchmark, 3090 Ti at 350 W). Agent sessions at 300 W: median 94 on the 3090 Ti, ~80 on the 3090 (first half hour, different tasks) |
 | Speculative decoding | MTP, 3 draft tokens, 69% accepted, ~3.1 tokens per step |
 | Context | 150k per request, 200k tokens of KV cache in total |
 | Prefix caching | 94% of prompt tokens served from cache in agent sessions |
@@ -128,9 +129,9 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 - **The agents' permissions on their VM:** `sudo apt-get` (root-equivalent there, a deliberate choice) and web
   research through a local search engine whose results are labelled untrusted. Locking down the VM's internet access
   was considered and decided against: the network isolation is the boundary.
-- **Requests to the human travel encrypted.** The bot token and keys live on the AI box, never on the VM the agents
-  control; the VM can only call a relay ([details](agent-harness.md#requests-to-the-human)). Because the agent now
-  chooses the words the human reads, requests are treated as untrusted and shown as plain text.
+- **Requests to the human.** The bot token and keys live on the AI box, never on the VM the agents control; the VM
+  can only call a relay ([details](agent-harness.md#requests-to-the-human)). Messages are plain text, encrypted only
+  for projects marked confidential. The agent writes them, so they are treated as untrusted.
 - **Supply chain.** The agent harness once replaced itself at runtime with a renamed package, so self-updates are off
   and versions pinned. Python packages are pinned with hashes; model weights come only at pinned revisions with
   checksums.
@@ -140,6 +141,8 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 - Ubuntu 24.04, 6 vCPU, 15 GB RAM, 48 GB disk.
 - Services: the model tunnels, SearXNG (localhost only) for web search, a text extractor for fetched pages.
 - Tools: the Pi coding agent with the lab's extensions, the driver and its helpers, the operator tools, Playwright.
+- After a reboot the tunnels, the relay client and SearXNG come back by themselves; the agent loops
+  (`agent-team start`) and the frontpage preview (a loop that serves `main` after every merge) are started by hand.
 
 ## Projects
 
@@ -152,7 +155,8 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 ## Plans
 
 - **The 5060 Ti** goes to the SIEM work and the type-1 log triage model when that starts.
-- **Less idle time in team mode:** a streamed plan; later a bigger model on both 24 GB cards for planning.
+- **Less idle time in team mode:** a streamed plan; later a bigger model on both 24 GB cards for planning (the 3090
+  Ti's x4 chipset link would slow a model split across the two).
 - **Open-frame rig** with risers for three cards; re-check temperatures after the move.
 
 ## Changelog
@@ -173,4 +177,4 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
-| 10-06 | Request deadline; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; 3090 Ti capped at 300 W; the second 3090 installed in slot 1 at 300 W (3090 Ti to slot 3, 5060 Ti to an x1 slot), DHCP client ID = MAC; agent c's vLLM on the 3090 (8081) and `agent-team add`, three agents on frontpage; OS updates on both machines; takeover (an idle fast agent takes the slow card's critical task, with its work); requests to the human in plain text, answered by replying in Telegram, except for projects marked confidential. |
+| 10-06 | Request deadline and required recommendation; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; takeover; plain-text requests answered in Telegram; second RTX 3090 in, agent c on it (`agent-team add`); both 24 GB cards at 300 W; OS updates on both machines. |

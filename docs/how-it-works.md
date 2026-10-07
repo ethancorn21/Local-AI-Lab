@@ -29,7 +29,7 @@ hardware and model serving are in [ai-lab.md](ai-lab.md). Terms in **bold** are 
 | **Architect** | A cloud model (Claude) | Turns the human's ideas into goals; designs, tests and fixes the harness from the agents' own session logs | Re-plan or micromanage the agents' tasks |
 | **Driver** | `agent-loop` and helpers: bash, no model | Picks tasks, starts sessions, enforces limits, verifies done claims, merges finished work, logs every session | Make a judgment call |
 | **Agents** | Qwen3.8-27B (open weights) in the Pi coding agent, one per GPU | Plan, split tasks, write code and tests, run them, take notes, commit | Change what "done" means |
-| **Model servers** | vLLM on an RTX 3090 Ti, llama.cpp on an RTX 5060 Ti | Serve the model to the agents over SSH tunnels | Anything else: they only answer requests |
+| **Model servers** | vLLM on the RTX 3090 Ti and the RTX 3090, llama.cpp on the RTX 5060 Ti | Serve the model to the agents over SSH tunnels | Anything else: they only answer requests |
 
 ```mermaid
 flowchart LR
@@ -39,13 +39,17 @@ flowchart LR
         D["Driver (one loop per agent):<br/>picks, verifies, merges"]
         A["Agent a (fast card):<br/>fresh session per step"]
         B["Agent b (slow card):<br/>fresh session per step"]
+        AC["Agent c (fast card):<br/>fresh session per step"]
     end
     D -->|starts| A
     D -->|starts| B
+    D -->|starts| AC
     A -->|works on branch agent/a| M
     B -->|works on branch agent/b| M
+    AC -->|works on branch agent/c| M
     A <-->|model API| S["Model servers on the AI box"]
     B <--> S
+    AC <--> S
     D -->|exceptions only| C
 ```
 
@@ -95,7 +99,7 @@ A session is one agent, started from nothing, doing one step:
    produces no output for 15 minutes is stopped; a session never runs longer than 45 minutes.
 4. **Hand over.** The agent rewrites the `## Hand-over` section of its task file (where things stand, test state,
    current hypothesis, the exact next step), logs decisions and dead ends in `DECISIONS.md`, commits and stops.
-   If its context fills up first (120k tokens on the 3090 Ti, 75k on the 5060 Ti), the harness tells it to stop and
+   If its context fills up first (120k tokens on the 24 GB cards, 75k on the 5060 Ti), the harness tells it to stop and
    write its notes; from then on only notes and git work, and a few turns later the session ends regardless.
 5. **Close.** The driver saves any code left uncommitted, verifies a done claim if there is one, merges (team mode),
    archives finished journal entries, and writes one line to the ledger: task, duration, result, and the exact harness
@@ -178,13 +182,14 @@ waiting on it, itself included.
 241 (nothing waits on it)                            rank of 241 = 1 (a leaf)
 ```
 
-- An agent finishes its own claims first, the highest rank first, whatever its speed. (2026-10-06: agent b held 253,
-  which five tasks waited on, and 243b, which nothing did; its lowest-rank-first order picked 243b, and 253 lay parked
-  for 39 minutes while agent a waited.)
+- An agent finishes its own claims first, the highest rank first, whatever its speed. (Picking its own claims lowest
+  first once left a task five others waited on parked for 39 minutes.)
 - Fast agents take the highest rank first, so long chains start early.
 - A slower agent takes the lowest rank first while a faster agent is running: leaves, which nothing waits on, so a fast
-  agent rarely sits idle waiting for the slow card (when it does: [takeover](#when-the-slow-card-holds-the-critical-path-takeover)). Each agent's relative speed is a setting (`TEAM_SPEED`: 4 for a 3090
-  class card, 1 for the 5060 Ti). Alone, or with equal speeds, an agent takes the longest chain itself.
+  agent rarely sits idle waiting for the slow card (when it does:
+  [takeover](#when-the-slow-card-holds-the-critical-path-takeover)). Each agent's relative speed is a setting
+  (`TEAM_SPEED`: 4 for the 3090s, 1 for the 5060 Ti). Alone, or with equal speeds, an agent takes the longest chain
+  itself.
 - On a replay of the first team project, "lowest number first" (the old rule) left the fast agent idle 5 of 15 task
   lengths; critical-path-first, 3 of 13.
 
@@ -199,7 +204,7 @@ waiting on it, itself included.
 - **Handing a task to a bigger agent.** When the small agent has had 3 sessions in a row on a task without ticking a box
   while a bigger agent waits for work, the driver takes the task away from it (its half-done work is kept on a backup
   branch) and the bigger agent gets it. Only that task's files leave the small agent's branch if it holds other tasks
-  too (on 2026-10-06 a full reset threw away its work on a parked task, which it then did again).
+  too (a full reset once threw away its work on a parked task).
 
 ### When an agent has nothing to build: prep
 
@@ -216,9 +221,8 @@ busy 92%. So an agent that has nothing to build does not wait; it **prepares** a
   ("written 2 steps before the task could start; built on: 230 (being built by agent a), 242 (not started, prep
   notes)"), so whoever uses them knows how much to trust them.
 - **Notes early.** Once a prep session has used 60% of its hand-over limit without a notes file, the harness tells it
-  to write what it has and commit, then keep improving the notes. (The first live day lost a 27-minute prep: the
-  agent read for the whole session, then tried to write everything in one last step at the edge of its window and was
-  cut off. The prompt had asked it to write early; prose did not hold, code does.)
+  to write what it has and commit, then keep improving the notes. (The prompt alone did not hold: a 27-minute prep was
+  lost when the agent read all session and was cut off writing at the edge of its window.)
 - **Only notes survive.** A prep session may change nothing else: afterwards the driver resets its branch to where it
   started plus one commit with the notes, which go into `main` at once. It cannot ask the human anything (questions go
   into the notes), and it does not count as a session of the task.
@@ -239,11 +243,9 @@ nothing waits on.
 ### When the slow card holds the critical path: takeover
 
 The rules above keep the slow agent off the critical path when they can, but not always: when the critical-path task
-is the only thing free, the slow agent takes it. On 2026-10-06 agent a merged 252 and went back to its own task 244;
-14 seconds later agent b took 253, which five tasks waited on. When a finished 244 it had nothing left to build and
-waited 47 minutes. Prep could not help: prep moves notes, never a claim (a had even written 253's notes the night
-before; b built from them). The 3-session hand-over did not help either: it is for an agent that is stuck, and b was
-only slow.
+is the only thing free, the slow agent takes it. On 2026-10-06 agent b took 253, which five tasks waited on, and agent
+a, done with its own task, waited 47 minutes. Prep could not help (it moves notes, never a claim), nor could the
+3-session hand-over (b was slow, not stuck).
 
 So a fast agent with nothing to build **takes the task over**:
 
@@ -263,13 +265,11 @@ So a fast agent with nothing to build **takes the task over**:
 - **Answers follow the task.** A request to the human is filed in the asking agent's own checkout, and only that
   agent's loop reads the answer. So when a request about a task is answered after the task moved (or just before), the
   old holder forwards the request and the answer to the new owner's inbox; its running session gets them after its
-  current step. (The first live takeover, 2026-10-06: the human answered agent b's request about 253 at 18:41; the
-  answer lifted the "waiting for the human" block, a took 253 over at 18:42, and the answer stayed in b's checkout until
-  it was relayed by hand.)
+  current step.
 
-Under these rules that afternoon would have gone: a asks for 253 at 14:37; b's session, on 253 at the time, is told to
-hand over; a few minutes later a builds 253 from b's checked plan instead of waiting until 15:24. (Not measured yet:
-the first live takeover will show how long the hand-over takes on the slow card.)
+The first live takeover (2026-10-06 18:42): a asked for 253 while b was between sessions; b gave it 28 seconds later,
+and a's first session on it started a minute after the ask. A takeover in the middle of a slow-card session has not
+happened live yet.
 
 The decisions behind this (which claim to ask for, which files belong to a task) are in a small Python helper,
 `team-takeover`; the bash driver does the moving.
@@ -293,7 +293,7 @@ The driver handles the routine failures itself and reports the rest:
 | A task runs 8 sessions without finishing | Flagged STALLED (and every 4 sessions after) |
 | Tasks wait on each other in a cycle | Logged as a deadlock; one is taken anyway |
 | An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
-| An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets a Telegram message on their phone, answered by replying to it (encrypted, through the telecloak app, only for projects marked confidential) |
+| An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets a Telegram message and answers by replying (confidential projects: encrypted, in the telecloak app) |
 | Nobody answers for 2 hours and there is nothing else to build | The agent goes ahead with its recommendation; the human is told and can still override. Things only a person can do (hardware, credentials, money, accounts) keep waiting |
 | A loop starts on a GPU another project is using | The other project's loop finishes its current session and stops; the newest start wins |
 
@@ -303,7 +303,7 @@ stays quiet.
 
 ## Settings
 
-Per agent, in `~/.agent-kit/agents/<id>.env` (copied into every new team project by `agent-team init`):
+Per agent, in `~/.agent-kit/agents/<id>.env` (copied into the agent's worktree by `agent-team init` or `agent-team add`):
 
 | Setting | What it does | Agent a (3090 Ti) | Agent b (5060 Ti) | Agent c (3090) |
 |---|---|---|---|---|

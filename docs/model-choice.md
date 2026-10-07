@@ -1,10 +1,10 @@
 # Model choice, October 2026: Qwen3.8-27B vs Qwen3.8-Flash-Next vs Swift 1.5
 
-Status (2026-10-05): tests finished; decided: keep the 27B. Deployed: the wrap-up ending on both servers and a 32k thinking cap (below). In short: on a fair footing
-the production 27B is at least as good as both alternatives, and the biggest finding is not about the model at all.
-Production vLLM ends a capped thinking block with a bare `</think>`, after which the 27B keeps reasoning in its
-answer until it runs out of tokens. Ending it with a short wrap-up sentence instead took the same model from 4 to 10
-of 14 held-out tasks.
+Status (2026-10-06): decided: keep the 27B. Deployed: the wrap-up ending on both servers; the thinking cap went to 32k
+on 10-05 and back to 16k on 10-06 (below). In short: on a fair footing the production 27B is at least as good as both
+alternatives, and the biggest finding is not about the model at all. Production vLLM ends a capped thinking block with a
+bare `</think>`, after which the 27B keeps reasoning in its answer until it runs out of tokens. Ending it with a short
+wrap-up sentence instead took the same model from 4 to 10 of 14 held-out tasks.
 
 ## The question
 
@@ -132,8 +132,9 @@ cap, 12 of 14 the 16k cap, 12 of 14 the 32k cap. Across the three caps: 8k 6, 16
 ## Reading
 
 - **Sample size.** 14 tasks, one attempt each: one task is 7 points, and P5, passed by every other arm, failed
-  for the 27B with the wrap-up after it had passed with the bare ending. Fair 27B vs Flash-Next: 5 tasks only the 27B passed, 2 only Flash-Next
-  (a sign test gives p about 0.45). That is no evidence Flash-Next is better, not proof that the 27B is.
+  for the 27B with the wrap-up after it had passed with the bare ending. Fair 27B vs Flash-Next: 5 tasks only the 27B
+  passed, 2 only Flash-Next (a sign test gives p about 0.45): no evidence that Flash-Next is better, and no proof
+  that the 27B is.
 - **Throughput.** Fair 27B and Flash-Next used the same tokens (237k vs 233k) at the same decode speed, so the
   same time per task. Flash-Next's real speed advantage is prefill: 2.4x faster cold, and 0.14 s against 1.5 s with
   a cached prompt. That matters for long agent prompts, but it comes with 21 GB of locked RAM, a 2-bit quant and a
@@ -145,9 +146,9 @@ cap, 12 of 14 the 16k cap, 12 of 14 the 32k cap. Across the three caps: 8k 6, 16
 
 ## Decision
 
-Keep the 27B, with the wrap-up ending and a 32k thinking cap. Flash-Next and Swift are set aside, and their files
-deleted, until the engine matures (Strata squeezing more out of the model) or the next Qwen generation; Flash-Next
-would be worth another look if prefill latency becomes the bottleneck or the box gets more RAM.
+Keep the 27B, with the wrap-up ending and a 16k thinking cap (32k for a day bought nothing). Flash-Next and Swift are
+set aside, and their files deleted, until the engine matures (Strata squeezing more out of the model) or the next Qwen
+generation; Flash-Next would be worth another look if prefill latency becomes the bottleneck or the box gets more RAM.
 
 ## Swift on HyperQwen: the checkpoint repack
 

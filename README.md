@@ -4,10 +4,10 @@ A home lab that runs an open-weight coding model on consumer GPUs and lets auton
 unattended, for days. This repository is the technical side: the harness code, configs, benchmark data and
 experiments.
 
-**Current setup:** Qwen3.8-27B (4-bit), one copy per GPU, one agent per copy: an RTX 3090 Ti on vLLM (~100 tok/s,
-150k context) and an RTX 5060 Ti on llama.cpp (~28 tok/s, 114k). A second 24 GB card, an RTX 3090, is being added. The
-agents (the Pi coding agent with this repo's extensions and driver) work in an isolated VM and build the same project
-together, each on its own git branch.
+**Current setup:** Qwen3.8-27B (4-bit), one copy per GPU, one agent per copy: an RTX 3090 Ti and an RTX 3090 on vLLM
+(~80-100 tok/s, 150k context) and an RTX 5060 Ti on llama.cpp (~28 tok/s, 114k). The agents (the Pi coding agent
+with this repo's extensions and driver) work in an isolated VM and build the same project together, each on its own
+git branch.
 
 **Start here: [How the harness works](docs/how-it-works.md).**
 
@@ -56,7 +56,8 @@ The pieces assume the setup in [docs/ai-lab.md](docs/ai-lab.md): model servers r
 2. **One agent:** make a folder in `~/projects/` with a `GOAL.md` (what you want, in your own words) and run
    `agent-start <name>`. Edit `GOAL.md` any time; the next session re-plans.
 3. **A team:** one settings file per agent in `~/.agent-kit/agents/` (from `harness/agents/*.env.example`), then
-   `agent-team init <name>` and `agent-team start <name>`.
+   `agent-team init <name>` and `agent-team start <name>`; `agent-team add <name> <id>` brings in another agent
+   later.
 4. Watch and steer with `agent-watch <name>`; stop with `agent-stop <name>` or `agent-team stop <name>`.
 
 Configs ending in `.example` have placeholders (`<...>`, `CHANGE-ME`) in place of addresses, account names and secrets.

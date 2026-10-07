@@ -29,42 +29,31 @@ check. M3 scored 279/300. The reading at the time was "xhigh failed twice, mediu
 
 ## Audit of round 1 (2026-09-30)
 
-A second session checked the work. Findings, most important first:
+A second session checked the work. The main finding: **the grader marked the better answer as a failure.** Task 004's
+spec contradicts itself. Rule (c) says to flush a quiet stream 60 s after its newest event, and the spec also says the
+output must be exactly what the reference gives, while events may arrive up to 10 s late. Case: events at ts 0, 2, 5 are
+flushed at 65.5; then an event with ts 58 arrives at 66 (8 s late, allowed). The reference puts it in the same window as
+0, 2, 5; a windower that already flushed starts a new window. Run on every arm:
 
-1. **The grader marked the better answer as a failure.** Task 004's spec contradicts itself. Rule (c) says to flush
-   a quiet stream 60 s after its newest event, and the spec also says the output must be exactly what the reference
-   gives, while events may arrive up to 10 s late. Case: events at ts 0, 2, 5 are flushed at 65.5; then an event with
-   ts 58 arrives at 66 (8 s late, allowed). The reference puts it in the same window as 0, 2, 5; a windower that
-   already flushed starts a new window. Run on every arm:
+| Arm | Late-event case |
+|---|---|
+| X2, X3 (xhigh) | matches the reference: they delay the flush to `max(high-water, first + 10 s) + 60 s`, and X3's docstring explains why |
+| X1, M1, M2, M3, and the live type1-triage windower | splits the window, so it does not match the reference |
 
-   | Arm | Late-event case |
-   |---|---|
-   | X2, X3 (xhigh) | matches the reference: they delay the flush to `max(high-water, first + 10 s) + 60 s`, and X3's docstring explains why |
-   | X1, M1, M2, M3, and the live type1-triage windower | splits the window, so it does not match the reference |
+The grader's final tick at +61 s came before X2/X3's delayed flush, so their last window never came out. Re-graded with
+the final tick far enough out for either reading:
 
-   The grader's final tick at +61 s came before X2/X3's delayed flush, so their last window never came out.
-   Re-graded with the final tick far enough out for either reading:
+| Arm | Effort | Minutes | Output tokens | Windows equal to the reference (late tick) |
+|---|---|---|---|---|
+| X1 | xhigh | 8.1 | 47k | 300/300 |
+| M1 | medium | 8.2 | 44k | 300/300 |
+| X2 | xhigh | 90.1 (a hung test, below) | 83k | 300/300 |
+| M2 | medium | 7.0 | 38k | 300/300 |
+| X3 | xhigh | 14.7 | 85k | 300/300 |
+| M3 | medium | 4.9 | 27k | **279/300, a real windowing bug** |
 
-   | Arm | Effort | Minutes | Output tokens | Windows equal to the reference (late tick) |
-   |---|---|---|---|---|
-   | X1 | xhigh | 8.1 | 47k | 300/300 |
-   | M1 | medium | 8.2 | 44k | 300/300 |
-   | X2 | xhigh | 90.1 (a hung test, see 2) | 83k | 300/300 |
-   | M2 | medium | 7.0 | 38k | 300/300 |
-   | X3 | xhigh | 14.7 | 85k | 300/300 |
-   | M3 | medium | 4.9 | 27k | **279/300, a real windowing bug** |
-
-2. **X2's 90 minutes were a harness gap, not effort.** Its own test looped forever, and Pi's bash tool had no default
-   timeout, so three sessions sat idle until the 45-minute session limit. Since fixed in three layers: a default bash
-   timeout (600 s) extension, a stall watchdog in the driver (a session whose output stops growing for 15 min is
-   killed with all its children, and the next session is told what hung), and no flaky-test rerun when the driver's
-   own test run timed out.
-3. **Timing was clean.** vLLM's own logs show at most one running request during the whole A/B, so no other work
-   competed for the GPU.
-4. Smaller: the harder grader being written next (grade2) had the same end-of-stream tick in every category; its
-   hang guard subclassed `Exception`, so graded code with `except Exception` would swallow it. The round-2
-   type-1 relabelling step crashed on a numpy bool in `json.dumps` (fixed and rerun). In the type-1 results, the
-   0.1% false-positive threshold picked on validation gave 1.06% on test (10x), which the write-up now says.
+Two side findings: X2's 90 minutes were a hung test of its own with no command timeout (since fixed: a 600 s command
+limit and a stall watchdog), and vLLM's logs show one request at a time throughout, so the timings are clean.
 
 **Corrected round-1 reading:** on correct windows, 5 of 6 arms are equal and one medium arm has a real bug; on the
 spec's hidden contradiction, 2 of 3 xhigh arms handled the case the spec's own correctness rule demands and no
@@ -138,48 +127,14 @@ everywhere except `THINKING`; the driver and extension hashes are recorded per r
 
 ## Building round 2: problems caught before any GPU time was spent
 
-Every check was tested against implementations with a known answer before use. That caught:
-
-1. **The flaw leaked into the core score** (see "Keeping it fair"): found by grading wider-window variants of the
-   reference; fixed by neutralizing window-dependent detections.
-2. **A probe check could not tell two readings apart:** its tie data made "first seen" order identical to "descending"
-   order. Fixed the input order.
-3. **A probe check expected the wrong value** (an address masked to the wrong prefix). Caught because a known-correct
-   implementation failed it.
-4. **An unplanned second contradiction in a probe.** Its seed test asserted the parser's exact output, while the task
-   asked to add a field *and* said the existing tests must keep passing. Caught when the mutation-score tool refused
-   to run on a red baseline. Fixed the seed test to check fields individually.
-5. **A probe check depended on where the agent put its code**; it now credits the behaviour wherever it lives and
-   records the location separately.
-6. **The plumbing test launched the real loop.** The runner wrote its launcher to whatever path the test override
-   pointed at, overwriting the stub. The stray loop was waiting for the (stopped) model server and was killed before it
-   ran a session. Fixed; the stub test then passed end to end (set up, launch, request filed, auto-answered, graded).
-7. **A wrong answer on a hiccup:** the responder sent the generic reply when the classifier call failed. It now leaves
-   the request open and retries.
-8. **A leak into a public file:** the classifier self-test cases described the planted flaws in plain words and were
-   committed to the public repo. Moved into `hidden/` and the commit amended before any push.
-9. **Judge isolation:** `--bare` cannot use the subscription (it needs an API key); isolation is done with a custom
-   system prompt, `--setting-sources project` and no tools instead.
-10. **Calibration, first run: 3 misses of 8.** Two were the quote checker (the judge prefixed quotes with the file
-    name; quote and location are now separate fields). One was a bad calibration case: its "silent" agent actually
-    stated a year rule, and the judge rightly counted that as noticing the flaw. After the fixes: 9/9.
-
-## GPU hand-over (2026-09-30 night)
-
-The GPU was running type-1 training (round 2 of the log-triage model bake-off, see `type1.md`). The human ruled the
-A/B the higher priority: the RTX 5060 Ti for the type-1 model and the SIEM are not set up yet, while effort decides
-how every project runs. The session running type-1 work was closed and a new one put on hold.
-
-- The type-1 queue was stopped *behind* its current job: the job that saves the chosen model's weights finishes, then
-  the queue ends, the training script restarts vLLM, and the A/B's sequencer starts. It was stopped by emptying the
-  queue file in place. The queue runner reads that file one line at a time from an open descriptor (its read offset
-  sat exactly at the end of the second line), so it reaches end-of-file after the current job; nothing was killed and
-  the job's thermal watchdog kept running. The remaining three type-1 jobs are saved in `queue5.full.tsv`; resume
-  after the A/B, with vLLM stopped, with `./run_queue.sh queue5.full.tsv` (finished jobs are skipped).
-- The auto-mode safety classifier first refused that change (and some AI box file deletions) because the request came
-  from another Claude session, not the human. It ran once the human authorized it directly.
-- All agent loops stay paused for the whole A/B, including type1-triage. The human pauses the local-only project's
-  loop.
+Every check was run against implementations with a known answer before use. That caught ten problems: the planted
+flaw leaking into the core score (fixed by neutralizing window-dependent detections, see "Keeping it fair"), two probe
+checks that could not tell readings apart or expected a wrong value, an unplanned second contradiction in a probe's
+seed test, a check that depended on where the agent put its code, a plumbing test that launched the real loop, an
+auto-responder that answered when its classifier call failed, the planted flaws described in a public file (moved to
+`hidden/`, amended before any push), and judge isolation (`--bare` needs an API key; a custom system prompt with no
+tools is used instead). Judge calibration missed 3 of 8 cases on its first run (two were the quote checker, one a bad
+case) and 9 of 9 after the fixes.
 
 ## Round 2 results (runs 2026-09-30, judged 2026-10-01)
 
@@ -457,16 +412,6 @@ MoE arm: `python3 run.py plan-moe`, then `AB_SCHEDULE=<kit>/schedule-moe.json py
 with `AB_SCHEDULE=schedule.json,schedule-moe.json AB_ARMS=moe,xhigh AB_TAG=-moe sudo -E python3 analyze.py --packets
 --mutate`; judging with `AB_JUDGE=judge-moe AB_ARMS=moe,xhigh AB_TAG=-moe AB_REUSE=judge` in front of each `judge.py`
 command (the arm's judging used about 1.2M input and 174k output tokens).
-
-Judging budget, estimated beforehand: about 2.3M tokens, almost all input (probe spec and code judgments ~0.5M,
-project spec and code ~0.4M, head-to-head probes ~0.4M and project ~0.5M, retest ~0.3M, calibration and overhead
-~0.2M). Actual use is in "Judge reliability" above, and saved with every judgment.
-
-## Same-day housekeeping
-
-The harness VM's throwaway test projects, the day-one bench folders, stray directories in the agent account's home,
-and an orphaned `tail -F` left running by an earlier monitoring session (2.8 days old) were removed. AI box deletions
-(a model artifact that never loaded, a superseded dataset, caches, two unused models) are waiting for the human.
 
 ## Appendix: planted flaws, answers and checks
 

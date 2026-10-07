@@ -41,7 +41,7 @@ One session = one fresh agent doing one step of one task:
 | Session without output | 15 min, then stopped with everything it started | Same |
 | One session | 45 min | Bounds the damage of any session |
 | Thinking per response | 16k tokens, ended with a wrap-up sentence | More bought nothing measurable, less cost correctness ([experiments](experiments.md#thinking-cap)) |
-| Context: hand-over starts / session ends | 120k / 142k on the 3090 Ti; 75k / 100k on the 5060 Ti | A hand-over needs up to ~20k tokens; the small card's window is 114k |
+| Context: hand-over starts / session ends | 120k / 142k on the 24 GB cards; 75k / 100k on the 5060 Ti | A hand-over needs up to ~20k tokens; the small card's window is 114k |
 
 At the hand-over limit the agent is told to write its notes; from then on only notes and git work, with thinking
 capped at 2k per turn, and the session ends a few turns later. Context compaction is always cancelled. Near the
@@ -129,13 +129,11 @@ Replies count only if they come from the human's own account, decrypt, are under
 Without a key, only a fixed "help, I need your attention" ping can leave. Rate limit: 20 messages an hour, 100 a day.
 
 **Plain projects.** A project not marked confidential sends readable text. A plain message from the human counts if it
-is a reply to one of the relay's own plain messages (it remembers which project and request each one was), or a new
-message while exactly one plain request is waiting; from the human's account, in the private chat, under a day old and
-not seen before. (The first plain answer, 2026-10-06, was typed into the chat rather than sent as a reply, and was
-refused with a notice the phone could not read: notices about plain messages are plain now.) It becomes the answer to
-that request, or a message to that project; never a command (start, stop, status stay encrypted-only), and never anything for a
-confidential project. The trade-off, accepted: someone holding the human's Telegram session can talk to plain
-projects' agents.
+replies to one of the relay's own plain messages (the relay remembers which project and request each one was), or if
+exactly one plain request is waiting; it must come from the human's account in the private chat, be under a day old
+and be new. It becomes the answer to that request or a message to that project: never a command (start, stop and status
+stay encrypted-only), and never anything for a confidential project. The trade-off, accepted: someone holding the
+human's Telegram session can talk to plain projects' agents.
 
 ## One project per GPU
 
@@ -150,8 +148,10 @@ is gone is ignored and removed. Why: the human wants every GPU pointed at one pr
 ## Team mode
 
 Several agents build one project at once, one per GPU: agent a on the 3090 Ti and agent c on the 3090 (vLLM, 150k
-window each), agent b on the 5060 Ti (llama.cpp, 114k window), the same model on all three. `main` holds only finished, verified work; each agent works in
-its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`), with its settings in `.agent/team.env`.
+window each), agent b on the 5060 Ti (llama.cpp, 114k window), the same model on all three. `main` holds only
+finished, verified work; each agent works in its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`),
+with its settings in `.agent/team.env`. `agent-team add` brings an agent into a running team: its task registry is
+merged from the others', so tasks the agents created do not become the human's.
 
 ### The rules (enforced by the driver)
 
@@ -169,8 +169,7 @@ its own worktree (`<project>.<id>`) on its own branch (`agent/<id>`), with its s
   claim at once if the task is parked, or tells the session working on it to hand over (`.agent/handover-now`) and
   gives it after. Only that task's work moves with it (`team-takeover paths`: its commits by subject and ledger); the
   new owner's first prompt says it was taken over. Requests to the human live in the asking agent's checkout, so an
-  answered request about a task another agent now holds is forwarded to that agent's inbox (the first live takeover,
-  2026-10-06 18:42, was unlocked by the human's answer and left that answer behind).
+  answered request about a task another agent now holds is forwarded to that agent's inbox.
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
   small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
   holds other claims (a full reset once cost it a parked task's work).
@@ -248,7 +247,7 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-06 | One project per GPU | Loops of other projects could share a card indefinitely |
 | 10-06 | Thinking cap back to 16k | 32k: same score for 1.8x the tokens; 8k: 6 of 14 instead of 11 |
 | 10-06 | Takeover: an idle fast agent takes the slow agent's critical task | a waited 47 min while b held 253 (five tasks behind it) and worked on 243b; the 3-session hand-over is for a stuck agent, not a slow one |
-| 10-06 | New driver logic in Python helpers, called from the bash | 1,700 lines of bash; bug 2 of 10-06 was glob order silently becoming policy. No rewrite: nobody reads it for its own sake |
+| 10-06 | New driver logic in Python helpers, called from the bash | 1,700 lines of bash, and a 10-06 bug was glob order silently becoming policy. No rewrite |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for
@@ -296,7 +295,7 @@ From hollowdeep, a browser game the agent built over ~40 hours (7,368 lines of c
 | Stop | `agent-stop <project>` (after the current session; `--now` immediately), or `agent-team stop <name>` |
 | Restart a team after a harness change | `agent-team restart <name>` (each agent finishes its session first) |
 | See how it is doing | `agent-report <project>`, `agent-team status <name>`, `sprint-progress <project>` |
-| Answer requests | The telecloak app, or `agent-talk` on the VM |
+| Answer requests | Reply to the Telegram message (the telecloak app for confidential projects), or `agent-talk` on the VM |
 | Veto a task the agent added | Set its first line to `Status: dropped` |
 | Where things are | Ledger `.agent/iterations.jsonl`, loop log `.agent/loop.log`, sessions `.agent/sessions/`, template `~/.agent-kit/template` |
 

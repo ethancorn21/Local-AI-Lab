@@ -129,17 +129,14 @@ What this says so far:
    examples per company; the second is indistinguishable from a normal login in one window (it needs context such
    as "this account never logs in at 3 am", which is type-2 or detection-rule territory).
 
-**Paused 2026-09-30** while the thinking-effort A/B v2 has the GPU. Round 2 was running at that point: the winner
-retrained with its weights saved, leave-one-attack-out for it (DNS exfiltration, scans), and Qwen3.5-2B + LoRA
-(`type1/bench/queue5.tsv`; `run_queue.sh` skips finished jobs, so rerunning the queue picks up where it stopped).
-Also waiting: a Linux host-attack test set (137 windows from splunk/attack_data auditd captures; the 27B without
-thinking confirmed only 9 of them and missed clear ones, so they need labels from the 27B with thinking or a
-person), and the 5060 Ti install (pin vLLM to the 3090 Ti first, temperature logging for every card).
-
-Not run yet (next GPU window, or on the 5060 Ti once installed): the winner again with its weights saved and with
-leave-one-attack-out (does the language model generalise to an unseen attack family better than TF-IDF's 0.00?),
-Qwen3.5-2B + LoRA, ModernBERT-large and Laya fine-tuned, Qwen3-Embedding + linear head, 4B/9B zero-shot. The vLLM
-server was down for four hours for this round; runs were ordered by how much they could change the decision.
+**Paused since 2026-09-30.** The GPU went to the thinking-effort A/B, then to the coding agents; this work resumes on
+the 5060 Ti when the SIEM work starts. Of round 2 only the first job ran: the winner retrained with its weights saved
+(the model timed on CPU below). Still queued on the AI box (`type1/bench/queue5.full.tsv`; `run_queue.sh` skips
+finished jobs): leave-one-attack-out for the winner (does it catch an unseen attack family, DNS exfiltration or scans,
+better than TF-IDF's 0.00?) and Qwen3.5-2B + LoRA. Not run at all: ModernBERT-large and Laya fine-tuned,
+Qwen3-Embedding + linear head, 4B/9B zero-shot. Also waiting: a Linux host-attack test set (137 windows from
+splunk/attack_data auditd captures; the 27B without thinking confirmed only 9 of them and missed clear ones, so they
+need labels from the 27B with thinking or a person).
 
 ## CPU speed (2026-10-02)
 
