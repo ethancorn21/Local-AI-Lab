@@ -7,7 +7,7 @@
 set -uo pipefail
 CPU_PL1_W=125   # sustained
 CPU_PL2_W=125   # burst
-declare -A GPU_PL_W=(["NVIDIA GeForce RTX 3090 Ti"]=260 ["NVIDIA GeForce RTX 3090"]=260)
+declare -A GPU_PL_W=(["NVIDIA GeForce RTX 3090 Ti"]=250 ["NVIDIA GeForce RTX 3090"]=250)
 R=/sys/class/powercap/intel-rapl:0
 fail=0
 echo $((CPU_PL1_W * 1000000)) > $R/constraint_0_power_limit_uw

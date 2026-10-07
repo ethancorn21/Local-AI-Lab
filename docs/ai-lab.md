@@ -26,9 +26,9 @@ Related notes:
 | Item | Now | Notes |
 |---|---|---|
 | CPU | Intel i9-14900KF | Unstable under Windows (suspected Raptor Lake degradation). P-cores capped, power limited to 125 W. No hardware errors under Linux so far. |
-| GPU 0 | RTX 3090 24 GB (used), slot 1 (PCIe 4.0 x16) | Agent c (vLLM), since 2026-10-06. 260 W cap (stock 350). Its memory chips sit under the backplate, so it needs air on the back. |
+| GPU 0 | RTX 3090 24 GB (used), slot 1 (PCIe 4.0 x16) | Agent c (vLLM), since 2026-10-06. 250 W cap (stock 350). Its memory chips sit under the backplate, so it needs air on the back. |
 | GPU 1 | RTX 5060 Ti 16 GB, a PCIe 3.0 x1 slot | Agent b (llama.cpp), since 2026-10-02. Stock 180 W. The x1 link only slows loading: the model stays in the card's memory. |
-| GPU 2 | RTX 3090 Ti 24 GB, slot 3 (PCIe 4.0 x4) | Agent a (vLLM). 260 W cap since 2026-10-07 (350, then 300 W before). |
+| GPU 2 | RTX 3090 Ti 24 GB, slot 3 (PCIe 4.0 x4) | Agent a (vLLM). 250 W cap since 2026-10-07 (350, then 300 before). |
 | RAM | 32 GB DDR5 | Upgrade as a 2-stick kit, not 4 sticks (two DIMMs per channel slows DDR5). |
 | Board | MSI PRO Z790-P WIFI | Slot 1 PCIe 5.0 x16 (CPU), slot 3 PCIe 4.0 x4 (chipset), the rest PCIe 3.0 x1. GPU numbers follow the PCI bus and change when cards move, so every service picks its card by UUID. |
 | PSU | EVGA SuperNOVA 1300 G2 (single rail, 6 PCIe power sockets) | Enough for all three cards with the caps. |
