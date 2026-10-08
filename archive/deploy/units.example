@@ -24,7 +24,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 
-# ---- AI box: /etc/systemd/system/lab-archive@.service (instances: sample, nightly)
+# ---- AI box: /etc/systemd/system/lab-archive@.service
+# instances: sample, nightly (lab-archive <instance>)
 [Unit]
 Description=Lab archive: %i
 
