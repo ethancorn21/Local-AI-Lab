@@ -173,7 +173,7 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 .ask .when { font-size: 11px; color: var(--attn-ink); }
 .ask textarea { background: var(--raise); border: 1px solid var(--attn); border-radius: 2px; padding: 7px 10px; min-height: 48px; resize: vertical; font-size: 13px; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: start; }
+.board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; align-items: start; }
 .col { background: var(--raise); padding: 12px 12px 8px; }
 .col-h { display: flex; align-items: baseline; gap: 10px; padding-bottom: 8px; }
 .col-h .count { font: 900 30px/1 var(--display); font-stretch: 75%; }
@@ -188,7 +188,13 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 .col.done li .name { color: var(--fg-2); }
 .col.build li { background: var(--tint, var(--bg)); border-left: 3px solid var(--ch, var(--line-2)); }
 .col.build li .name { font-weight: 600; }
-.col.open li .note { color: var(--muted); }
+.col.open li .note { color: var(--muted); flex-wrap: wrap; }
+.col.ready-col .count { color: var(--muted); }
+.col.ready-col.has .count { color: var(--attn); }
+.col.ready-col.has { box-shadow: inset 0 3px 0 var(--attn); }
+.dep { display: inline-flex; align-items: center; gap: 4px; font: 600 10.5px var(--mono); color: var(--fg-2); padding: 1px 5px; border-radius: 2px;
+  background: var(--tint, var(--sunk)); border-left: 2px solid var(--ch, var(--line-2)); }
+.dep b { font-weight: 800; text-transform: uppercase; color: var(--ch, var(--fg)); }
 .ready { color: var(--good); font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.08em; }
 .boxes { display: inline-flex; gap: 3px; margin-left: auto; }
 .boxes i { width: 8px; height: 8px; border: 1.5px solid var(--ch, var(--muted)); }
@@ -282,6 +288,9 @@ table.hwt { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   .agent { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
   .agent-main { height: 82vh; }
   .side { overflow: visible; border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (max-width: 1240px) {
+  .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 900px) {
   .board { grid-template-columns: minmax(0, 1fr); }

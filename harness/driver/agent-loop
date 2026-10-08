@@ -946,7 +946,10 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     cn=$(team_cycle_note "$task"); PROMPT="$PROMPT$cn$FORCED_NOTE"
     [ -n "$cn" ] && log "iteration $i: $task is part of a cycle of tasks that wait on each other - told to build them together"
     split=$(team_split_note "$task")
-    [ -n "$split" ] && { PROMPT="$PROMPT$split"; log "$task is too big for another agent: this session is told to split it"; tev split_asked "$task"; }
+    if [ -n "$split" ]; then   # why: too big for another agent, or the team idles behind it (agent-team-lib, team_split_note)
+      swhy=${split#" SPLIT THIS TASK FIRST: "}; swhy=${swhy%%. Split what*}
+      PROMPT="$PROMPT$split"; log "$task: this session is told to split it ($swhy)"; tev split_asked "$task" "$swhy"
+    fi
   fi
   PROMPT="$PROMPT$REVIVED"
   # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).

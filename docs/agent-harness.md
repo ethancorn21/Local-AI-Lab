@@ -168,6 +168,13 @@ merged from the others', so tasks the agents created do not become the human's.
   another agent holds a task whose `Touches:` files overlap.
 - **Size.** An agent can be limited to tasks that touch at most N files (`TEAM_MAX_TOUCHES`: 8 for agent b). A task too
   big for another running agent gets split first, into new top-level tasks it can take.
+- **Split what the team waits on.** When another running agent has waited for the others `TEAM_IDLE_SPLIT_MIN` (20)
+  minutes and open tasks wait on this one, the next session on it splits it first, the same way, into parts that can be
+  built at the same time (`Split: no - <reason>` opts out). The split instruction forbids making a task wait for one
+  that waits for it. Why: on 2026-10-07 every open task hung off 256, which agent c held for 12 sessions (3.6 hours)
+  while a and b waited 168 and 221 minutes; the "split after 5 sessions" hint, a prompt sentence, was ignored seven
+  times. The size rule fired only once c's own hand-over pushed 256 to a 9th file, and 11 minutes after that split both
+  idle agents had work.
 - **Who takes what.** A task's rank is the length of the longest chain of open tasks waiting on it. An agent finishes
   its own claims first, the highest rank first. For new work, fast agents take the highest rank first; a slower agent
   (`TEAM_SPEED`) takes the lowest first while a faster one runs, so the fast card rarely waits on the slow one.
@@ -223,6 +230,11 @@ branch, or inferred), the plan per acceptance box, the tests, the risks.
 - **The notes belong to the task.** Whoever claims the task starts from them, after checking every assumption against
   `main`.
 - **Write early.** At 60% of the hand-over limit without notes, the session is told to write what it has.
+- **Stale notes are prepared again.** Notes older in `main` than the last change to their task file, or to the task
+  file of a task it depends on, are a prep target again, after every task with no notes at all. The session reworks
+  them against the code as it is now; one that leaves them unchanged counts as an empty prep (two and the task is not
+  prepared again). Why: on 2026-10-07 tasks 233-238 kept notes from 10-05, written before 233 was split and their
+  dependencies rewired, so the idle agents had nothing to prepare and just waited.
 
 Why: on the first team project the small card's agent was busy only 44% of the time its loop ran.
 
@@ -245,6 +257,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
 | `test_team_add.sh` | Adding an agent to an existing team: its checkout, its settings, and who owns each task |
 | `test_team_deadlock.sh` | The 2026-10-07 deadlock reproduced; cycles found and gathered on one agent with their work; dead statuses; finished claims released; the stall net (when it fires, when not, forced starts and their limits) |
+| `test_team_idle.sh` | The 2026-10-07 idle hours: the split asked of a task the team waits on (and every case where it is not), stale prep notes prepared again after unprepared tasks, one stamp on refreshed notes |
 | `test_team_deadlock_e2e.sh` | Two stub agents whose tasks come to need each other: the cycle rule finishes the project; with it off, the stall net does; with both off, nothing moves (the old deadlock) |
 | `test_team_split.sh`, `test_team_handover.sh`, `test_team_deps.sh`, `test_team_restart.sh`, `test_replan.sh` | Splitting for the small agent, handing tasks over, dependency edge cases, restarts, re-planning |
 | `test_ask_deadline.sh`, `test_ask_human_ext.mjs` | The request deadline and the recommendation rule |
@@ -278,6 +291,8 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-06 | Takeover: an idle fast agent takes the slow agent's critical task | a waited 47 min while b held 253 (five tasks behind it) and worked on 243b; the 3-session hand-over is for a stuck agent, not a slow one |
 | 10-06 | New driver logic in Python helpers, called from the bash | 1,700 lines of bash, and a 10-06 bug was glob order silently becoming policy. No rewrite |
 | 10-07 | Cycles gathered on one agent; blocked needs an open request; the stall net | All three agents sat idle 4 hours on 256/257 waiting for each other, and the human found out from the silent GPU fans |
+| 10-07 | Split the task the team waits on after 20 idle minutes; stale prep notes prepared again | Before that deadlock, a and b waited 168 and 221 minutes behind 256 (busy 47% and 45% overnight) with every waiting task already "prepared" |
+| 10-07 | Lab archive: every agent session, event and hardware reading kept on the AI box, nightly CSV export ([archive/](../archive/README.md)) | The console keeps two sessions per agent; the VM's disk lasts weeks and its agents run as root. Kept at least a year for a capstone analysis |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for

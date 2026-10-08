@@ -281,13 +281,42 @@ smallest_other_limit() {  # the smallest TEAM_MAX_TOUCHES among the other runnin
   done
   echo "$m"
 }
-team_split_note() {  # team_split_note <task file> : the split instruction for a task too big for another agent, or nothing
-  local lim n
+# The same split when the team idles behind one task: frontpage 2026-10-07, every open task hung off 256, which agent c
+# held for 12 sessions (3.6 hours) while a and b waited 168 and 221 minutes with nothing to build or prepare. The
+# 5-session hint (a prompt sentence) was ignored seven times; the size rule fired only when c's own hand-over pushed
+# 256 to a 9th file, and 11 minutes after that split both idle agents had work. So: when another running agent has
+# waited for other agents TEAM_IDLE_SPLIT_MIN (20) minutes (its loops/<id>.state, Stall below) and open tasks wait on
+# this one (rank 2+), the session on it splits it first. 0 turns the rule off.
+team_idle_waiter() {  # team_idle_waiter <task file> : "agent <id> has had nothing to build for <n> minutes", or nothing
+  local m=${TEAM_IDLE_SPLIT_MIN:-20} id st t now best="" bt=0 p
+  [ "$m" -gt 0 ] 2>/dev/null || return 0
+  p=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
+  [ -n "$p" ] && [ "$(status_of "$p")" != done ] && return 0   # planning: the plan may change every task
+  [ "$(rank_of "$(task_id "$1")" "$(team_ranks)")" -ge 2 ] || return 0
+  now=$(date +%s)
+  for id in $(live_agents); do
+    [ "$id" = "$AGENT_ID" ] && continue
+    read -r st t 2>/dev/null < "$TEAM/loops/$id.state" || continue
+    [ "$st" = wait ] && [[ $t =~ ^[0-9]+$ ]] && [ $((now - t)) -ge $((m * 60)) ] && [ $((now - t)) -gt "$bt" ] && { best=$id; bt=$((now - t)); }
+  done
+  [ -n "$best" ] && printf 'agent %s has had nothing to build for %d minutes' "$best" $((bt / 60))
+  return 0
+}
+team_split_note() {  # team_split_note <task file> : the split instruction for a task too big for another agent, or one
+  # the team idles behind (above), or nothing
+  local lim n why w size=""
   case $(task_id "$1") in 000|999) return 0 ;; esac
+  case $(status_of "$1") in split|done|dropped) return 0 ;; esac
   grep -qiE '^Split:[[:space:]]*no' "$1" && return 0
-  lim=$(smallest_other_limit); [ -n "$lim" ] || return 0
-  n=$(touches_of "$1" | grep -c .); [ "$n" -gt "$lim" ] || return 0
-  printf '%s' " SPLIT THIS TASK FIRST: it changes $n files, and another agent can only take tasks of at most $lim files, so as one task it waits for you alone. Split what is not built yet into new top-level tasks (the lowest free numbers in $(task_range)) of at most $lim files each, every one with a Goal, testable Acceptance criteria, a \`Depends on:\` line and a \`Touches:\` line, so that parts which do not need each other can be built at the same time. Either this task keeps what is already built and what the parts need first (the parts then depend on this task), or, when nothing is built yet, it waits for the parts (add their numbers to its \`Depends on:\` line). Move the acceptance boxes the parts deliver into the parts, and cut this task's \`Touches:\` line down to the files it still changes itself. Where another open task depends on this one and needs a part, add that part's number to its \`Depends on:\` line too. Commit and end the session: the driver puts these task files into main at once, so the other agent can take the parts. Only if the work truly cannot be divided: add the line \`Split: no - <reason>\` under this task's \`Touches:\` line and carry on."
+  lim=$(smallest_other_limit); n=$(touches_of "$1" | grep -c .)
+  [ -n "$lim" ] && size=" of at most $lim files each"
+  if [ -n "$lim" ] && [ "$n" -gt "$lim" ]; then
+    why="it changes $n files, and another agent can only take tasks of at most $lim files, so as one task it waits for you alone"
+  else
+    w=$(team_idle_waiter "$1"); [ -n "$w" ] || return 0
+    why="$w, and other open tasks wait on this one, so as one task it keeps them waiting for you alone"
+  fi
+  printf '%s' " SPLIT THIS TASK FIRST: $why. Split what is not built yet into new top-level tasks (the lowest free numbers in $(task_range))$size, every one with a Goal, testable Acceptance criteria, a \`Depends on:\` line and a \`Touches:\` line, so that parts which do not need each other can be built at the same time. Either this task keeps what is already built and what the parts need first (the parts then depend on this task), or, when nothing is built yet, it waits for the parts (add their numbers to its \`Depends on:\` line). Never both ways: a task must not wait, directly or through others, for a task that waits for it, or neither can ever start. Move the acceptance boxes the parts deliver into the parts, and cut this task's \`Touches:\` line down to the files it still changes itself. Where another open task depends on this one and needs a part, add that part's number to its \`Depends on:\` line too. Commit and end the session: the driver puts these task files into main at once, so the other agent can take the parts. Only if the work truly cannot be divided: add the line \`Split: no - <reason>\` under this task's \`Touches:\` line and carry on."
 }
 team_publish_split() {  # team_publish_split <task file> <commit before the session> : after a session told to split
   # its task, the task files it wrote or changed go into main at once (the parts, this task, Depends on lines added to
@@ -843,14 +872,29 @@ prep_read_bytes() {  # prep_read_bytes <task file>
   done | awk '{ s += $1 } END { print s + 0 }'
 }
 prep_budget_bytes() { echo $(( ( ${WRAPUP_SOFT_TOKENS:-120000} - ${TEAM_PREP_RESERVE_TOKENS:-25000} ) * 4 )); }
-team_prep_target() {  # the task this idle agent prepares, or nothing: open, unclaimed, not prepared, small enough to read
-  # in this agent's window (above); the nearest
+# Notes go stale: they describe the task and its dependencies as they were. frontpage 2026-10-07: 233-238 had notes
+# from 10-05, written before 233 was split into 255-257 and their dependencies rewired; with every task "prepared",
+# agents a and b had nothing to prepare and sat idle 168 and 221 minutes while c built the one task they all waited on.
+prep_stale() {  # prep_stale <task file> : its notes in main are older than the last change in main to the task file or
+  # to the task file of one it depends on (notes not in main yet count as fresh)
+  local nt t d df
+  nt=$(git -C "$TEAM_DIR" log -1 --format=%ct main -- "$(prep_file "$1")" 2>/dev/null); [ -n "$nt" ] || return 1
+  for d in "$(task_id "$1")" $(deps_of "$1"); do
+    [[ $d =~ ^[0-9]+$ ]] && d=$(printf %03d "$((10#$d))")
+    df=$(cd "$TEAM_DIR" && compgen -G "tasks/$d-*.md" | head -1); [ -n "$df" ] || continue
+    t=$(git -C "$TEAM_DIR" log -1 --format=%ct main -- "$df" 2>/dev/null)
+    [ -n "$t" ] && [ "$t" -gt "$nt" ] && return 0
+  done
+  return 1
+}
+team_prep_target() {  # the task this idle agent prepares, or nothing: open, unclaimed, not prepared (or its notes are
+  # stale, above), small enough to read in this agent's window (above); unprepared before stale, then the nearest
   # to starting first (fewest unbuilt layers before it), then the longest chain behind it. Deeper tasks are prepared
   # too, once nothing nearer is left: their notes build on guesses, but an idle GPU builds nothing (frontpage
   # 2026-10-04: after preparing 242, b sat idle with 231-238 waiting behind 242 and 239 under a one-layer rule).
   # None while planning runs (the plan may still change every task).
   [ "${TEAM_PREP:-1}" = 1 ] || return 0
-  local m f id l r best="" bl=999 br=0 ranks
+  local m f id l r s best="" bs=9 bl=999 br=0 ranks
   m=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
   [ -n "$m" ] && [ "$(status_of "$m")" != done ] && return 0
   ranks=$(team_ranks)
@@ -859,7 +903,7 @@ team_prep_target() {  # the task this idle agent prepares, or nothing: open, unc
     case $f in tasks/000-*|tasks/999-*) continue ;; esac
     [ "$(status_of "$f")" = open ] || continue
     id=$(task_id "$f")
-    [ -f "$(prep_file "$f")" ] && continue
+    s=0; if [ -f "$(prep_file "$f")" ]; then prep_stale "$f" || continue; s=1; fi
     # A handed-over task has real work and a hand-over already, and a waiting agent about to claim it (frontpage
     # 2026-10-07: b, idle after handing 802 to c, prepared 802 in the seconds before c claimed it; c then waited 230 s
     # for notes that never came).
@@ -871,7 +915,9 @@ team_prep_target() {  # the task this idle agent prepares, or nothing: open, unc
     [ "$(prep_read_bytes "$f")" -le "$(prep_budget_bytes)" ] || continue
     l=$(prep_layers "$f"); [ "$l" -lt 99 ] || continue
     r=$(rank_of "$id" "$ranks")
-    if [ "$l" -lt "$bl" ] || { [ "$l" -eq "$bl" ] && [ "$r" -gt "$br" ]; }; then best=$f; bl=$l; br=$r; fi
+    if [ "$s" -lt "$bs" ] || { [ "$s" -eq "$bs" ] && { [ "$l" -lt "$bl" ] || { [ "$l" -eq "$bl" ] && [ "$r" -gt "$br" ]; }; }; }; then
+      best=$f; bs=$s; bl=$l; br=$r
+    fi
   done
   echo "$best"
 }
@@ -890,10 +936,11 @@ team_prep_basis() {  # team_prep_basis <task file> : one line, what the notes ar
   printf '%s' "$l step(s) before it could start; built on:$out"
 }
 team_prep_prompt() {  # team_prep_prompt <task file> <iteration> : the whole prompt of a prep session
-  local f=$1 id pf l basis deep=""
+  local f=$1 id pf l basis deep="" old=""
   id=$(task_id "$f"); pf=$(prep_file "$f"); basis=$(team_prep_basis "$f"); l=${basis%% *}
+  [ -f "$pf" ] && old=" $pf already holds notes from an earlier prep, written before this task or a task it waits on last changed in main: check each part against the task files and code as they are now, keep what still holds, and rewrite the rest (replace the file; do not append a second version)."
   [ "$l" -ge 2 ] 2>/dev/null && deep=" This task is $l steps from starting: tasks it waits on are not built yet, so what they will provide is a guess. Work from their task files, their prep notes where they have them, and the work in progress they in turn wait on, and mark those assumptions \"inferred\". Plan at the level that will survive: behaviour, interfaces, tests; name files and lines only where they will not move (a task that splits or moves modules changes them)."
-  printf '%s' "You are iteration $2 of an autonomous coding loop, in a PREP SESSION: there is nothing you can build right now, so you prepare a task that starts later, $f. It is ${basis/; built on:/. It waits for:}$deep Write $pf so that the agent that takes $id can check your plan and start building at once, instead of researching from scratch. Read $f, the code and tests it will change, and what its dependencies will provide: their task files and prep notes, and work in progress on other agents' branches, read only (\`git log main..agent/<id>\`, \`git diff main...agent/<id> -- <path>\`, \`git show agent/<id>:<path>\`). $pf holds: 1. Assumptions: what each dependency will provide (names, signatures, data shapes, files), each marked \"seen on its branch\", \"seen in main\" or \"inferred\". 2. Plan: the steps, mapped to the task's acceptance boxes, with the files and functions to change. 3. Tests: the end-to-end, integration or golden tests to add or change, with their cases. 4. Risks and open questions (the human is not asked during prep: questions go here). Code sketches are welcome inside the notes. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but $pf: the driver keeps only that file. Write it early and improve it as you go, committing each time (\`git add $pf && git commit -m \"prep $id: <what>\"\`): the session is ended as soon as the task can be built or other work is free. Then stop."
+  printf '%s' "You are iteration $2 of an autonomous coding loop, in a PREP SESSION: there is nothing you can build right now, so you prepare a task that starts later, $f. It is ${basis/; built on:/. It waits for:}$deep$old Write $pf so that the agent that takes $id can check your plan and start building at once, instead of researching from scratch. Read $f, the code and tests it will change, and what its dependencies will provide: their task files and prep notes, and work in progress on other agents' branches, read only (\`git log main..agent/<id>\`, \`git diff main...agent/<id> -- <path>\`, \`git show agent/<id>:<path>\`). $pf holds: 1. Assumptions: what each dependency will provide (names, signatures, data shapes, files), each marked \"seen on its branch\", \"seen in main\" or \"inferred\". 2. Plan: the steps, mapped to the task's acceptance boxes, with the files and functions to change. 3. Tests: the end-to-end, integration or golden tests to add or change, with their cases. 4. Risks and open questions (the human is not asked during prep: questions go here). Code sketches are welcome inside the notes. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but $pf: the driver keeps only that file. Write it early and improve it as you go, committing each time (\`git add $pf && git commit -m \"prep $id: <what>\"\`): the session is ended as soon as the task can be built or other work is free. Then stop."
 }
 team_prep_watch() {  # team_prep_watch <task file> : in the background during a prep session. Real work beats prep: once
   # the task can be built, or any task is free for this agent, wrapup's driver signal tells the session to write its
@@ -923,12 +970,15 @@ team_prep_finish() {  # team_prep_finish <task file> <commit before the session>
     local keep=""
     if [ -s "$pf" ]; then
       keep=$(mktemp)
-      { [ -n "$basis" ] && printf '> Prep notes by agent %s, %s, written %s\n> Check every assumption against main before building on it.\n\n' "$AGENT_ID" "$(date '+%F %H:%M')" "$basis"; cat "$pf"; } > "$keep"
+      # (a refresh of older notes may keep their stamp: the new one replaces it)
+      { [ -n "$basis" ] && printf '> Prep notes by agent %s, %s, written %s\n> Check every assumption against main before building on it.\n\n' "$AGENT_ID" "$(date '+%F %H:%M')" "$basis"
+        if [ -n "$basis" ]; then sed '1{/^> Prep notes by agent /{N;N;d}}' "$pf"; else cat "$pf"; fi; } > "$keep"
     fi
     git reset -q --hard "$h0"
     if [ -n "$keep" ]; then mkdir -p "$(dirname "$pf")"; mv "$keep" "$pf"; git add "$pf" && git commit -q -m "[driver] prep $id: notes by agent $AGENT_ID"; fi
   fi
-  if [ ! -s "$pf" ]; then
+  # no notes, or a refresh of stale notes (prep_stale) that left them as they were: counted, so it is not picked forever
+  if [ ! -s "$pf" ] || { git cat-file -e "$h0:$pf" 2>/dev/null && [ "$(git rev-parse "$h0:$pf")" = "$(git rev-parse -q --verify "HEAD:$pf")" ]; }; then
     mkdir -p "$TEAM/prep-tries"; echo $(( $(cat "$TEAM/prep-tries/$id" 2>/dev/null || echo 0) + 1 )) > "$TEAM/prep-tries/$id"
     log "prep $id: no notes written"; tev prep_empty "$f"
   else

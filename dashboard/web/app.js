@@ -509,12 +509,20 @@ function boardColumns(project, b) {
         m && m.task_id === t.id ? stateChip(n) : "claimed",
         t.boxes ? h("span", { class: "boxes", title: `${t.boxes[0]} of ${t.boxes[1]} acceptance boxes ticked` }, Array.from({ length: Math.min(t.boxes[1], 12) }, (_, i) => h("i", { class: i < t.boxes[0] ? "on" : "" }))) : null]
         : (t.status === "split" ? "split: waits for its subtasks" : t.status || "in progress"))); });
-  const open = b.open.map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
-    h("span", { class: "note" }, t.waits.length ? `after ${t.waits.join(", ")}` : h("span", { class: "ready" }, "ready to start"))));
+  // Not started splits in two: work an idle agent could take now, and work that waits on other tasks (with who holds
+  // those), so blocked work never reads as unassigned (frontpage 2026-10-07: "not started" held 234-238, all behind 256).
+  const holder = id => (b.building.find(x => x.id === id) || {}).agent;
+  const ready = b.open.filter(t => !t.waits.length), waiting = b.open.filter(t => t.waits.length);
+  const readyLi = ready.map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
+    h("span", { class: "note" }, h("span", { class: "ready" }, "ready to start"))));
+  const waitLi = waiting.map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
+    h("span", { class: "note" }, "after", ...t.waits.map(id => { const a = holder(id);
+      return h("span", { class: "dep", style: a && chFor(a) ? chStyle(chFor(a)) : null }, id, a ? h("b", {}, a) : null); }))));
   return h("div", { class: "board" },
     col("done", b.done.length, "done", done, b.done.length > 8 ? h("div", { class: "more" }, `and ${b.done.length - 8} earlier`) : null),
     col("build", b.building.length, "being built", build),
-    col("open", b.open.length, "not started", open));
+    col("ready-col" + (ready.length ? " has" : ""), ready.length, "ready to start", readyLi),
+    col("open", waiting.length, "waiting on other tasks", waitLi));
 }
 function board() {
   const asksHost = h("div"), boardsHost = h("div", { style: "display: flex; flex-direction: column; gap: 26px" });
