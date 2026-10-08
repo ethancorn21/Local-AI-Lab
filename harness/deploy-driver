@@ -10,7 +10,7 @@ D=$(cd "$(dirname "$0")/driver" && pwd)
 FILES="agent-loop agent-team-lib team-takeover team-carve plan-schedule"
 B=/home/$GU/bin
 X=$(cd "$(dirname "$0")/pi-extensions" && pwd); XB=/home/$GU/.pi/agent/extensions
-EXTS=$(cd "$X" && ls *.ts)
+EXTS=$(cd "$X" && ls *.ts | tr '\n' ' ')
 h() { sha256sum | cut -c1-12; }
 have=$(ssh "$VM" "for f in agent-loop agent-team-lib; do sudo -u $GU cat $B/\$f | sha256sum | cut -c1-12; done" | tr '\n' ' ')
 if [ -n "${EXPECT:-}" ]; then
