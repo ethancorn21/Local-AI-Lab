@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# harness/deploy-driver [team ...]: install this checkout's driver on the harness VM, from the Mac, then restart the
+# named teams' loops (each agent after its current session). Files are written new and renamed into place, so running
+# loops keep reading the old ones (bash reads a script as it runs); the old files go to ~/.agent-kit/backups first.
+#   EXPECT=<commit>  refuse unless the VM runs that commit's agent-loop and agent-team-lib (nothing else deployed meanwhile)
+# Host: VM (default harnessvm), agent user AGENT_USER (agent).
+set -euo pipefail
+VM=${VM:-harnessvm} GU=${AGENT_USER:-agent}
+D=$(cd "$(dirname "$0")/driver" && pwd)
+FILES="agent-loop agent-team-lib team-takeover plan-schedule"
+B=/home/$GU/bin
+h() { sha256sum | cut -c1-12; }
+have=$(ssh "$VM" "for f in agent-loop agent-team-lib; do sudo -u $GU cat $B/\$f | sha256sum | cut -c1-12; done" | tr '\n' ' ')
+if [ -n "${EXPECT:-}" ]; then
+  want=$(for f in agent-loop agent-team-lib; do git -C "$D" show "$EXPECT:harness/driver/$f" | h; done | tr '\n' ' ')
+  [ "$have" = "$want" ] || { echo "the VM runs $have, not $EXPECT ($want): nothing deployed"; exit 2; }
+fi
+stamp=$(date +%F-%H%M)
+ssh "$VM" "set -e; sudo -u $GU mkdir -p /home/$GU/.agent-kit/backups
+  for f in $FILES; do [ -f $B/\$f ] && sudo -u $GU cp -p $B/\$f /home/$GU/.agent-kit/backups/\$f.bak-$stamp || true; done"
+for f in $FILES; do
+  ssh "$VM" "sudo -u $GU tee $B/$f.new >/dev/null && sudo -u $GU chmod 0755 $B/$f.new && sudo -u $GU mv $B/$f.new $B/$f" < "$D/$f"
+done
+for f in $FILES; do
+  [ "$(ssh "$VM" "sudo -u $GU cat $B/$f" | h)" = "$(h < "$D/$f")" ] || { echo "$f did not arrive intact"; exit 1; }
+done
+echo "VM driver = $(git -C "$D" rev-parse --short HEAD) (backups *.bak-$stamp)"
+for t in "$@"; do
+  ssh "$VM" "sudo -u $GU bash -c 'setsid $B/agent-team restart $t > /home/$GU/restart-$t-$stamp.log 2>&1 < /dev/null &'"
+  echo "team $t: each agent restarts after its current session (log ~$GU/restart-$t-$stamp.log)"
+done
