@@ -83,7 +83,8 @@ for d in (MAIN, WT, WT_B, SECRET):
 write(f"{MAIN}/.agent/team-main", "")
 write(f"{MAIN}/tasks/001-scaffold.md", "Status: done\n# 001: Scaffold\n")
 write(f"{MAIN}/tasks/002-feed-rows.md", TASK_002.replace("[x]", "[ ]"))
-write(f"{MAIN}/tasks/003-theme-page.md", "Status: open\n# 003: Theme page\nDepends on: 002\n")
+# a Goal longer than 4000 bytes above the Depends on line (frontpage 238), and a part a split named but never wrote (009)
+write(f"{MAIN}/tasks/003-theme-page.md", "Status: open\n# 003: Theme page\n\n## Goal\n" + "Pick a background. " * 260 + "\n\nDepends on: 002, 009\n")
 write(f"{MAIN}/tasks/004-docs.md", "Status: open\n# 004: Docs\n")
 write(f"{MAIN}/tasks/prep/002.md", "Prep: the feed module already has a row template.\n")
 write(f"{MAIN}/.agent/team/claims/002/owner", f"a 1 0 {WT}/tasks/002-feed-rows.md\n")
@@ -310,7 +311,7 @@ try:
     b = wait_for(lambda: state()["boards"].get("demo"))
     check("sprint board", b and b["total"] == 4 and [x["id"] for x in b["done"]] == ["001"]
           and [(x["id"], x["agent"], x["boxes"]) for x in b["building"]] == [("002", "a", [1, 3])]
-          and [(x["id"], x["waits"]) for x in b["open"]] == [("003", ["002"]), ("004", [])], b)
+          and [(x["id"], x["waits"], x["missing"]) for x in b["open"]] == [("003", ["002", "009"], ["009"]), ("004", [], [])], b)
     cb = wait_for(lambda: (lambda c: c if c and any(e.get("text") == "after the bad line" for e in c["events"]) else None)(state()["channels"].get("demo.b")))
     evb = (cb or {}).get("events", [])
     check("agent b on the console beside a", cb and cb["meta"].get("agent") == "b" and "demo.a" in state()["channels"], list(state()["channels"]))

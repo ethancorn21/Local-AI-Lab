@@ -517,6 +517,7 @@ function boardColumns(project, b) {
     h("span", { class: "note" }, h("span", { class: "ready" }, "ready to start"))));
   const waitLi = waiting.map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
     h("span", { class: "note" }, "after", ...t.waits.map(id => { const a = holder(id);
+      if ((t.missing || []).includes(id)) return h("span", { class: "dep", title: "named in Depends on, no task file yet" }, id, h("b", {}, "not written"));
       return h("span", { class: "dep", style: a && chFor(a) ? chStyle(chFor(a)) : null }, id, a ? h("b", {}, a) : null); }))));
   return h("div", { class: "board" },
     col("done", b.done.length, "done", done, b.done.length > 8 ? h("div", { class: "more" }, `and ${b.done.length - 8} earlier`) : null),

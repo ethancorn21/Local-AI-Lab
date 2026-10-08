@@ -595,7 +595,7 @@ class Channel:
                 for f in sorted(os.listdir(os.path.join(main, "tasks"))):
                     if not f.endswith(".md") or f.startswith(tid + "-"):
                         continue
-                    head = read(os.path.join(main, "tasks", f), 1500) or ""
+                    head = read(os.path.join(main, "tasks", f)) or ""   # whole: see board()
                     dm = re.search(r"^Depends on:\s*(.*)$", head, re.M | re.I)
                     if dm and any(d.lstrip("0") == tid.lstrip("0") for d in re.findall(r"\b\d+[a-z]*\b", dm.group(1))):
                         if task_status(os.path.join(main, "tasks", f)) not in ("done", "dropped"):
@@ -673,7 +673,9 @@ def board(main):
 
     def info(tid):
         f = files.get(tid)
-        text = read(os.path.join(tasks_dir, f), 4000) if f else ""
+        # the whole file: a Depends on line can sit below a long Goal (frontpage 2026-10-07: 238's at byte 4173, and a
+        # 4000-byte read showed it "ready to start" while it waited for 234 and 237)
+        text = read(os.path.join(tasks_dir, f)) if f else ""
         title = next((re.sub(r"^\d+[a-z]*[:.)]?\s*", "", l[2:].strip()) for l in (text or "").splitlines() if l.startswith("# ")), task_parts(f or "")[1])
         dm = re.search(r"^Depends on:\s*(.*)$", text or "", re.M | re.I)
         deps = re.findall(r"\b\d+[a-z]*\b", dm.group(1)) if dm else []
@@ -695,12 +697,14 @@ def board(main):
                     boxes = [sum(1 for c in t["checks"] if c[0]), len(t["checks"])]
             building.append({"id": tid, "title": title, "agent": agent, "status": status, "boxes": boxes})
         else:
-            waits = []
+            waits, missing = [], []
             for d in deps:
                 df = files.get(d.zfill(3) if d.isdigit() else d)
+                if not df:
+                    missing.append(d)   # named by a split, never written: the driver has the session write it first
                 if not df or task_status(os.path.join(tasks_dir, df)) not in ("done", "dropped"):
                     waits.append(d)
-            opened.append({"id": tid, "title": title, "waits": waits})
+            opened.append({"id": tid, "title": title, "waits": waits, "missing": missing})
     done.reverse()
     return {"total": p.get("total"), "done": done, "building": building, "open": opened}
 

@@ -97,7 +97,7 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
   const ready = b.open.filter(t => !t.waits.length).length;
   check("board: done / being built / ready / waiting", JSON.stringify(cols) === JSON.stringify([Math.min(8, b.done.length), b.building.length, ready, b.open.length - ready]), cols);
   check("board: ready column loud when it has work", text("#view .col.ready-col .note").join("|") === "ready to start" && !!d.querySelector("#view .col.ready-col.has"), text("#view .col.ready-col .note"));
-  check("board: a waiting task names its blocker and who builds it", text("#view .col.open .dep").join("|") === "002a" && text("#view .col.open .dep b").join("|") === "a", text("#view .col.open .dep"));
+  check("board: a waiting task names its blocker and who builds it", text("#view .col.open .dep").join("|") === "002a|009not written" && text("#view .col.open .dep b").join("|") === "a|not written", text("#view .col.open .dep"));
   d.querySelector("#view .ask textarea").value = "Relative.";
   d.querySelector("#view .ask .act.primary").click();
   await tick();
