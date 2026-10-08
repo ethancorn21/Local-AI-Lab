@@ -2,7 +2,7 @@
    faint wash), and the labels are loud: every kind of event (thought, answer, bash, read, edit, write, search, ask,
    driver) is a filled chip in its own vivid hue, so a glance at a feed says what each agent is doing without reading.
    Red and green are kept for fail and pass, never a label. Two themes on the Espresso & Foil base
-   (~/code/projects/design/espresso-foil.md): latte, and espresso (#2B211C).
+   (~/code/projects/design/espresso-foil.md): latte (cream panels on latte), and espresso (#2B211C panels on the #1C1612 page).
    The Live page tiles the channels like the operator's monitor: one tall pane, two stacked.
    Agent text arrives as data and is only ever set as text (textContent), never parsed as HTML. */
 :root {
@@ -24,7 +24,7 @@
   color-scheme: light;
 }
 :root[data-theme="dark"] {
-  --bg: #2B211C; --raise: #362B23; --sunk: #241B17; --line: #4E3D33; --line-2: #6A5444;   /* espresso */
+  --bg: #1C1612; --raise: #2B211C; --sunk: #15100D; --line: #4E3D33; --line-2: #6A5444;   /* espresso panels on the deep page */
   --fg: #EFE6DC; --fg-2: #D3C6B8; --muted: #B5A493;
   --ch-a: #8f94f0; --ch-b: #e397ab; --ch-c: #63bfae;
   --wash: 17%;
