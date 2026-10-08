@@ -396,7 +396,7 @@ function renderChrome() {
     item("hardware", h("span", { class: "led " + (hot ? "warn" : "") }), "Hardware", `GPUs ${tempText}`));
   $("#nav-agents").replaceChildren(h("span", { class: "label" }, "Agents"),
     ...chNames().map(n => { const m = S.channels[n].meta; const st = stale(n);
-      return item(n, h("span", { class: "tag", style: `background: var(--ch-${colorKey(n) || "x"}, var(--fg-2))` }, letter(n)), m.task || n,
+      return item(n, h("span", { class: "tag", style: `--ch: var(--ch-${colorKey(n) || "x"}, var(--fg-2))` }, letter(n)), m.task || n,
         `${gpuOf(n)?.name || (m.port ? `port ${m.port}` : "")} · ${m.project || ""}`,
         h("span", { class: "led " + (st ? "warn" : m.running ? "on" : ""), title: st ? "Stream stuck" : m.activity || "" })); }));
   const projects = [...new Set(chNames().map(n => S.channels[n].meta.project))];
@@ -482,7 +482,7 @@ function askCard(a) {
   const ta = h("textarea", { id: `ask-${a.ch}-${a.id}`, placeholder: "Answer in your own words…", maxlength: 4000 });
   const status = h("p", { class: "ask-err" });
   const box = h("div", { class: "ask", style: chStyle(a.ch) },
-    h("div", { class: "row" }, h("span", { class: "tag", style: `background: var(--ch, var(--fg-2))` }, letter(a.ch)),
+    h("div", { class: "row" }, h("span", { class: "tag" }, letter(a.ch)),
       h("span", { class: "label" }, `${label(a.ch)} asks · request ${a.id} · ${a.task || ""}${a.blocking === "yes" ? " · blocking" : ""} · ${a.asked || ""}`)),
     h("p", { class: "ask-text" }, a.text), ta, status,
     h("div", { class: "row" },
@@ -505,7 +505,7 @@ function boardColumns(project, b) {
   const done = b.done.slice(0, 8).map(t => h("li", {}, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id)));
   const build = b.building.map(t => { const n = t.agent && chFor(t.agent); const m = n ? S.channels[n].meta : null;
     return h("li", { style: n ? chStyle(n) : null }, h("span", { class: "name" }, t.title), h("span", { class: "id v-dial" }, t.id),
-      h("span", { class: "note" }, t.agent ? [h("span", { class: "tag", style: "background: var(--ch, var(--fg-2)); width: 18px; height: 18px; font-size: 10.5px" }, t.agent),
+      h("span", { class: "note" }, t.agent ? [h("span", { class: "tag", style: "width: 18px; height: 18px; font-size: 10.5px" }, t.agent),
         m && m.task_id === t.id ? stateChip(n) : "claimed",
         t.boxes ? h("span", { class: "boxes", title: `${t.boxes[0]} of ${t.boxes[1]} acceptance boxes ticked` }, Array.from({ length: Math.min(t.boxes[1], 12) }, (_, i) => h("i", { class: i < t.boxes[0] ? "on" : "" }))) : null]
         : (t.status === "split" ? "split: waits for its subtasks" : t.status || "in progress"))); });
@@ -731,7 +731,7 @@ function timeline() {
       }
       for (const { m, txt, x: xx } of packRow(laneMarks.sort((a, b) => b.m.t - a.m.t)))
         el(`tl-mark ${MARKS[m.kind][0]} v-dial`, xx, y0 + 2, txt, { title: `${clock(m.t)} · ${m.text}` });
-      const g = el("tl-gutter", 0, y0, [h("span", { class: "tag", style: `background: var(--ch-${colorKey(n) || "x"}, var(--fg-2))` }, letter(n)),
+      const g = el("tl-gutter", 0, y0, [h("span", { class: "tag", style: `--ch: var(--ch-${colorKey(n) || "x"}, var(--fg-2))` }, letter(n)),
         h("span", { class: "tl-gname" }, label(n)), stateChip(n)], { style: sty });
       g.style.height = `${laneH}px`;
     });
@@ -752,7 +752,7 @@ function timeline() {
         h("p", { class: "v-dial muted" }, `${label(o.ch)} · session ${sx.iter} · ${clock(sx.start)}–${sx.end ? clock(sx.end) : "now"}${sx.end ? ` (${dur(sx.end - sx.start)})` : ""}`),
         h("dl", { class: "kv v-dial" }, ...[["outcome", sx.status], ["verify", sx.verify], ["hand-over", sx.wrapup]].filter(r => r[1]).flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, String(v))])),
         h("ul", { class: "tl-list" }, ch.map(nd => h("li", { onclick: () => { if (nd.kind !== "Test") { TL.open = { type: "node", ch: o.ch, id: nd.id }; openDrawer(); schedule(); } } },
-          nd.kind === "Test" ? chip(nd.fail ? "k-ask" : "k-say", nd.fail ? `✗ ${nd.fail}` : `✓ ${nd.pass}`) : chip(nd.kind === "Write" ? "k-write" : "k-edit", nd.kind),
+          nd.kind === "Test" ? chip(nd.fail ? "k-fail" : "k-pass", nd.fail ? `✗ ${nd.fail}` : `✓ ${nd.pass}`) : chip(nd.kind === "Write" ? "k-write" : "k-edit", nd.kind),
           h("span", { class: "v-code" }, nd.kind === "Test" ? nd.cmd || "tests" : nd.path), h("span", { class: "v-dial muted" }, `${nd.approx ? "≈" : ""}${clock(nd.t)}`)))));
       return;
     }

@@ -1,6 +1,6 @@
 /* Layout: a workbench for three channels. The ground is calm (soft type, quiet surfaces, agent colours as a stripe and a
    faint wash), and the labels are loud: every kind of event (thought, answer, bash, read, edit, write, search, ask,
-   driver) is a filled chip in its own vivid hue, so a glance at a feed says what each agent is doing without reading.
+   driver) is a foil chip in its own hue, so a glance at a feed says what each agent is doing without reading.
    Red and green are kept for fail and pass, never a label. Two themes on the Espresso & Foil base
    (~/code/projects/design/espresso-foil.md): latte (cream panels on latte), and espresso (#2B211C panels on the #1C1612 page).
    The Live page tiles the channels like the operator's monitor: one tall pane, two stacked.
@@ -15,7 +15,13 @@
   --add-bg: #d8e4c8; --add-fg: #375f25; --del-bg: #eed5ca; --del-fg: #8f3627;
   --kw: #7d4a88; --str: #50722f; --com: #8f8b7a; --fn: #3a68a8;
   --shadow: rgba(43, 33, 28, 0.18);
-  /* the labels: vivid, the same in both themes, dark ink on top */
+  /* the labels: Espresso & Foil, the same in both themes. A chip is a pill with a chrome rim around a pastel foil swept
+     from its kind's hue (--h-*), dark ink on top. Hues sit off red and green, which mean fail and pass.
+     The --k-* solids are each kind's accent for lines and rings that point at a label. */
+  --chrome: linear-gradient(135deg, #fdfdfd 0%, #a9adb3 20%, #f4f5f7 42%, #7d8188 60%, #e6e8eb 80%, #9ea2a8 100%);
+  --sheen: linear-gradient(110deg, transparent 38%, rgba(255, 255, 255, 0.6) 50%, transparent 62%);
+  --on-foil: #2B211C;
+  --h-bash: 25; --h-edit: 48; --h-say: 78; --h-write: 168; --h-read: 196; --h-web: 226; --h-think: 262; --h-driver: 295; --h-ask: 325;
   --k-think: #a970ff; --k-say: #b4e33d; --k-bash: #ff8b2b; --k-read: #33b8ff; --k-edit: #ffd23f; --k-write: #2ad4c0;
   --k-web: #6b84ff; --k-ask: #ff3b6b; --k-driver: #ff4fb4; --k-tool: #a7b0c4; --k-wait: #8f8a78; --k-ink: #17140c;
   --body: "Geist", system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -59,8 +65,13 @@ button { cursor: pointer; background: none; border: 0; padding: 0; }
 .nav button[aria-current="true"] { color: var(--fg); border-left-color: var(--fg); background: var(--raise); font-weight: 600; }
 .nav .grow { flex: 1; min-width: 0; }
 .nav .sub { display: block; font-size: 11px; font-weight: 400; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tag { font: 800 11px var(--display); text-transform: uppercase; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 2px; color: var(--k-ink); flex: none; }
-.n { font: 600 10.5px var(--mono); color: var(--attn-ink); background: var(--attn-wash); border: 1px solid var(--attn); border-radius: 2px; padding: 0 5px; }
+/* an agent's letter: a coin in the agent's colour with the chrome rim (set --ch on it or a parent) */
+.tag { font: 800 11px var(--display); text-transform: uppercase; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; color: var(--k-ink); flex: none;
+  box-sizing: border-box; border: 2px solid transparent;
+  background: var(--sheen) padding-box, linear-gradient(var(--ch, var(--fg-2)), var(--ch, var(--fg-2))) padding-box, var(--chrome) border-box;
+  background-size: 300% 100%, 100% 100%, 100% 100%; background-position: 100% 0, 0 0, 0 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 2px rgba(0, 0, 0, 0.35); transition: background-position 0.9s ease; }
+.tag:hover, button:hover > .tag { background-position: 0 0, 0 0, 0 0; }
 .led { width: 7px; height: 7px; background: var(--line-2); flex: none; }
 .led.on { background: var(--good); animation: led 1.4s ease-in-out infinite; }
 .led.warn { background: var(--attn); }
@@ -327,28 +338,38 @@ details.fold[open] > summary::after { content: " ▾"; }
 .you.pending { opacity: 0.75; }
 .you.failed { background: var(--crit); }
 .tool.err .meta { color: var(--crit); }
-.tool.err .chip { --k: var(--crit); color: #fff; }
+.tool.err .chip { background: var(--sheen) padding-box, linear-gradient(var(--crit), var(--crit)) padding-box, var(--chrome) border-box; color: #fff; }
 .leds.idle i.on { background: var(--line-2); }
 .chan-off .ch-head { filter: saturate(0.4); }
 
-/* ---------- the loud part: what each agent is doing, at a glance */
-.chip { --k: var(--k-tool); display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex: none; white-space: nowrap;
-  font: 700 10px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--k-ink); background: var(--k);
-  padding: 3px 6px; border-radius: 3px; }
-:root[data-theme="dark"] .chip { box-shadow: 0 0 12px -3px var(--k); }
+/* ---------- the loud part: what each agent is doing, at a glance. Foil stickers on the matte page: chrome rim, pastel foil
+   swept from the kind's hue (a narrow sweep, so eleven kinds stay apart), a sheen that slides across on hover. A live chip
+   (thinking, answering, a tool running) runs that sheen on a loop: the one motion, used to say "happening now". */
+.chip, .n { --h: 215; --sat: 22%; display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex: none; white-space: nowrap;
+  font: 700 10px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--on-foil);
+  padding: 2px 7px; border: 2px solid transparent; border-radius: 999px;
+  --g: linear-gradient(110deg, hsl(calc(var(--h) - 12) var(--sat) 82%), hsl(calc(var(--h) + 12) var(--sat) 86%),
+       hsl(calc(var(--h) + 32) var(--sat) 88%), hsl(calc(var(--h) + 8) var(--sat) 85%), hsl(calc(var(--h) - 12) var(--sat) 82%));
+  background: var(--sheen) padding-box, var(--g) padding-box, var(--chrome) border-box;
+  background-size: 300% 100%, 100% 100%, 100% 100%; background-position: 100% 0, 0 0, 0 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75), 0 1px 2px rgba(0, 0, 0, 0.35); transition: background-position 0.9s ease; }
+.chip:hover, .n:hover { background-position: 0 0, 0 0, 0 0; }
 .feed .chip.lead { min-width: 62px; }
-.chip.k-think { --k: var(--k-think); } .chip.k-say { --k: var(--k-say); } .chip.k-bash { --k: var(--k-bash); }
-.chip.k-read { --k: var(--k-read); } .chip.k-edit { --k: var(--k-edit); } .chip.k-write { --k: var(--k-write); }
-.chip.k-web { --k: var(--k-web); } .chip.k-ask { --k: var(--k-ask); } .chip.k-driver { --k: var(--k-driver); }
-.chip.k-wait { --k: var(--k-wait); }
-.chip.k-prep { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 1.5px var(--fg); }
-.chip.k-stuck { --k: var(--attn); }
-.chip.live { animation: glow 1.6s ease-in-out infinite; }
-@keyframes glow { 50% { filter: brightness(1.25) saturate(1.2); box-shadow: 0 0 14px -2px var(--k); } }
-.chip.quiet { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 1px var(--line-2); }
-.state { font-size: 11px; padding: 4px 8px; }
-.state i { width: 6px; height: 6px; border-radius: 50%; background: var(--k-ink); opacity: 0.75; }
-.state.live i { animation: pulse 1.2s infinite; }
+.chip.k-think { --h: var(--h-think); --sat: 95%; } .chip.k-say { --h: var(--h-say); --sat: 95%; } .chip.k-bash { --h: var(--h-bash); --sat: 95%; }
+.chip.k-read { --h: var(--h-read); --sat: 95%; } .chip.k-edit { --h: var(--h-edit); --sat: 95%; } .chip.k-write { --h: var(--h-write); --sat: 95%; }
+.chip.k-web { --h: var(--h-web); --sat: 95%; } .chip.k-ask, .n { --h: var(--h-ask); --sat: 95%; } .chip.k-driver { --h: var(--h-driver); --sat: 95%; }
+.chip.k-wait { --h: 35; --sat: 14%; }
+/* not foil: prep is the bare chrome rim; stuck, fail and pass are status colours inside the rim */
+.chip.k-prep { background: linear-gradient(var(--raise), var(--raise)) padding-box, var(--chrome) border-box; color: var(--fg); }
+.chip.k-stuck { background: var(--sheen) padding-box, linear-gradient(var(--attn), var(--attn)) padding-box, var(--chrome) border-box; color: var(--k-ink); }
+.chip.k-fail { background: var(--sheen) padding-box, linear-gradient(var(--crit), var(--crit)) padding-box, var(--chrome) border-box; color: #fff; }
+.chip.k-pass { background: var(--sheen) padding-box, linear-gradient(var(--good), var(--good)) padding-box, var(--chrome) border-box; color: #fff; }
+.chip.live { animation: sheen 2.4s ease-in-out infinite; }
+@keyframes sheen { 0%, 20% { background-position: 100% 0, 0 0, 0 0; } 80%, 100% { background-position: 0 0, 0 0, 0 0; } }
+.n { font: 700 10.5px/1.3 var(--mono); letter-spacing: 0; padding: 0 6px; }   /* requests waiting: the count wears the request foil */
+.chip.quiet { background: none; border: 1px solid var(--line-2); padding: 3px 8px; box-shadow: none; color: var(--muted); }
+.state { font-size: 11px; padding: 3px 9px; }
+.state i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.7; }
 .think summary { display: flex; align-items: center; gap: 9px; }
 .think summary .muted { font: 10.5px var(--mono); }
 .sayblock { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }
@@ -388,7 +409,7 @@ details.fold[open] > summary::after { content: " ▾"; }
 .tl-band:hover { filter: brightness(1.08); }
 .tl-node { display: inline-flex; align-items: center; gap: 6px; height: 22px; box-sizing: border-box; padding: 0 7px 0 3px; overflow: hidden; cursor: pointer; z-index: 1;
   font: 500 11px var(--mono); color: var(--fg); background: var(--raise); border: 1px solid var(--line-2); border-radius: 4px; box-shadow: 0 1px 3px var(--shadow); }
-.tl-node .chip { padding: 2px 4px; font-size: 9.5px; min-width: 0; }
+.tl-node .chip { padding: 1px 5px; border-width: 1.5px; font-size: 9.5px; min-width: 0; }
 .tl-node .nm { overflow: hidden; text-overflow: ellipsis; }
 .tl-node .plus, .tl-node .minus { font-size: 10px; }
 .tl-node:hover { border-color: var(--fg); transform: translateY(-1px); }

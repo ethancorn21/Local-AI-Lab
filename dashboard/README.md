@@ -19,11 +19,16 @@ launchd keeps up.
 | **Agent** (one per agent) | The full feed with a composer (Send, or Stop session & send), and the task panel: goal, acceptance boxes, depends on / unlocks, files it touches, every session on this task, prep notes, `PROGRESS.md`, open requests, this session's numbers. |
 
 What the colours mean. The page is quiet on purpose and only the labels are loud, so a glance says what each agent is
-doing: violet = thinking, lime = answer, orange = bash, sky = read, yellow = edit, teal = write, blue = web search or
-fetch, hot pink-red = a request to you, magenta = the driver (the harness between sessions), grey = waiting for other
-agents. Red and green never label anything: they mean failed and passed. The pane header's chip is the same set for
-the agent's state right now, plus PREP (outlined) during a prep session. The sun/moon button switches between the
-off-white and the dark brown theme (remembered per browser); the page tells Dark Reader to leave it alone.
+doing. The style is Espresso & Foil: a matte brown page, and each label is a foil sticker (a chrome rim around a pastel
+foil in its kind's hue). Violet = thinking, lime = answer, peach-orange = bash, sky = read, gold = edit, aqua = write,
+periwinkle = web search or fetch, pink = a request to you (the board's request count wears it too), orchid = the
+driver (the harness between sessions), silver = another tool, taupe = waiting for other agents. A label for something
+happening right now (thinking, answering, a tool running) has a sheen sliding across it on a loop; the same sheen
+crosses any label on hover, and nothing moves with reduced motion on. Red and green never label anything: they mean
+failed and passed (a tool error, a test run). The pane header's chip is the same set for the agent's state right now,
+plus PREP (the bare chrome rim) during a prep session and STUCK? (amber). Agents' letters are coins in the agent's
+colour with the same rim. The sun/moon button switches between the latte and the espresso theme (remembered per
+browser); the page tells Dark Reader to leave it alone.
 
 What the numbers mean:
 
