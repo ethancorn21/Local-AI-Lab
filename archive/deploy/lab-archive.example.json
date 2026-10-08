@@ -1,0 +1,11 @@
+{
+  "root": "/opt/lab-archive",
+  "hwtemps": "/var/log/hwtemps.csv",
+  "timezone": "America/Chicago",
+  "servers": {
+    "8080": {"gpu": "RTX 3090 Ti", "kind": "vllm"},
+    "8081": {"gpu": "RTX 3090", "kind": "vllm"},
+    "8082": {"gpu": "RTX 5060 Ti", "kind": "llama"}
+  },
+  "agent_gpu": {"a": "RTX 3090 Ti", "b": "RTX 5060 Ti", "c": "RTX 3090", "solo": "RTX 3090 Ti"}
+}

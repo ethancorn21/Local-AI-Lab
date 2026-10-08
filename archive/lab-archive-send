@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# lab-archive-send: on the harness VM, as the agent user (systemd timer lab-archive-send.timer). Ships the agents' history
+# to the AI box's archive, where it is kept for good: every file under each checkout's .agent/ that is new or changed
+# since the last successful run (sessions, ledger, loop log, team events, requests, prep notes), plus a git bundle of
+# the project (all branches: code, task files, memory files) whenever a branch moved. One zstd tar per run.
+#
+# Which projects: only those named in ~/.agent-kit/archive-projects (one per line; "frontpage" also takes its team
+# checkouts frontpage.a, frontpage.b, ...). Names in ~/.agent-kit/dashboard-hidden are never shipped, even if listed.
+# A project not in the list is never read.
+#
+# Where: LAB_ARCHIVE_TARGET, default the ssh host "lab-archive" (its key runs only lab-archive-ingest on the AI box,
+# which stores the stream as a new read-only file and can neither delete nor overwrite). A target starting with "/" is
+# run as a local command instead (tests).
+set -euo pipefail
+P=${LAB_PROJECTS:-$HOME/projects}
+LIST=${LAB_ARCHIVE_LIST:-$HOME/.agent-kit/archive-projects}
+HIDDEN=${LAB_ARCHIVE_HIDDEN:-$HOME/.agent-kit/dashboard-hidden}
+STATE=${LAB_ARCHIVE_STATE:-$HOME/.cache/lab-archive}
+TARGET=${LAB_ARCHIVE_TARGET:-lab-archive}
+log() { echo "lab-archive-send: $*" >&2; }
+
+[ -f "$LIST" ] || { log "no $LIST - nothing to archive"; exit 0; }
+mkdir -p "$STATE"
+t0=$(date +%s)
+stage=$(mktemp -d "$STATE/stage.XXXXXX"); trap 'rm -rf "$stage"' EXIT
+mkdir -p "$stage/bundles"
+: > "$stage/files"; : > "$stage/refs.new"
+since=(); [ -f "$STATE/last" ] && since=(-newer "$STATE/last")
+
+while read -r name _; do
+  name=${name%%#*}
+  [ -n "$name" ] || continue
+  [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || { log "skipped list entry '$name' (not a plain project name)"; continue; }
+  grep -qxF -- "$name" "$HIDDEN" 2>/dev/null && { log "skipped $name (dashboard-hidden)"; continue; }
+  for d in "$P/$name" "$P/$name".[a-z]; do
+    [ -d "$d/.agent" ] || continue
+    rel=${d#"$P"/}
+    # Files and symlinks (a TUI-era iter-NNNN.jsonl links to the session file in iter-NNNN.d/)
+    (cd "$P" && find "$rel/.agent" "${since[@]}" \( -type f -o -type l \) -not -name '*.lock' -print) >> "$stage/files"
+    # The main checkout holds the repository (team checkouts are its worktrees): one bundle covers every branch.
+    if [ -d "$d/.git" ]; then
+      old=$(sed -n "s/^$rel //p" "$STATE/refs" 2>/dev/null || true)
+      refs=$(git -C "$d" for-each-ref --format='%(objectname) %(refname)' | sha1sum | cut -c1-16)
+      if [ "$refs" != "$old" ] && ! git -C "$d" bundle create -q "$stage/bundles/$rel.bundle" --all 2>/dev/null; then
+        log "WARNING: no bundle for $rel - retried next run"; refs=$old
+      fi
+      [ -n "$refs" ] && echo "$rel $refs" >> "$stage/refs.new"
+    fi
+  done
+done < "$LIST"
+
+n=$(grep -c . "$stage/files" || true); nb=$(find "$stage/bundles" -type f | wc -l)
+[ "$n" -gt 0 ] || [ "$nb" -gt 0 ] || { log "nothing new"; touch -d "@$t0" "$STATE/last"; exit 0; }
+date -u +%Y-%m-%dT%H:%M:%SZ > "$stage/MANIFEST"
+{ echo "sent $(hostname) files=$n bundles=$nb"; cat "$stage/refs.new"; } >> "$stage/MANIFEST"
+# Paths in the tar: <project checkout>/.agent/..., bundles/<project>.bundle, MANIFEST. A file that vanishes mid-run
+# (a lock, a session's temp file) is not an error.
+out=$stage/out.tar.zst
+set +e
+nice -n 19 ionice -c3 tar --create --file - --ignore-failed-read --warning=no-file-changed --warning=no-file-removed \
+  -C "$P" --verbatim-files-from --files-from "$stage/files" -C "$stage" MANIFEST bundles \
+  | nice -n 19 zstd -q -T2 -10 > "$out"
+ps=("${PIPESTATUS[@]}"); set -e
+[ "${ps[0]}" -le 1 ] && [ "${ps[1]}" -eq 0 ] || { log "FAILED packing (tar ${ps[0]}, zstd ${ps[1]})"; exit 1; }   # tar 1: a file changed while read
+sum="$(stat -c %s "$out") $(sha256sum "$out" | cut -c1-64)"   # the archive checks both: a dropped upload is refused
+if [[ $TARGET == /* ]]; then reply=$("$TARGET" $sum < "$out" || true); else reply=$(ssh "$TARGET" "$sum" < "$out" || true); fi
+case $reply in
+  stored\ *) touch -d "@$t0" "$STATE/last"; mv "$stage/refs.new" "$STATE/refs"
+             log "$reply ($n files, $nb bundles)" ;;
+  *) log "FAILED: the archive answered '${reply:-nothing}' - will resend next run"; exit 1 ;;
+esac

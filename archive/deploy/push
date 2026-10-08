@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# archive/deploy/push [setup|code]: install the lab archive from this checkout. Run from the Mac.
+#   code   (default) the three programs only
+#   setup  once: the AI box's archive account, directories, config and timers; the VM's key, ssh config, project
+#          list and timer; then the code. Needs AIBOX_ADDR and VM_ADDR (kept out of this public repo).
+# Hosts are ssh aliases with sudo: AIBOX (default aibox), VM (default harnessvm). Accounts: ARCHIVE_USER (labarchive)
+# on the AI box, AGENT_USER (agent) on the VM. Re-running setup changes nothing that is already in place.
+set -euo pipefail
+AIBOX=${AIBOX:-aibox} VM=${VM:-harnessvm} AU=${ARCHIVE_USER:-labarchive} GU=${AGENT_USER:-agent}
+D=$(cd "$(dirname "$0")/.." && pwd)
+what=${1:-code}
+unit() { sed -n "/^# ---- $1: \/etc\/systemd\/system\/$2\$/,/^# ----/p" "$D/deploy/units.example" | sed '1d;/^# ----/d' \
+         | sed "s/<agent-user>/$GU/;s/<archive-user>/$AU/"; }
+
+if [ "$what" = setup ]; then
+  : "${AIBOX_ADDR:?AIBOX_ADDR (the AI box's address as the VM reaches it)}" "${VM_ADDR:?VM_ADDR (the VM's address as the AI box sees it)}"
+  ssh "$AIBOX" "set -e
+    id $AU >/dev/null 2>&1 || { sudo useradd --system --home-dir /var/lib/$AU --create-home --shell /bin/sh $AU; sudo passwd -l $AU >/dev/null; }
+    sudo install -d -o $AU -g $AU -m 0755 /opt/lab-archive /opt/lab-archive/vm /opt/lab-archive/hw /opt/lab-archive/export /opt/lab-archive/cache
+    sudo install -d -o $AU -g $AU -m 0700 /var/lib/$AU/.ssh"
+  [ "$(ssh "$AIBOX" 'test -f /etc/lab-archive.json && echo y || true')" = y ] \
+    || ssh "$AIBOX" 'sudo install -m 0644 /dev/stdin /etc/lab-archive.json' < "$D/deploy/lab-archive.example.json"
+  for u in lab-archive@.service lab-archive-sample.timer lab-archive-nightly.timer; do
+    unit "AI box" "$u" | ssh "$AIBOX" "sudo install -m 0644 /dev/stdin /etc/systemd/system/$u"
+  done
+  # the VM's key: made on the VM by the agent user, allowed on the AI box to run the ingest only, from the VM only
+  pub=$(ssh "$VM" "sudo -u $GU bash -c 'k=\$HOME/.ssh/lab_archive_ed25519; [ -f \$k ] || ssh-keygen -q -t ed25519 -N \"\" -C lab-archive-send -f \$k; cat \$k.pub'")
+  ssh "$AIBOX" "sudo touch /var/lib/$AU/.ssh/authorized_keys
+    grep -qF '${pub#* }' /var/lib/$AU/.ssh/authorized_keys 2>/dev/null || echo 'from=\"$VM_ADDR\",restrict,command=\"/usr/local/bin/lab-archive-ingest\" $pub' | sudo tee -a /var/lib/$AU/.ssh/authorized_keys >/dev/null
+    sudo chown $AU:$AU /var/lib/$AU/.ssh/authorized_keys; sudo chmod 0600 /var/lib/$AU/.ssh/authorized_keys"
+  ssh "$VM" "set -e
+    sudo -u $GU bash -c 'c=\$HOME/.ssh/config; grep -q \"^Host lab-archive\$\" \$c 2>/dev/null || printf \"\nHost lab-archive\n  HostName $AIBOX_ADDR\n  User $AU\n  IdentityFile ~/.ssh/lab_archive_ed25519\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking yes\n  ServerAliveInterval 30\n\" >> \$c
+      l=\$HOME/.agent-kit/archive-projects; [ -f \$l ] || printf \"# projects lab-archive-send ships to the AI box (one per line; a team name takes its checkouts)\nfrontpage\nhollowdeep\n\" > \$l'
+    sudo install -d -m 0755 /opt/lab-archive"
+  for u in lab-archive-send.service lab-archive-send.timer; do
+    unit "harness VM" "$u" | ssh "$VM" "sudo install -m 0644 /dev/stdin /etc/systemd/system/$u"
+  done
+fi
+
+ssh "$AIBOX" 'set -e; t=$(mktemp -d); trap "rm -rf $t" EXIT; tar -C "$t" -xzf -
+  sudo install -m 0755 "$t/lab-archive-ingest" /usr/local/bin/lab-archive-ingest
+  sudo install -m 0755 "$t/lab-archive" /usr/local/bin/lab-archive
+  sudo systemctl daemon-reload; sudo systemctl enable --now lab-archive-sample.timer lab-archive-nightly.timer >/dev/null
+  echo "AI box: sample $(systemctl is-active lab-archive-sample.timer), nightly $(systemctl is-active lab-archive-nightly.timer)"' \
+  < <(tar -C "$D" -czf - lab-archive-ingest lab-archive)
+ssh "$VM" 'set -e; sudo install -m 0755 /dev/stdin /opt/lab-archive/lab-archive-send
+  sudo systemctl daemon-reload; sudo systemctl enable --now lab-archive-send.timer >/dev/null
+  echo "VM: send $(systemctl is-active lab-archive-send.timer), next $(systemctl show -p NextElapseUSecRealtime --value lab-archive-send.timer)"' \
+  < "$D/lab-archive-send"

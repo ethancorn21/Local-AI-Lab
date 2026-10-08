@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""lab-archive: the AI box's side of the lab archive, as the archive account (systemd timers).
+
+  lab-archive sample   every minute: the model servers' counters (tokens generated and read, requests, KV use)
+                       -> <root>/hw/servers/YYYY-MM-DD.jsonl (UTC days)
+  lab-archive seal     nightly: the temperature guard's log split into finished UTC days, times made UTC
+                       -> <root>/hw/hwtemps/YYYY-MM-DD.csv (written once, never changed); leftover upload parts removed
+  lab-archive export   nightly: tidy tables for analysis -> <root>/export/*.csv and README.md (rebuilt every time)
+  lab-archive nightly  seal, then export (the nightly timer)
+
+The VM's uploads (lab-archive-ingest) are <root>/vm/YYYY-MM/*.tar.zst, one per lab-archive-send run, holding only what
+changed since the run before; a file that grows (a ledger, a running session) is in several, and the newest copy wins.
+Each upload is read once: what export needs from it is cached in <root>/cache/<upload>.json (uploads never change).
+Nothing here deletes or rewrites an upload or a sealed day. Everything read from an upload was written on the VM, where
+the agents run as root: it is parsed as data only, never extracted to disk or run.
+
+Config: /etc/lab-archive.json (or $LAB_ARCHIVE_CONFIG), see archive/deploy/lab-archive.example.json.
+"""
+import csv
+import datetime as dt
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+from zoneinfo import ZoneInfo
+
+CONF = json.load(open(os.environ.get("LAB_ARCHIVE_CONFIG", "/etc/lab-archive.json")))
+ROOT = CONF.get("root", "/opt/lab-archive")
+HWTEMPS = CONF.get("hwtemps", "/var/log/hwtemps.csv")
+LOCAL = ZoneInfo(CONF.get("timezone", "America/Chicago"))
+SERVERS = CONF.get("servers", {})        # port -> {"gpu": name, "kind": "vllm"|"llama"}
+AGENT_GPU = CONF.get("agent_gpu", {})    # checkout suffix ("a", "b", ...; "solo" for a one-agent project) -> GPU name
+CACHE_V = 3                              # bump when what the cache holds changes: every upload is read again
+UTC = dt.timezone.utc
+
+
+def log(*a):
+    print("lab-archive:", *a, file=sys.stderr, flush=True)
+
+
+def wopen(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return open(path + ".tmp", "w", newline="")
+
+
+def wdone(path):
+    os.replace(path + ".tmp", path)
+
+
+def iso(t):
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if t else ""
+
+
+def loc(t):
+    return t.astimezone(LOCAL).strftime("%Y-%m-%d %H:%M:%S") if t else ""
+
+
+def ptime(s):
+    """An aware datetime from the harness's ISO times (with offset) or Pi's epoch milliseconds."""
+    if s is None or s == "":
+        return None
+    try:
+        if isinstance(s, (int, float)):
+            return dt.datetime.fromtimestamp(s / 1000, UTC)
+        t = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=LOCAL)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+# ------------------------------------------------------------------------------------------------ sample
+
+def metrics(port):
+    text = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=3).read().decode(errors="replace")
+    want = {"vllm:generation_tokens_total": "gen_tokens", "vllm:prompt_tokens_total": "prompt_tokens",
+            "vllm:num_requests_running": "running", "vllm:num_requests_waiting": "waiting",
+            "vllm:kv_cache_usage_perc": "kv_frac", "llamacpp:tokens_predicted_total": "gen_tokens",
+            "llamacpp:prompt_tokens_total": "prompt_tokens", "llamacpp:requests_processing": "running",
+            "llamacpp:requests_deferred": "waiting"}
+    out = {}
+    for ln in text.splitlines():
+        if ln.startswith("#"):
+            continue
+        key = ln.split("{", 1)[0].split(" ", 1)[0]
+        if key in want:
+            try:
+                out[want[key]] = out.get(want[key], 0) + float(ln.rsplit(" ", 1)[1])
+            except ValueError:
+                pass
+    return out
+
+
+def sample():
+    now = dt.datetime.now(UTC).replace(microsecond=0)
+    lines = []
+    for port, spec in SERVERS.items():
+        row = {"t": iso(now), "port": int(port), "gpu": spec.get("gpu"), "kind": spec.get("kind")}
+        try:
+            row.update(metrics(port), up=True)
+        except Exception:
+            row["up"] = False
+        lines.append(json.dumps(row))
+    path = f"{ROOT}/hw/servers/{now:%Y-%m-%d}.jsonl"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write("".join(l + "\n" for l in lines))
+
+
+# ------------------------------------------------------------------------------------------------ seal
+
+def hwtemps_rows(path=HWTEMPS):
+    """(utc time, fields) for every row of the guard's log. Its times are naive local time, but the guard ran on UTC
+    until the box's first restart after the time zone change (2026-10-04, restart 10-06 ~22:00): rows up to the first
+    backwards jump of the clock are UTC, the rest local. A backwards jump later than that is logged and read as local."""
+    try:
+        fh = open(path, newline="")
+    except OSError:
+        return
+    utc, prev = True, None
+    with fh:
+        for f in csv.reader(fh):
+            if len(f) < 10 or f[0] == "time":
+                continue
+            try:
+                naive = dt.datetime.strptime(f[0], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                continue
+            if prev is not None and naive < prev - dt.timedelta(minutes=10):
+                if utc:
+                    log(f"hwtemps: clock went back {prev} -> {naive}: UTC rows end here, local time from now on")
+                else:
+                    log(f"hwtemps: clock went back again {prev} -> {naive} (read as local)")
+                utc = False
+            prev = naive
+            yield (naive.replace(tzinfo=UTC) if utc else naive.replace(tzinfo=LOCAL)).astimezone(UTC), f
+
+
+HW_HEAD = ["time_utc", "cpu_pkg_c", "cpu_max_core_c", "gpu_index", "gpu", "gpu_c", "gpu_w", "gpu_fan_pct", "gpu_util_pct",
+           "thermal_slowdown"]
+
+
+def seal():
+    today = dt.datetime.now(UTC).date()
+    days, sealed = {}, set(os.path.basename(p)[:10] for p in glob.glob(f"{ROOT}/hw/hwtemps/*.csv"))
+    for t, f in hwtemps_rows():
+        d = t.date().isoformat()
+        if t.date() < today and d not in sealed:
+            days.setdefault(d, []).append([iso(t)] + f[1:10])
+    for d, rows in sorted(days.items()):
+        path = f"{ROOT}/hw/hwtemps/{d}.csv"
+        with wopen(path) as fh:
+            w = csv.writer(fh)
+            w.writerow(HW_HEAD)
+            w.writerows(sorted(rows))
+        os.chmod(path + ".tmp", 0o444)
+        wdone(path)
+        log(f"sealed hwtemps {d}: {len(rows)} rows")
+    # an upload cut off before ingest could clean up (the connection's process was killed)
+    for p in glob.glob(f"{ROOT}/vm/*/.*.part"):
+        if time.time() - os.path.getmtime(p) > 86400:
+            os.unlink(p)
+            log(f"removed leftover upload part {p}")
+
+
+# ------------------------------------------------------------------------------------------------ export: reading uploads
+
+SESSION_RE = re.compile(r"^([^/]+)/\.agent/sessions/(.+\.jsonl)$")
+ITER_RE = re.compile(r"(?:^|/)iter-(\d+)(?:\.jsonl|\.d/)")
+
+
+def summarize_session(fh):
+    """Counts from one Pi session file: both formats (the TUI's session entries, type "message"; headless --mode json
+    events, where each finished message is a "message_end")."""
+    s = {"first": None, "last": None, "turns": 0, "peak_ctx": 0, "input": 0, "output": 0, "reasoning": 0,
+         "tool_calls": 0, "tool_errors": 0, "tools": {}, "model": None, "stop_length": 0}
+    for raw in fh:
+        try:
+            e = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(e, dict):
+            continue
+        typ = e.get("type")
+        if typ == "session" and not s["first"]:
+            s["first"] = e.get("timestamp")
+        m = e.get("message")
+        if typ not in ("message", "message_end") or not isinstance(m, dict):
+            continue
+        ts = m.get("timestamp")
+        if isinstance(ts, (int, float)):
+            s["first"] = s["first"] or ts
+            s["last"] = ts
+        role = m.get("role")
+        if role == "assistant":
+            u = m.get("usage") or {}
+            s["turns"] += 1
+            inp = (u.get("input") or 0) + (u.get("cacheRead") or 0)
+            s["input"] += inp
+            s["peak_ctx"] = max(s["peak_ctx"], inp + (u.get("output") or 0))
+            s["output"] += u.get("output") or 0
+            s["reasoning"] += u.get("reasoning") or 0
+            s["model"] = m.get("model") or s["model"]
+            s["stop_length"] += m.get("stopReason") == "length"
+            for c in m.get("content") or []:
+                if isinstance(c, dict) and c.get("type") in ("toolCall", "tool_use"):
+                    s["tool_calls"] += 1
+                    n = str(c.get("name"))[:40]
+                    s["tools"][n] = s["tools"].get(n, 0) + 1
+        elif role == "toolResult" and m.get("isError"):
+            s["tool_errors"] += 1
+    return s
+
+
+def jsonl(fh):
+    """The JSON objects of a JSON-lines file; any other line is skipped."""
+    out = []
+    for raw in fh:
+        try:
+            o = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+LEDGER_KEYS = ("iter", "task", "kind", "start", "end", "agent_secs", "rc", "timed_out", "agent_commits", "status_after",
+               "verify", "wrapup", "asks_filed", "human_messages", "human_interrupt", "web_searches", "web_fetches",
+               "code_files_saved", "driver_saved_leftovers", "session_error", "harness_id", "prep_bytes")
+
+
+def read_upload(path):
+    """What export needs from one upload: session summaries, iteration -> session links, ledgers, team events."""
+    out = {"v": CACHE_V, "sessions": {}, "links": {}, "ledgers": {}, "events": {}}
+    p = subprocess.Popen(["zstd", "-dcq", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        # an upload that is not a whole tar (written on the VM: anything can arrive) yields what could be read
+        with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
+            for ti in tar:
+                name = ti.name
+                if ti.issym():
+                    m = SESSION_RE.match(name)
+                    if m and ITER_RE.search(name):   # sessions/iter-NNNN.jsonl -> the iteration's session file
+                        c, lk = m.group(1), ti.linkname
+                        if os.path.isabs(lk):   # absolute on the VM: keep the part from the checkout on
+                            i = lk.find(f"/{c}/.agent/")
+                            tgt = lk[i + 1:] if i >= 0 else ""
+                        else:
+                            tgt = os.path.normpath(os.path.join(os.path.dirname(name), lk))
+                        if tgt:
+                            out["links"][tgt] = int(ITER_RE.search(name).group(1))
+                    continue
+                if not ti.isfile():
+                    continue
+                m = SESSION_RE.match(name)
+                if m:
+                    out["sessions"][name] = summarize_session(tar.extractfile(ti))
+                elif name.endswith("/.agent/iterations.jsonl"):
+                    out["ledgers"][name.split("/", 1)[0]] = [{k: r.get(k) for k in LEDGER_KEYS} for r in jsonl(tar.extractfile(ti))]
+                elif name.endswith("/.agent/team/events.jsonl"):
+                    out["events"][name.split("/", 1)[0]] = jsonl(tar.extractfile(ti))
+    except (tarfile.TarError, EOFError, OSError, ValueError) as e:
+        log(f"WARNING: {os.path.basename(path)} is not a readable tar past this point ({e}) - kept what was read")
+    finally:
+        p.stdout.close()
+        if p.wait() != 0:
+            log(f"WARNING: {path} did not decompress cleanly (zstd {p.returncode}) - read what was there")
+    return out
+
+
+def uploads():
+    """The merged view of every upload, newest copy of each file winning."""
+    merged = {"sessions": {}, "links": {}, "ledgers": {}, "events": {}}
+    for path in sorted(glob.glob(f"{ROOT}/vm/*/*.tar.zst"), key=os.path.basename):
+        cp = f"{ROOT}/cache/{os.path.basename(path)}.json"
+        u = None
+        try:
+            u = json.load(open(cp))
+            if u.get("v") != CACHE_V:
+                u = None
+        except (OSError, ValueError):
+            pass
+        if u is None:
+            t0 = time.time()
+            u = read_upload(path)
+            with wopen(cp) as fh:
+                json.dump(u, fh)
+            wdone(cp)
+            log(f"read {os.path.basename(path)}: {len(u['sessions'])} sessions in {time.time() - t0:.0f} s")
+        for k in merged:
+            merged[k].update(u[k])
+    return merged
+
+
+# ------------------------------------------------------------------------------------------------ export: tables
+
+def split_checkout(c):
+    """("frontpage", "a") for a team checkout, ("hollowdeep", "solo") for a one-agent project."""
+    m = re.fullmatch(r"(.+)\.([a-z])", c)
+    return (m.group(1), m.group(2)) if m else (c, "solo")
+
+
+def task_id(t):
+    m = re.search(r"tasks/(\d+[a-z]*)-", t or "")
+    return m.group(1) if m else ""
+
+
+def kind_of(r):
+    if r.get("kind"):
+        return r["kind"]
+    return {"000": "plan", "999": "goal_check"}.get(task_id(r.get("task")), "build")
+
+
+def verdict(v):
+    if v is None:
+        return ""
+    if isinstance(v, dict):
+        return str(v.get("result") or v.get("verdict") or json.dumps(v, sort_keys=True))[:80]
+    return str(v)[:80]
+
+
+def hardware(since=None):
+    """{(gpu, minute utc): [temp, watts, util]} averaged per minute: sealed days, then the live log for the rest."""
+    acc = {}
+    sealed = set()
+    for p in sorted(glob.glob(f"{ROOT}/hw/hwtemps/*.csv")):
+        sealed.add(os.path.basename(p)[:10])
+        with open(p, newline="") as fh:
+            for r in csv.DictReader(fh):
+                t = ptime(r["time_utc"])
+                if t:
+                    acc.setdefault((r["gpu"], t.replace(second=0)), []).append((r["gpu_c"], r["gpu_w"], r["gpu_util_pct"], r["cpu_pkg_c"]))
+    for t, f in hwtemps_rows():
+        if t.date().isoformat() not in sealed:
+            acc.setdefault((f[4], t.replace(second=0)), []).append((f[5], f[6], f[8], f[1]))
+    out = {}
+    for k, vals in acc.items():
+        cols = []
+        for i in range(4):
+            xs = []
+            for v in vals:
+                try:
+                    xs.append(float(v[i]))
+                except (TypeError, ValueError):
+                    pass
+            cols.append(round(sum(xs) / len(xs), 1) if xs else None)
+        out[k] = cols
+    return out
+
+
+def waits_of(events, project, now):
+    """Agent waits from the team's events, as analysis/team-idle.py counts them: a wait ends at wait_end, at a new
+    reason (a new wait starts), at the agent's next event of any kind, or at the team's stop."""
+    def cat(r):
+        if re.search(r"\b000 held|no open tasks", r):
+            return "planning"
+        if re.search(r"\b999 held", r):
+            return "goal_check"
+        return "dependencies_claims_size"
+    rows, open_w = [], {}
+
+    def close(a, t):
+        t0, r = open_w.pop(a)
+        rows.append([project, a, iso(t0), iso(t), loc(t0), round((t - t0).total_seconds() / 60, 1), cat(r), r[:300]])
+    for e in sorted(events, key=lambda e: e.get("time", "")):
+        a, t = e.get("agent"), ptime(e.get("time"))
+        if not t:
+            continue
+        if e.get("event") == "stop":
+            for x in list(open_w):
+                close(x, t)
+            continue
+        if a in open_w:
+            close(a, t)
+        if e.get("event") in ("wait_start", "wait_reason"):
+            open_w[a] = (t, e.get("detail") or "")
+    for a in list(open_w):
+        close(a, now)
+    return rows
+
+
+def export():
+    now = dt.datetime.now(UTC)
+    u = uploads()
+    hw = hardware()
+    ex = f"{ROOT}/export"
+    # session file -> iteration: links (sessions/iter-NNNN.jsonl symlinks), iter-NNNN names, else nearest start
+    by_checkout = {}
+    for path, s in u["sessions"].items():
+        c = path.split("/", 1)[0]
+        it = u["links"].get(path)
+        if it is None and ITER_RE.search(path):
+            it = int(ITER_RE.search(path).group(1))
+        by_checkout.setdefault(c, []).append((it, ptime(s["first"]), s))
+
+    def session_for(c, it, start):
+        best, bd = None, 300
+        for sit, first, s in by_checkout.get(c, []):
+            if sit is not None and sit == it:
+                return s
+            if sit is None and first and start:
+                d = abs((first - start).total_seconds())
+                if d < bd:
+                    best, bd = s, d
+        return best
+
+    sess_head = ["project", "agent", "iteration", "kind", "task_id", "task", "start_utc", "end_utc", "start_local",
+                 "wall_min", "agent_min", "verify", "status_after", "agent_commits", "timed_out", "wrapup", "asks_filed",
+                 "human_messages", "web_searches", "web_fetches", "session_error", "harness_id", "model", "turns",
+                 "peak_context_tokens", "input_tokens", "output_tokens", "reasoning_tokens", "tool_calls", "tool_errors",
+                 "responses_cut_at_length", "gpu", "gpu_energy_wh", "gpu_avg_w"]
+    sessions, tasks = [], {}
+    def add_session(c, project, agent, gpu, r):
+        st, en = ptime(r.get("start")), ptime(r.get("end"))
+        s = session_for(c, r.get("iter"), st) or {}
+        wh, avg = "", ""
+        if gpu and st and en:
+            ws, m = [], st.replace(second=0)
+            while m <= en:
+                v = hw.get((gpu, m))
+                if v and v[1] is not None:
+                    ws.append(v[1])
+                m += dt.timedelta(minutes=1)
+            if ws:   # minutes without a reading are left out of the energy (a gap is not zero watts)
+                wh, avg = round(sum(ws) / 60, 1), round(sum(ws) / len(ws))
+        k = kind_of(r)
+        sessions.append([project, agent, r.get("iter"), k, task_id(r.get("task")), r.get("task") or "", iso(st), iso(en),
+                         loc(st), round((en - st).total_seconds() / 60, 1) if st and en else "",
+                         round((r.get("agent_secs") or 0) / 60, 1), verdict(r.get("verify")), r.get("status_after") or "",
+                         r.get("agent_commits"), r.get("timed_out"), r.get("wrapup") or "", r.get("asks_filed"),
+                         r.get("human_messages"), r.get("web_searches"), r.get("web_fetches"),
+                         str(r.get("session_error") or "")[:120], r.get("harness_id") or "", s.get("model") or "",
+                         s.get("turns", ""), s.get("peak_ctx", ""), s.get("input", ""), s.get("output", ""),
+                         s.get("reasoning", ""), s.get("tool_calls", ""), s.get("tool_errors", ""),
+                         s.get("stop_length", ""), gpu, wh, avg])
+        tid = task_id(r.get("task"))
+        if tid:
+            t = tasks.setdefault((project, tid), {"task": r.get("task"), "sessions": 0, "prep": 0, "minutes": 0.0,
+                                                  "agents": set(), "first": None, "last": None, "wh": 0.0,
+                                                  "accepted": None, "tokens": 0})
+            if k == "prep":
+                t["prep"] += 1
+            else:
+                t["sessions"] += 1
+                t["agents"].add(agent)
+            t["minutes"] += (en - st).total_seconds() / 60 if st and en else 0
+            t["wh"] += wh or 0
+            t["tokens"] += s.get("output") or 0
+            t["first"] = min(x for x in (t["first"], st) if x) if st or t["first"] else None
+            t["last"] = max(x for x in (t["last"], en) if x) if en or t["last"] else None
+            if "accept" in verdict(r.get("verify")).lower():
+                t["accepted"] = en
+    for c, ledger in sorted(u["ledgers"].items()):
+        project, agent = split_checkout(c)
+        gpu = AGENT_GPU.get(agent, "")
+        for r in ledger:
+            try:   # one malformed row (written on the VM) costs only itself
+                add_session(c, project, agent, gpu, r)
+            except (TypeError, ValueError, AttributeError, OverflowError) as e:
+                log(f"WARNING: skipped a ledger row of {c} ({type(e).__name__}: {e})")
+    with wopen(f"{ex}/sessions.csv") as fh:
+        w = csv.writer(fh); w.writerow(sess_head); w.writerows(sessions)
+    wdone(f"{ex}/sessions.csv")
+
+    # team events, waits, and what the events add to tasks (claims, merges, hand-overs, takeovers, splits)
+    ev_rows, wait_rows = [], []
+    for c, evs in sorted(u["events"].items()):
+        project = split_checkout(c)[0]
+        for e in evs:
+            t = ptime(e.get("time"))
+            ev_rows.append([project, iso(t), loc(t), e.get("agent") or "", e.get("event") or "", task_id(e.get("task")),
+                            e.get("task") or "", str(e.get("detail") or "")[:300]])
+            tid = task_id(e.get("task"))
+            if tid and (project, tid) in tasks:
+                tk = tasks[(project, tid)]
+                if e.get("event") == "claim" and t:
+                    tk["claimed"] = min(tk.get("claimed") or t, t)
+                if e.get("event") == "merge" and t:
+                    tk["merged"] = t
+                for kind in ("handover", "takeover", "split_published"):
+                    if e.get("event") == kind:
+                        tk[kind] = tk.get(kind, 0) + 1
+        wait_rows += waits_of(evs, project, now)
+    with wopen(f"{ex}/team_events.csv") as fh:
+        w = csv.writer(fh)
+        w.writerow(["project", "time_utc", "time_local", "agent", "event", "task_id", "task", "detail"])
+        w.writerows(ev_rows)
+    wdone(f"{ex}/team_events.csv")
+    with wopen(f"{ex}/waits.csv") as fh:
+        w = csv.writer(fh)
+        w.writerow(["project", "agent", "start_utc", "end_utc", "start_local", "minutes", "waiting_on", "reason"])
+        w.writerows(wait_rows)
+    wdone(f"{ex}/waits.csv")
+
+    with wopen(f"{ex}/tasks.csv") as fh:
+        w = csv.writer(fh)
+        w.writerow(["project", "task_id", "task", "first_session_utc", "done_utc", "build_sessions", "prep_sessions",
+                    "session_minutes", "agents", "gpu_energy_wh", "output_tokens", "handovers", "takeovers", "splits"])
+        for (project, tid), t in sorted(tasks.items()):
+            done = t.get("merged") or t.get("accepted")
+            w.writerow([project, tid, t["task"], iso(t["first"]), iso(done), t["sessions"], t["prep"], round(t["minutes"], 1),
+                        " ".join(sorted(t["agents"])), round(t["wh"], 1), t["tokens"], t.get("handover", 0),
+                        t.get("takeover", 0), t.get("split_published", 0)])
+    wdone(f"{ex}/tasks.csv")
+
+    with wopen(f"{ex}/hardware_minute.csv") as fh:
+        w = csv.writer(fh)
+        w.writerow(["minute_utc", "minute_local", "gpu", "gpu_c", "gpu_w", "gpu_util_pct", "cpu_pkg_c", "gpu_energy_wh"])
+        for (gpu, m), v in sorted(hw.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+            w.writerow([iso(m), loc(m), gpu, v[0], v[1], v[2], v[3], round(v[1] / 60, 2) if v[1] is not None else ""])
+    wdone(f"{ex}/hardware_minute.csv")
+
+    # model servers: counters -> tokens per minute (a counter that went down = the server restarted: that minute is blank)
+    prev, rows = {}, []
+    for p in sorted(glob.glob(f"{ROOT}/hw/servers/*.jsonl")):
+        for r in jsonl(open(p)):
+            key, t = r.get("port"), ptime(r.get("t"))
+            last = prev.get(key)
+            row = [iso(t), loc(t), r.get("port"), r.get("gpu"), r.get("up")]
+            for c in ("gen_tokens", "prompt_tokens"):
+                cur, old = r.get(c), (last or {}).get(c)
+                row.append(round(cur - old) if cur is not None and old is not None and cur >= old else "")
+            kv = r.get("kv_frac")
+            row += [r.get("running", ""), r.get("waiting", ""), round(100 * kv) if kv is not None else ""]
+            rows.append(row)
+            prev[key] = r
+    with wopen(f"{ex}/servers_minute.csv") as fh:
+        w = csv.writer(fh)
+        w.writerow(["minute_utc", "minute_local", "port", "gpu", "up", "gen_tokens", "prompt_tokens", "requests_running",
+                    "requests_waiting", "kv_cache_pct"])
+        w.writerows(rows)
+    wdone(f"{ex}/servers_minute.csv")
+
+    readme = f"{ex}/README.md"
+    with wopen(readme) as fh:
+        fh.write(EXPORT_README.format(now=iso(now), sessions=len(sessions), tasks=len(tasks), waits=len(wait_rows),
+                                      events=len(ev_rows), hw=len(hw), servers=len(rows)))
+    wdone(readme)
+    log(f"export: {len(sessions)} sessions, {len(tasks)} tasks, {len(wait_rows)} waits, {len(ev_rows)} events, "
+        f"{len(hw)} GPU-minutes, {len(rows)} server samples")
+
+
+EXPORT_README = """# Lab archive export
+
+Built {now} by `lab-archive export` from the archive (`/opt/lab-archive`). Rebuilt nightly; edit copies, not these.
+Times: `*_utc` are UTC; `*_local` are America/Chicago. Agents: `a`, `b`, `c` are a team's agents (one GPU each);
+`solo` is a project run by one agent.
+
+| File | One row per | Rows |
+|---|---|---|
+| `sessions.csv` | agent session (one fresh agent doing one step of one task) | {sessions} |
+| `tasks.csv` | task, totals over its sessions | {tasks} |
+| `waits.csv` | stretch an agent of a team had nothing it could take | {waits} |
+| `team_events.csv` | team event (claim, wait, merge, hand-over, takeover, split, prep...) | {events} |
+| `hardware_minute.csv` | GPU and minute (temperature guard's log, every 15 s, averaged) | {hw} |
+| `servers_minute.csv` | model server and minute | {servers} |
+
+## sessions.csv
+- `kind`: build, prep (planning a later task while idle), plan (task 000), goal_check (task 999).
+- `wall_min`: start to end; `agent_min`: the agent's own time inside it.
+- `verify`: the driver's check of a done claim (accepted / rejected), empty when nothing was claimed.
+- `status_after`: the task's status after the session.
+- `wrapup`: whether the session was told to hand over at its context limit (steered) or stopped (aborted).
+- Tokens: `input_tokens` is everything the model read over the session's turns (each turn rereads the context);
+  `peak_context_tokens` the largest single context; `reasoning_tokens` the thinking part of `output_tokens`.
+- `gpu_energy_wh`: the GPU's measured draw over the session, from the guard's log (whole card, not only this agent's
+  share; blank before the log started on 2026-10-02 or without a GPU mapping).
+
+## tasks.csv
+- `done_utc`: merged into main (team) or accepted (solo); empty while open.
+- `handovers`: given to a bigger agent after 3 sessions without progress; `takeovers`: taken by a faster idle agent;
+  `splits`: the task was split into parts other agents could take.
+
+## waits.csv
+- `waiting_on`: planning (task 000 running), goal_check (task 999 running), dependencies_claims_size (tasks waited on
+  other tasks, claims, or were too big for that agent). `reason` is the driver's own words when the wait started.
+
+## servers_minute.csv
+- `gen_tokens` / `prompt_tokens`: generated and read in that minute (blank across a server restart).
+"""
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "sample":
+        sample()
+    elif cmd == "seal":
+        seal()
+    elif cmd == "export":
+        export()
+    elif cmd == "nightly":
+        seal()
+        export()
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

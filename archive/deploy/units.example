@@ -1,0 +1,64 @@
+# systemd units of the lab archive. `archive/deploy/push setup` writes them; this file is the reference.
+
+# ---- harness VM: /etc/systemd/system/lab-archive-send.service
+[Unit]
+Description=Lab archive: ship new agent history to the AI box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=<agent-user>
+ExecStart=/opt/lab-archive/lab-archive-send
+Nice=19
+IOSchedulingClass=idle
+
+# ---- harness VM: /etc/systemd/system/lab-archive-send.timer
+[Unit]
+Description=Lab archive: ship every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+# ---- AI box: /etc/systemd/system/lab-archive@.service (instances: sample, nightly)
+[Unit]
+Description=Lab archive: %i
+
+[Service]
+Type=oneshot
+User=<archive-user>
+ExecStart=/usr/local/bin/lab-archive %i
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/lab-archive
+ProtectHome=yes
+PrivateTmp=yes
+
+# ---- AI box: /etc/systemd/system/lab-archive-sample.timer
+[Unit]
+Description=Lab archive: model server counters every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+AccuracySec=1s
+Unit=lab-archive@sample.service
+
+[Install]
+WantedBy=timers.target
+
+# ---- AI box: /etc/systemd/system/lab-archive-nightly.timer
+[Unit]
+Description=Lab archive: seal finished days and rebuild the export
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+Unit=lab-archive@nightly.service
+
+[Install]
+WantedBy=timers.target
