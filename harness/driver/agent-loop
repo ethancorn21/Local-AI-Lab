@@ -747,7 +747,7 @@ verify_done() {
 commit_leftovers "uncommitted work found at loop start"
 # One agent session: iteration $i on $task with $PROMPT, in the viewer's tmux window or headless. Sets rc (124 = timeout).
 run_session() {
-  [ -n "${TEAM_DIR:-}" ] && team_state work
+  [ -n "${TEAM_DIR:-}" ] && { team_state work; echo "$([ -n "${PREP:-}${CARVE:-}" ] && printf 'prep ')$task" > "$TEAM/loops/$AGENT_ID.task"; }   # claim_parked
   if [ "$VIEWER" = tui ]; then
     # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds
     # iteration, task, tok/s and elapsed time, and exits Pi when the agent is done). Typing there steers the agent.
@@ -762,7 +762,7 @@ run_session() {
     tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -n "$win"
     tmux list-windows -t "=$sess:" -F '#{window_name}' | grep -qx "$win" || tmux new-window -d -t "=$sess:" -n "$win"
     tmux set-option -w -t "=$sess:$win" remain-on-exit on   # keep the last screen up between iterations
-    if ! tmux respawn-window -k -t "=$sess:$win" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' WRAPUP_PREP_FILE='${PREP_FILE:-}' PI_LOOP_PREP='${PREP:-}' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"; then
+    if ! tmux respawn-window -k -t "=$sess:$win" "cd '$P' && export PATH='$PATH' PI_SKIP_VERSION_CHECK=1 PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK='$task' WRAPUP_HANDOVER='$HANDOVER_MODE' WRAPUP_PREP_FILE='${PREP_FILE:-}' WRAPUP_CARVE='${CARVE:-}' PI_LOOP_PREP='${PREP:-}${CARVE:-}' PI_LOOP_MARKERS='$P/.agent/sessions/iter-$n4.stderr'; timeout --foreground $ITER_TIMEOUT pi --thinking $THINKING --offline --session-dir '$sdir' \"\$(cat .agent/prompt.txt)\"; echo \$? > .agent/rc; tmux wait-for -S $chan"; then
       log "ERROR: could not start the agent in tmux window $AGENT_TMUX - stopping (nothing ran this iteration)"; exit 1
     fi
     tmux display -p -t "=$sess:$win" '#{pane_pid}' > .agent/pi.pid
@@ -772,7 +772,7 @@ run_session() {
     if [ -n "$f" ]; then ln -sf "$(realpath "$f")" ".agent/sessions/iter-$n4.jsonl"; else : > ".agent/sessions/iter-$n4.jsonl"; fi
   elif [ "$AGENT_CMD" = omp ]; then
     hooks=(); for x in "$HOME"/.pi/agent/extensions/*.ts; do hooks+=(--hook "$x"); done
-    PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" PI_LOOP_PREP="${PREP:-}" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
+    PI_LOOP=1 PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" WRAPUP_CARVE="${CARVE:-}" PI_LOOP_PREP="${PREP:-}${CARVE:-}" timeout "$ITER_TIMEOUT" omp -p --mode json --thinking high \
       --session-dir ".agent/sessions/iter-$n4.d" "${hooks[@]}" "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
     spid=$!; echo $spid > .agent/pi.pid
@@ -781,7 +781,7 @@ run_session() {
     rc=$?
     kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
   else
-    PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" PI_LOOP_PREP="${PREP:-}" \
+    PI_LOOP_ITER=$i PI_LOOP_TASK="$task" WRAPUP_PREP_FILE="${PREP_FILE:-}" WRAPUP_CARVE="${CARVE:-}" PI_LOOP_PREP="${PREP:-}${CARVE:-}" \
       timeout "$ITER_TIMEOUT" pi --mode json --thinking "$THINKING" --offline --session-dir .agent/sessions -p "$PROMPT" \
       > ".agent/sessions/iter-$n4.jsonl" 2> ".agent/sessions/iter-$n4.stderr" < /dev/null 9>&- &
     spid=$!; echo $spid > .agent/pi.pid
@@ -791,6 +791,7 @@ run_session() {
     kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
   fi
   rm -f .agent/pi.pid
+  [ -n "${TEAM_DIR:-}" ] && rm -f "$TEAM/loops/$AGENT_ID.task"   # no session: nothing of this agent is parked
 }
 # A prep session (team mode, agent-team-lib "Prep"): notes for a task that starts soon. Its own prompt, no task step:
 # no test baseline, hand-over, verification, merge or session counts; only tasks/prep/<id>.md is kept and published.
@@ -822,7 +823,35 @@ prep_iteration() {  # prep_iteration <task file>
      harness: $harness}' >> "$LEDGER"
   PREP_FILE=""
 }
-[ -n "${TEAM_DIR:-}" ] && { team_state start; team_handover_finish; team_takeover_settle; }   # a hand-over or takeover left half done while this loop was stopped
+# A carve session (team mode, agent-team-lib "Carve"): an idle agent carves new tasks out of one another agent is
+# building. Its own prompt, no task step; only the parts and the carve list are kept, and the driver publishes them.
+carve_iteration() {  # carve_iteration : on $CARVE_KEY, which $CARVE_HOLDER builds ($CARVE_FILE, in its checkout)
+  local h0 t0 s0 t1 s1 wpid
+  task=$CARVE_FILE; n4=$(printf %04d "$i"); PREP_FILE=tasks/carve/$CARVE_KEY.md
+  harness_stamp
+  log "iteration $i: carve $CARVE_KEY, which agent $CARVE_HOLDER builds (harness $HARNESS_ID)"; tev carve_start "tasks/$CARVE_KEY" "agent $CARVE_HOLDER"
+  codemap_sync "before iteration $i"
+  pitfalls_sync "before iteration $i"
+  rm -f .agent/wrapup-now .agent/stalled
+  h0=$(git rev-parse HEAD)
+  PROMPT=$(team_carve_prompt "$CARVE_KEY" "$CARVE_HOLDER" "$CARVE_FILE" "$i")
+  t0=$(date -Iseconds); s0=$(date +%s)
+  team_carve_watch "$CARVE_KEY" "$CARVE_HOLDER" 9>&- & wpid=$!
+  run_session
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  t1=$(date -Iseconds); s1=$(date +%s)
+  [ "$rc" -eq 124 ] && log "iteration $i (carve) hit the ${ITER_TIMEOUT}s timeout"
+  rm -f .agent/stalled .agent/wrapup-now
+  team_carve_finish "$CARVE_KEY" "$CARVE_HOLDER" "$CARVE_FILE" "$h0"
+  archive_sync "after iteration $i"
+  jq -n -c --argjson iter "$i" --arg task "tasks/$(basename "$CARVE_FILE")" --arg start "$t0" --arg end "$t1" --argjson agent_secs "$((s1 - s0))" \
+      --argjson rc "$rc" --arg holder "$CARVE_HOLDER" --arg result "$CARVE_RESULT" --arg harness_id "$HARNESS_ID" --argjson harness "$HARNESS" '
+    {iter: $iter, task: $task, kind: "carve", start: $start, end: $end, agent_secs: $agent_secs, rc: $rc,
+     timed_out: ($rc == 124), status_after: null, verify: null, carve_holder: $holder, carve_result: $result,
+     harness_id: $harness_id, harness: $harness}' >> "$LEDGER"
+  PREP_FILE="" CARVE=""
+}
+[ -n "${TEAM_DIR:-}" ] && { team_state start; rm -f "$TEAM/loops/$AGENT_ID.task"; team_handover_finish; team_takeover_settle; }   # a hand-over or takeover left half done while this loop was stopped
 # team mode: the registry was made at team setup; tasks that arrive later through merges are the agents', not the human's
 if [ -z "${TEAM_DIR:-}" ] || [ ! -f .agent/tasks.json ]; then task-audit init | while IFS= read -r l; do log "$l"; done; fi
 task_scan
@@ -858,7 +887,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
   # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
-  PREP="" FORCED_NOTE=""
+  PREP="" CARVE="" FORCED_NOTE=""
   while :; do
     [ -n "${TEAM_DIR:-}" ] && team_takeover_sync   # claims asked for by a faster agent go to it; work of claims given to this one arrives
     WAITING=$(waiting_tasks)
@@ -876,6 +905,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
       # request about 230 while b only prepared, held no task, and a had prep work it could do)
       if [ -n "${TEAM_DIR:-}" ]; then
         team_takeover_ask && { team_wait; continue; }   # a slower agent's task that others wait on: real work first
+        read -r CARVE_KEY CARVE_HOLDER CARVE_FILE <<<"$(team_carve_target)"   # then new work carved out of a task being built
+        [ -n "$CARVE_KEY" ] && carve_lock "$CARVE_KEY" && { CARVE=1; break; }
         task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
         if [ -n "$(others_tasks)" ]; then team_wait; continue; fi
       fi
@@ -885,6 +916,8 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
       decision=$(team_idle_decision)
       case $decision in
         wait) team_takeover_ask && { team_wait; continue; }   # a slower agent's task that others wait on: real work before prep
+              read -r CARVE_KEY CARVE_HOLDER CARVE_FILE <<<"$(team_carve_target)"   # then new work carved out of a task being built
+              [ -n "$CARVE_KEY" ] && carve_lock "$CARVE_KEY" && { CARVE=1; break; }
               task=$(team_prep_target); [ -n "$task" ] && prep_lock "$task" && { PREP=1; break; }
               team_wait; continue ;;
         stop) log "team: stopping - $(cat "$TEAM/STOP" 2>/dev/null)"; task=""; break ;;
@@ -904,10 +937,11 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     fi
     task=$(goal_check_next); break
   done
-  [ -n "${TEAM_DIR:-}" ] && team_wait_done "$task"
-  [ -n "$task" ] && [ -z "$PREP" ] && rm -f .agent/asks-idle-since   # real work: the request deadline clock stops
-  if [ -z "$task" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
+  [ -n "${TEAM_DIR:-}" ] && team_wait_done "${task:-${CARVE_FILE:-}}"
+  [ -n "$task" ] && [ -z "$PREP" ] && [ -z "$CARVE" ] && rm -f .agent/asks-idle-since   # real work: the request deadline clock stops
+  if [ -z "$task" ] && [ -z "$CARVE" ]; then log "queue empty - stopping"; stop_reason=""; break; fi
   if [ -n "$PREP" ]; then prep_iteration "$task"; continue; fi
+  if [ -n "$CARVE" ]; then carve_iteration; continue; fi
   REVIVED=$(revive_task "$task")   # blocked with no request open, or an unknown status: in-progress, and the prompt says why
   [ -n "${TEAM_DIR:-}" ] && team_prep_handoff "$task"   # another agent still preparing it: its notes first (bounded)
   before=$(agent_commits); head0=$(git rev-parse HEAD); split=""
@@ -944,11 +978,19 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     tn=$(team_takeover_note "$task"); PROMPT="$PROMPT$tn"
     [ -n "$tn" ] && { tev takeover_used "$task"; log "iteration $i continues the work of the agent $task was taken over from"; }
     cn=$(team_cycle_note "$task"); PROMPT="$PROMPT$cn$FORCED_NOTE"
+    vn=$(team_carved_note "$task"); PROMPT="$PROMPT$vn"
     [ -n "$cn" ] && log "iteration $i: $task is part of a cycle of tasks that wait on each other - told to build them together"
-    split=$(team_split_note "$task")
-    if [ -n "$split" ]; then   # why: too big for another agent, or the team idles behind it (agent-team-lib, team_split_note)
-      swhy=${split#" SPLIT THIS TASK FIRST: "}; swhy=${swhy%%. Split what*}
-      PROMPT="$PROMPT$split"; log "$task: this session is told to split it ($swhy)"; tev split_asked "$task" "$swhy"
+    # parts its Depends on line names but nobody wrote (agent-team-lib, missing_deps): written first, published like a split
+    split=$(team_missing_note "$task")
+    if [ -n "$split" ]; then
+      mt=$(missing_deps "$task" | tr '\n' ' ' | sed 's/ $//')
+      PROMPT="$PROMPT$split"; log "$task: its Depends on line names task(s) with no task file ($mt) - this session is told to write them first"; tev parts_missing "$task" "$mt"
+    else
+      split=$(team_split_note "$task")
+      if [ -n "$split" ]; then   # why: too big for another agent, or the team idles behind it (agent-team-lib, team_split_note)
+        swhy=${split#" SPLIT THIS TASK FIRST: "}; swhy=${swhy%%. Split what*}
+        PROMPT="$PROMPT$split"; log "$task: this session is told to split it ($swhy)"; tev split_asked "$task" "$swhy"
+      fi
     fi
   fi
   PROMPT="$PROMPT$REVIVED"
@@ -999,6 +1041,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
               done | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add')
   n4=$(printf %04d "$i")
   rm -f .agent/stalled .agent/handover-now
+  [ -n "$split" ] && { mkdir -p "$TEAM/splitting"; echo "$AGENT_ID" > "$TEAM/splitting/$(claim_key "$task")"; }   # no carve meanwhile (agent-team-lib, Carve)
   twpid=""; [ -n "${TEAM_DIR:-}" ] && { team_session_watch "$task" 9>&- & twpid=$!; }   # takeover requests, answered during the session
   run_session
   [ -n "$twpid" ] && { kill "$twpid" 2>/dev/null; wait "$twpid" 2>/dev/null; }
@@ -1018,7 +1061,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     leftovers=true; code_leftovers=$(git status --porcelain | grep -cvE ' (PROGRESS|DECISIONS|CODEMAP)\.md$| codemap/')
   fi
   commit_leftovers "uncommitted work after iteration $i"
-  [ -n "${TEAM_DIR:-}" ] && team_takeover_settle   # claims given away during the session: their files leave this branch before anything is verified
+  [ -n "${TEAM_DIR:-}" ] && { team_takeover_settle; team_carve_apply; }   # claims given away during the session leave this branch, carves of its task are marked, before anything is verified
   if [ "$(agent_commits)" -gt "$before" ]; then no_progress=0
   elif [ "$code_leftovers" -gt 0 ]; then no_progress=0; log "no agent commit, but the driver saved $code_leftovers changed code file(s) - counts as progress"
   elif ! server_ok; then log "model server down during iteration $i - not counted toward the no-progress limit"
@@ -1038,7 +1081,7 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
         log "$task: every box ticked but the status was left open - closed by the driver, verifying"
       fi ;;
   esac
-  [ -n "$split" ] && team_publish_split "$task" "$head0"
+  [ -n "$split" ] && { team_publish_split "$task" "$head0"; rm -f "$TEAM/splitting/$(claim_key "$task")"; }
   status_after=$(status_of "$task")
   [ "$status_after" = done ] && verify_done "$task"
   [ "$VERIFY" = accepted ] && withdraw_asks_of "$task"

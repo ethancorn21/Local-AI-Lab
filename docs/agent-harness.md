@@ -184,6 +184,38 @@ merged from the others', so tasks the agents created do not become the human's.
   gives it after. Only that task's work moves with it (`team-takeover paths`: its commits by subject and ledger); the
   new owner's first prompt says it was taken over. Requests to the human live in the asking agent's checkout, so an
   answered request about a task another agent now holds is forwarded to that agent's inbox.
+- **Parked claims go to any idle agent.** A claim whose holder is in a session on another task, or in a prep or carve
+  session (`.agent/team/loops/<id>.task` exists only while a session runs), can be asked for by any agent with nothing
+  to build, slower or not, whatever waits on it; it is given at once. Between sessions nothing is parked, and a claim in
+  a cycle is never asked for this way (the cycle rule gathers it): both happened in the end-to-end test, where two
+  waiting agents passed one claim back and forth every second. Why: on 2026-10-07 agent a held 236 while it built 234 for
+  90 minutes; 236 headed the longest chain left (236, 237, 238) and its split was designed, but b and c, both slower
+  than a, waited 90 and 30 minutes, because only a faster agent could ask.
+- **Parts named but never written are written first.** A `Depends on:` number with no task file in `main` or the
+  checkout is work to create, not work to wait for: the task is workable, and its session is told to write those parts
+  first (`CREATE THE PARTS FIRST`), with exactly those numbers, then end; the driver publishes them like a split. Why:
+  on 2026-10-07 agent a's split session added 236's parts 259-262 to its `Depends on:` line and ended without writing
+  them ("next session creates them"); the driver published 236, which then waited for four tasks that did not exist, so
+  no session on it ever came. The console board now marks such a dependency "not written".
+- **Carve: idle agents divide the task being built.** An agent with nothing to build, no claim to take over and before
+  any prep, carves the work another agent has not started out of the task that agent is building now: new top-level
+  tasks (the parts) that it and the other idle agents build at the same time. Target: a claim being built (not
+  parked), at least two unticked boxes, no `Split: no`, no split session on it, readable within the prep budget, not
+  tried on this version of the holder's task file; the highest rank first; one carver per task. The carve session
+  (`CARVE SESSION` prompt, no hand-over, no requests to the human) reads the holder's task live, read only, its boxes
+  numbered and the files the holder changed so far, and writes the parts (`Carved from: <key>`) plus
+  `tasks/carve/<key>.md` ("<box> -> <part>" per moved box, or `none: <reason>`). `team-carve check` passes it only if
+  the moved boxes are unticked, the holder keeps one, every part takes a box, is open, has `Depends on:` (never the
+  holder's task) and `Touches:` (none of the holder's changed files), and at least one part can start now; nothing else
+  of the session is kept. Published: the parts into `main`, their numbers added to every open task in `main` that
+  waits for the holder's task, the parts' files left out of the holder's `Touches:` at once (`.agent/team/carved/<key>`),
+  and a `[driver]` message in the holder's inbox, delivered after its current turn ("do not build those boxes or change
+  those files"). Right after its session, before verifying, the holder's loop marks the boxes `- [moved to <part>]`
+  (found by their text) and takes the files off its `Touches:` line; its next prompt says so once. A box the holder
+  ticked anyway stays ticked and is logged (`carve_conflict`). While a carve is under way or waits to be applied, the
+  holder gets no idle split. Why: on 2026-10-07 agent a built 234 for 90 minutes while c had nothing to build for 30
+  and b for 90; the holder-side split waits for the holder's next session and 20 idle minutes, and a's 19:46 split of
+  234 gave nobody work (its new task 263 depended on 234). `TEAM_CARVE=0` turns it off.
 - **Cycles.** Tasks whose `Depends on:` lines wait on each other (directly, through a chain, or a parent through its
   subtasks) can never start one after the other. Before every pick the driver finds them (`team-takeover cycles`) and
   gives all of a cycle's tasks to one agent: the fastest of the agents holding them, then the one holding most of the
@@ -214,7 +246,8 @@ merged from the others', so tasks the agents created do not become the human's.
   cannot slow it down and fail it.
 - **Planning for a team.** The planning task must give every task `Depends on:` and `Touches:`. `plan-schedule`
   replays the schedule and sends the plan back once if shared files would make agents wait.
-- **Idle and stop.** An agent with nothing to take prepares a task (below) or waits for the others. When nobody holds
+- **Idle and stop.** An agent with nothing to take asks for a claim it can take over, else carves, else prepares a task
+  (below), else waits for the others. When nobody holds
   work, one agent runs the goal check; if it adds nothing, the team stops.
 
 ### Prep: work for an idle agent

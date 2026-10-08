@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""team-carve : the decisions behind a carve in team mode (agent-team-lib, "Carve"); bash does the moving.
+
+An idle agent carves the work another agent has not started out of the task that agent is building, as new top-level
+tasks (the parts) that it and the other idle agents build at the same time. frontpage 2026-10-07: agent a built 234 for
+90 minutes while agent c had nothing to build for 30 minutes and agent b for 90.
+
+team-carve check <key> <holder's task file> <carve list> <main's tasks dir> <part file>...
+    Whether a carve session's parts may go into main. stdin, written by agent-team-lib's team_carve_finish:
+        changed TAB <path>                      a file the holder changed on its branch or has uncommitted
+        claim TAB <key> TAB <touches ...>       another claim (not the holder's), its Touches paths
+    The carve list (tasks/carve/<key>.md) has one line per moved box, "<box number> -> <part number>", the boxes
+    numbered as `task_boxes` numbers them (every "- [ ]" / "- [x]" line above "## Hand-over", from 1), or one line
+    "none: <reason>".
+    A carve passes when: every moved box is a box of the holder's task that is not ticked; the holder keeps at least one
+    unticked box; every part takes at least one box, is open, has a `Depends on:` line (not on the holder's task) and a
+    `Touches:` line (no file the holder changed) and an unticked box, and its number is new to main; and at least one
+    part can start now (its dependencies done in main; its Touches clear of the other claims and of what stays in the
+    holder's Touches).
+    stdout when it passes (exit 0):
+        box <n> <part>       per moved box
+        text <n> <line>      its first line, as the holder's task file has it (the holder may renumber its boxes before
+                             the carve reaches it: apply finds the box by this text first)
+        files <paths ...>    the holder's Touches paths that go to the parts (equal to, or inside, a part's path)
+        start <parts ...>    the parts that can start now
+    "none <reason>" (exit 2) for a carve list that says none; reasons on stderr (exit 1) when it fails.
+
+team-carve apply <task file> <carved file>
+    The holder's side, in its own checkout, from $TEAM/carved/<key> (lines "boxes <n>:<part> ...", "text <n> <line>",
+    "files <path> ..."): each moved box that is still unticked becomes "- [moved to <part>]" - found by its text, else by
+    its number; its files leave the `Touches:` line. Prints "ticked <n>" for a moved box the holder ticked meanwhile
+    (left as it is), "lost <n>" for one it no longer finds.
+"""
+import os, re, sys
+
+BOX = re.compile(r"^(\s*)- \[([ x])\]")
+PATHLIKE = re.compile(r"^(\.|\*|[A-Za-z0-9_@.*/-]*[./][A-Za-z0-9_@.*/-]*)$")
+DEP = re.compile(r"\b\d+[a-z]*\b")
+LIST = re.compile(r"^\s*(\d+)\s*(?:->|→|:)\s*(\d+[a-z]*)\s*$")
+
+
+def read(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def field(text, name):
+    m = re.search(rf"^{name}:[ \t]*(.*)$", text, re.M | re.I)
+    return m.group(1) if m else None
+
+
+def norm(p):   # the same as agent-team-lib's touches_of
+    p = re.sub(r"^\./", "", p)
+    p = re.sub(r"/?\*+$", "", p)
+    p = re.sub(r"/+$", "", p)
+    return p or "."
+
+
+def touches(text):
+    line = field(text, "Touches")
+    if line is None:
+        return None
+    words = line.replace("`", "").replace(",", " ").replace(";", " ").split()
+    return [norm(w) for w in words if PATHLIKE.match(w)]
+
+
+def overlap(x, y):
+    return x == "." or y == "." or x == y or x.startswith(y + "/") or y.startswith(x + "/")
+
+
+def box_lines(text):   # (ticked, first line) per box above the hand-over, numbered from 1 as task_boxes numbers them
+    out = []
+    for line in text.split("\n## Hand-over", 1)[0].splitlines():
+        m = BOX.match(line)
+        if m:
+            out.append((m.group(2) == "x", BOX.sub("", line, count=1).strip()))
+    return out
+
+
+def boxes(text):
+    return [t for t, _ in box_lines(text)]
+
+
+def task_id(path):
+    return os.path.basename(path).split("-", 1)[0]
+
+
+def key_of(tid):
+    m = re.match(r"\d+", tid)
+    return str(int(m.group(0))) if m else tid
+
+
+def canon(tid):   # 025b and 25b are one task
+    m = re.match(r"(\d+)([a-z]*)", tid)
+    return str(int(m.group(1))) + m.group(2) if m else tid
+
+
+def status(text):
+    m = re.match(r"\s*Status:\s*(\S+)", text or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
+def check(key, holder_file, carve_list, main_tasks, part_files):
+    errs = []
+    holder = read(holder_file) or ""
+    hlines = box_lines(holder)
+    hboxes = [t for t, _ in hlines]
+    changed, claims = [], []
+    for line in sys.stdin:
+        f = line.rstrip("\n").split("\t")
+        if f[0] == "changed" and len(f) > 1 and f[1]:
+            changed.append(norm(f[1]))
+        elif f[0] == "claim" and len(f) > 2:
+            claims.append((f[1], f[2].split()))
+    text = read(carve_list)
+    if text is None:
+        print(f"no carve list ({os.path.basename(carve_list)})", file=sys.stderr)
+        return 1
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    for l in lines:
+        if l.strip().lower().startswith("none"):
+            print("none " + re.sub(r"^none\s*:?\s*", "", l.strip(), flags=re.I))
+            return 2
+    moves = {}
+    for l in lines:
+        m = LIST.match(l)
+        if not m:
+            errs.append(f"carve list line not '<box> -> <part>': {l.strip()[:80]}")
+            continue
+        n, part = int(m.group(1)), m.group(2)
+        if not 1 <= n <= len(hboxes):
+            errs.append(f"box {n}: {key} has {len(hboxes)} boxes")
+        elif hboxes[n - 1]:
+            errs.append(f"box {n} is ticked already")
+        elif n in moves and moves[n] != part:
+            errs.append(f"box {n} moved twice")
+        moves[n] = part
+    if not moves:
+        errs.append("the carve list moves no box")
+    kept = [i for i, x in enumerate(hboxes, 1) if not x and i not in moves]
+    if not kept:
+        errs.append(f"agent holding {key} would keep no unticked box (leave it the step it is on)")
+    listing = [f for f in os.listdir(main_tasks) if f.endswith(".md")] if os.path.isdir(main_tasks) else []
+    main_ids = {canon(f.split("-", 1)[0]) for f in listing}
+    done = {canon(f.split("-", 1)[0]) for f in listing if status(read(os.path.join(main_tasks, f))) in ("done", "dropped")}
+    parts = {}
+    for pf in part_files:
+        t = read(pf) or ""
+        pid = task_id(pf)
+        p = {"deps": None, "touches": touches(t), "file": pf}
+        d = field(t, "Depends on")
+        p["deps"] = None if d is None else [x for x in DEP.findall(d)]
+        if status(t) != "open":
+            errs.append(f"part {pid}: Status is not open")
+        if p["deps"] is None:
+            errs.append(f"part {pid}: no `Depends on:` line")
+        elif any(key_of(x) == key_of(key) for x in p["deps"]):
+            errs.append(f"part {pid} depends on {key}: it would wait for the agent it is to run beside")
+        if p["touches"] is None:
+            errs.append(f"part {pid}: no `Touches:` line")
+        else:
+            hit = sorted({c for c in changed for x in p["touches"] if overlap(c, x)})
+            if hit:
+                errs.append(f"part {pid} touches file(s) agent holding {key} changed: {' '.join(hit[:5])}")
+        if not any(not x for x in boxes(t)):
+            errs.append(f"part {pid}: no unticked acceptance box")
+        if canon(pid) in main_ids:
+            errs.append(f"part {pid}: task {pid} exists in main already")
+        parts[pid] = p
+    if not parts:
+        errs.append("no part task file written")
+    for n, pid in moves.items():
+        if pid not in parts:
+            errs.append(f"box {n} moves to {pid}, which is not a new task file of this session")
+    for pid in parts:
+        if pid not in moves.values():
+            errs.append(f"part {pid} takes no box of {key}")
+    htouch = touches(holder) or []
+    ptouch = [x for p in parts.values() for x in (p["touches"] or [])]
+    gone = [h for h in htouch if any(h == x or h.startswith(x + "/") for x in ptouch)]
+    stays = [h for h in htouch if h not in gone]
+    others = [(k, ts) for k, ts in claims] + [(key, stays)]
+    start = []
+    for pid, p in parts.items():
+        if p["deps"] is None or p["touches"] is None:
+            continue
+        if any(canon(x) not in done for x in p["deps"]):
+            continue
+        if any(overlap(x, y) for _, ts in others for x in p["touches"] for y in ts):
+            continue
+        start.append(pid)
+    if parts and not start:
+        errs.append("no part can start now (each waits for unfinished tasks or touches files another task holds)")
+    if errs:
+        for e in errs:
+            print(e, file=sys.stderr)
+        return 1
+    for n in sorted(moves):
+        print(f"box {n} {moves[n]}")
+    for n in sorted(moves):
+        print(f"text {n} {hlines[n - 1][1]}")
+    print("files " + " ".join(gone))
+    print("start " + " ".join(sorted(start)))
+    return 0
+
+
+def apply(task_file, carved_file):
+    moves, texts, paths = {}, {}, set()
+    for l in (read(carved_file) or "").splitlines():
+        kind, _, rest = l.partition(" ")
+        if kind == "boxes":
+            for a in rest.split():
+                n, _, part = a.partition(":")
+                moves[int(n)] = part
+        elif kind == "text":
+            n, _, t = rest.partition(" ")
+            texts[int(n)] = t.strip()
+        elif kind == "files":
+            paths = {norm(p) for p in rest.split()}
+    text = read(task_file)
+    if text is None:
+        print(f"no task file {task_file}", file=sys.stderr)
+        return 1
+    lines = text.splitlines(keepends=True)
+    above, where = True, []   # (line index, ticked, first line) per box above the hand-over
+    for i, line in enumerate(lines):
+        if line.startswith("## Hand-over"):
+            above = False
+        m = BOX.match(line) if above else None
+        if m:
+            where.append((i, m.group(2) == "x", BOX.sub("", line, count=1).strip()))
+    used = set()
+    for n, part in sorted(moves.items()):
+        hit = [w for w in where if texts.get(n) and w[2] == texts[n] and w[0] not in used]
+        if not hit and not texts.get(n) and 1 <= n <= len(where):
+            hit = [where[n - 1]]
+        if not hit:
+            print(f"lost {n}")
+            continue
+        i, ticked, _ = hit[0]
+        used.add(i)
+        if ticked:
+            print(f"ticked {n}")
+        else:
+            lines[i] = BOX.sub(lambda mm: f"{mm.group(1)}- [moved to {part}]", lines[i], count=1)
+    out, above = [], True
+    for line in lines:
+        if line.startswith("## Hand-over"):
+            above = False
+        if above and paths and re.match(r"Touches:", line, re.I):
+            head, _, rest = line.partition(":")
+            nl = "\n" if rest.endswith("\n") else ""
+            items = [x.strip() for x in rest.strip().split(",") if x.strip()]
+            keep = [x for x in items if norm(x.replace("`", "").strip()) not in paths]
+            line = f"{head}: {', '.join(keep) if keep else 'none'}{nl}"
+        out.append(line)
+    with open(task_file + ".carve-tmp", "w") as f:
+        f.write("".join(out))
+    os.replace(task_file + ".carve-tmp", task_file)
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) >= 5 and a[0] == "check":
+        sys.exit(check(a[1], a[2], a[3], a[4], a[5:]))
+    if len(a) == 3 and a[0] == "apply":
+        sys.exit(apply(a[1], a[2]))
+    print(__doc__, file=sys.stderr)
+    sys.exit(64)
+
+
+if __name__ == "__main__":
+    main()

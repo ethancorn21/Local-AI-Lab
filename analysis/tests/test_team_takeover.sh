@@ -62,8 +62,8 @@ claim b 253 253-flow.md; claim b 243 243b-fix.md; claim b 270 270-asked.md
 # --- the ask ---
 mkdir -p "$P.b/.agent/asks"; printf 'status: open\nblocking: yes\ntask: tasks/270-asked.md\n' > "$P.b/.agent/asks/001.md"
 facts=$(as a team_takeover_facts)
-grep -qP '^253\tb\t1\t4\t3\t$' <<<"$facts" && ok "facts: 253 held by b (speed 1 < 4), rank 3, a could build it" || bad "facts 253: $(grep '^253' <<<"$facts")"
-grep -qP '^270\tb\t1\t4\t2\twaits for the human$' <<<"$facts" && ok "facts: 270 waits for the human's answer in b's checkout" || bad "facts 270: $(grep '^270' <<<"$facts")"
+grep -qP '^253\tb\t1\t4\t3\t\t0$' <<<"$facts" && ok "facts: 253 held by b (speed 1 < 4), rank 3, a could build it" || bad "facts 253: $(grep '^253' <<<"$facts")"
+grep -qP '^270\tb\t1\t4\t2\twaits for the human\t0$' <<<"$facts" && ok "facts: 270 waits for the human's answer in b's checkout" || bad "facts 270: $(grep '^270' <<<"$facts")"
 grep -qP '^243\tb\t1\t4\t1\t' <<<"$facts" && ok "facts: 243 has rank 1 (nothing waits on it)" || bad "facts 243: $(grep '^243' <<<"$facts")"
 [ "$(as a team_takeover_candidate)" = 253 ] && ok "a's candidate: 253" || bad "candidate: $(as a team_takeover_candidate)"
 [ -z "$(as b team_takeover_candidate)" ] && ok "b asks a faster agent for nothing" || bad "b's candidate: $(as b team_takeover_candidate)"

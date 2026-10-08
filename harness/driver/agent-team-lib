@@ -118,9 +118,32 @@ unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (o
   done
   return 0
 }
-touches_of() {  # the task's Touches: paths, normalised (no ./, no trailing / or globs); words that are not paths dropped
+# Parts named but never written: frontpage 2026-10-07, agent a's split session designed 236's parts 259-262, added them
+# to its `Depends on:` line and ended ("next session creates them"); the driver published 236, and from then on 236
+# waited for four tasks that did not exist, so no session on it ever came to write them. 237 and 238 waited behind it
+# while two agents sat idle. A dependency with no task file anywhere is work to create, not work to wait for: the task
+# is workable, and its session is told to write the parts first (team_missing_note).
+missing_deps() {  # missing_deps <task file> [checkout] : its dependencies with no task file in main or in that checkout (default: this one)
+  local d
+  for d in $(deps_of "$1"); do
+    [[ $d =~ ^[0-9]+$ ]] && d=$(printf %03d "$((10#$d))")
+    compgen -G "$TEAM_DIR/tasks/$d-*.md" > /dev/null || compgen -G "${2:-.}/tasks/$d-*.md" > /dev/null || echo "$d"
+  done
+  return 0
+}
+team_missing_note() {  # team_missing_note <task file> : the prompt's order to write the parts its Depends on line names, or nothing
+  local m; m=$(missing_deps "$1" | tr '\n' ' ' | sed 's/ $//; s/ /, /g'); [ -n "$m" ] || return 0
+  printf '%s' " CREATE THE PARTS FIRST: this task's \`Depends on:\` line names task(s) $m, but no task file exists for them (a split named its parts and the session ended before writing them). Before anything else, write each one as tasks/<number>-<name>.md with exactly that number: a new top-level task with a Goal, testable Acceptance criteria, a \`Depends on:\` line and a \`Touches:\` line, from this task's hand-over and notes (where a split was designed there, follow that design). If a number names no real work, remove it from this task's \`Depends on:\` line instead. Move the acceptance boxes the parts deliver out of this task and cut its \`Touches:\` line to the files it still changes itself. Never both ways: a part must not wait for this task while this task waits for it. Commit and end the session: the driver puts these task files into main at once, so the other agents can take the parts."
+}
+touches_raw() {  # the task's Touches: paths, normalised (no ./, no trailing / or globs); words that are not paths dropped
   sed -n 's/^Touches:[[:space:]]*//Ip' "$1" | head -1 | tr -d '`' | tr ',;' '  ' | tr -s ' ' '\n' \
     | grep -E '^(\.|\*|[A-Za-z0-9_@.*/-]*[./][A-Za-z0-9_@.*/-]*)$' | sed -E 's#^\./##; s#/?\*+$##; s#/+$##; s#^$#.#' || true
+}
+touches_of() {  # touches_raw, less the paths a carve gave to its parts and the holder has not taken off its Touches yet (Carve below)
+  local c=""
+  [ -n "${TEAM_DIR:-}" ] && [ "$(task_id "$1")" = "$(claim_key "$1")" ] && c=$TEAM/carved/$(claim_key "$1")
+  if [ -n "$c" ] && [ -f "$c" ]; then touches_raw "$1" | grep -vxF -f <(sed -n 's/^files //p' "$c" | tr ' ' '\n' | grep .) || true
+  else touches_raw "$1"; fi
 }
 overlap() {  # overlap <task A> <task B> : a Touches path of one equals or contains one of the other's
   local x y
@@ -139,7 +162,8 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
   if [ -f "$TEAM/handed/$k" ] && [ "$(cut -d' ' -f1 "$TEAM/handed/$k")" = "$AGENT_ID" ]; then echo "handed over to a bigger agent"; return 0; fi
   # Own work too waits for its declared dependencies: frontpage 2026-10-03, an agent spent 8 sessions on a subtask
   # that needed another agent's unfinished task (it builds stand-ins instead of the feature). Claim is kept.
-  u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }
+  # (parts it names that have no task file yet are written first, whatever else it waits for: missing_deps above)
+  if [ -z "$(missing_deps "$1")" ]; then u=$(unmet_deps "$1"); [ -n "$u" ] && { echo "waits for $(echo $u | tr ' ' ,)"; return 0; }; fi
   [ -n "$o" ] && return 0   # own claim: subtasks and continuing work, no other checks
   u=$(done_in_main "$1"); [ -n "$u" ] && { echo "already $u in main"; return 0; }
   # An agent with a smaller context window (TEAM_MAX_TOUCHES in its env file) leaves big tasks to the others: on
@@ -313,6 +337,7 @@ team_split_note() {  # team_split_note <task file> : the split instruction for a
   if [ -n "$lim" ] && [ "$n" -gt "$lim" ]; then
     why="it changes $n files, and another agent can only take tasks of at most $lim files, so as one task it waits for you alone"
   else
+    { carve_busy "$(claim_key "$1")" || [ -f "$TEAM/carved/$(claim_key "$1")" ]; } && return 0   # an idle agent is carving it (Carve below)
     w=$(team_idle_waiter "$1"); [ -n "$w" ] || return 0
     why="$w, and other open tasks wait on this one, so as one task it keeps them waiting for you alone"
   fi
@@ -477,6 +502,10 @@ team_pick_order() {  # the task files in the order this agent takes them: the pl
 #     (dependencies done in main, its own size limit, no file overlap with any other claim, no open request to the
 #     human about it); the highest rank first (team-takeover pick). $TEAM/takeover/<key>/asker = "<asker> <loop pid>
 #     <epoch> <asker's checkout>". Then it waits: the answer takes seconds, or one hand-over of the holder's session.
+#   - parked claims: any agent with nothing to build, faster or not, asks for a claim whose holder is building another
+#     task (claim_parked; $TEAM/takeover/<key>/why = parked), whatever waits on it. frontpage 2026-10-07: agent a held
+#     236 while it built 234 for 90 minutes; 236 was the head of the longest chain left (236 -> 237 -> 238), its split
+#     was designed, and agents b and c, both slower than a, waited 90 and 30 minutes because only a faster agent could ask.
 #   - answering: only the holder's loop changes its claim. Between sessions it gives the claim at once; during a session
 #     on that task, wrapup's driver signal (.agent/handover-now) makes the session write its hand-over and end, and the
 #     claim goes after it; during a session on another task (the claim is parked), its watcher gives it at once.
@@ -485,14 +514,6 @@ team_pick_order() {  # the task files in the order this agent takes them: the pl
 #     The holder's branch gets those paths back as main has them (its other claims' work stays): at once between
 #     sessions, else right after the session, before anything of that branch is verified or merged.
 agent_running() { local f=$TEAM/loops/$1.pid; [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; }
-team_has_slower() {  # another running agent is slower than this one (only then can this one take anything over)
-  local id me; me=$(agent_speed "$AGENT_ID")
-  for id in $(live_agents); do
-    [ "$id" = "$AGENT_ID" ] && continue
-    awk -v o="$(agent_speed "$id")" -v m="$me" 'BEGIN { exit !(o < m) }' && return 0
-  done
-  return 1
-}
 team_takeover_why_not() {  # team_takeover_why_not <holder's checkout> <key> : why this agent could not build that claim now (empty: it could)
   local hw=$1 k=$2 top s t q pending="" startable=""
   top=$(compgen -G "$hw/tasks/$k-*.md" | head -1); [ -n "$top" ] || { echo "no task file"; return 0; }
@@ -501,7 +522,10 @@ team_takeover_why_not() {  # team_takeover_why_not <holder's checkout> <key> : w
     [ -f "$q" ] && grep -qx 'status: open' "$q" || continue
     t=$(sed -n 's/^task: //p' "$q" | head -1); [ -n "$t" ] && [ "$(claim_key "$t")" = "$k" ] && { echo "waits for the human"; return 0; }
   done
-  t=$(unmet_deps "$top"); [ -n "$t" ] && { echo "waits for $(echo $t | tr ' ' ,)"; return 0; }
+  if [ -z "$(missing_deps "$top" "$hw")" ]; then t=$(unmet_deps "$top"); [ -n "$t" ] && { echo "waits for $(echo $t | tr ' ' ,)"; return 0; }; fi
+  # a cycle's tasks are gathered on one agent by the cycle rule (Cycles below), never asked for one by one
+  [ -n "$TEAM_CYCLES" ] && awk -F'\t' -v k="$k" '{ n = split($2, x, " "); for (i = 1; i <= n; i++) { id = x[i]; sub(/[a-z]+$/, "", id); if (id + 0 == k + 0) f = 1 } } END { exit !f }' <<<"$TEAM_CYCLES" \
+    && { echo "part of a cycle"; return 0; }
   for t in "$hw"/tasks/$k[a-z]*-*.md; do   # split: an unfinished subtask must be able to start
     [ -f "$t" ] || continue
     case $(status_of "$t") in done|dropped) continue ;; open|in-progress) [ -z "$(unmet_deps "$t")" ] && startable=1 ;; esac
@@ -517,21 +541,35 @@ team_takeover_why_not() {  # team_takeover_why_not <holder's checkout> <key> : w
   done
   return 0
 }
+team_planning() {  # a plan is being made: 000 open in main, or an agent holds it (a re-plan after a GOAL.md change runs
+  # on that agent's branch; the plan may rewrite every task, so nothing is taken over or carved meanwhile)
+  local m; m=$(compgen -G "$TEAM_DIR/tasks/000-*.md" | head -1)
+  { [ -n "$m" ] && [ "$(status_of "$m")" != done ]; } || [ -n "$(claim_owner 000)" ]
+}
+claim_parked() {  # claim_parked <holder> <key> : the holder is in a session on another task, or a prep or carve session
+  # (loops/<id>.task exists only while a session runs). Between sessions nothing is parked: the holder may be verifying
+  # the claim, or about to start it (a claim just taken still showed the last session's task, and two waiting agents
+  # passed one claim back and forth every second: test_team_deadlock_e2e, 2026-10-07).
+  local cur; [ -f "$TEAM/loops/$1.task" ] && read -r cur < "$TEAM/loops/$1.task" || return 1
+  [[ $cur == prep\ * ]] && return 0
+  [ "$(claim_key "$cur")" != "$2" ]
+}
 team_takeover_facts() {  # team-takeover pick's input: one line per claim another running agent holds
-  local o a f k ranks me
-  ranks=$(team_ranks); me=$(agent_speed "$AGENT_ID")
+  local o a f k ranks me p planning=""
+  ranks=$(team_ranks); me=$(agent_speed "$AGENT_ID"); team_planning && planning=1
   for o in "$TEAM"/claims/*/owner; do
     [ -f "$o" ] || continue
     read -r a _ _ f < "$o"; k=$(basename "$(dirname "$o")")
     case $k in 000|999) continue ;; esac
     [ -n "$a" ] && [ "$a" != "$AGENT_ID" ] && agent_running "$a" || continue
     [ -d "$TEAM/takeover/$k" ] && continue   # another agent asked for it already
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$a" "$(agent_speed "$a")" "$me" "$(claim_rank "$k" "$ranks")" "$(team_takeover_why_not "${f%/tasks/*}" "$k")"
+    p=0; [ -z "$planning" ] && claim_parked "$a" "$k" && p=1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$a" "$(agent_speed "$a")" "$me" "$(claim_rank "$k" "$ranks")" "$(team_takeover_why_not "${f%/tasks/*}" "$k")" "$p"
   done
 }
-team_takeover_candidate() {  # the claim this agent would ask for now, or nothing
-  [ "${TEAM_TAKEOVER:-1}" = 1 ] && team_has_slower || return 0
-  team_takeover_facts | team-takeover pick 2>/dev/null
+team_takeover_candidate() {  # the claim this agent would ask for now ("<key>", or "<key> parked"), or nothing
+  [ "${TEAM_TAKEOVER:-1}" = 1 ] || return 0
+  team_takeover_facts | team-takeover pick 2>/dev/null | tr '\t' ' '
 }
 team_takeover_ask() {  # team_takeover_ask : an agent with nothing to build asks for a slower agent's claim; true while its request is open
   [ "${TEAM_TAKEOVER:-1}" = 1 ] || return 1
@@ -542,14 +580,16 @@ team_takeover_ask() {  # team_takeover_ask : an agent with nothing to build asks
     [ -n "$o" ] && [ "$o" != "$AGENT_ID" ] && agent_running "$o" && return 0
     rm -rf "$d"   # given to this agent, finished, released, or its holder stopped
   done
-  team_has_slower || return 1
-  why=$(mktemp); k=$(team_takeover_facts | team-takeover pick 2> "$why"); why=$(cat "$why"; rm -f "$why")
+  local kind
+  why=$(mktemp); read -r k kind <<<"$(team_takeover_facts | team-takeover pick 2> "$why" | tr '\t' ' ')"; why=$(cat "$why"; rm -f "$why")
   [ -n "$k" ] || return 1
   mkdir -p "$TEAM/takeover"; mkdir "$TEAM/takeover/$k" 2>/dev/null || return 1
+  [ "$kind" = parked ] && echo parked > "$TEAM/takeover/$k/why"   # why first: the holder acts on asker
   echo "$AGENT_ID $$ $(date +%s) $PWD" > "$TEAM/takeover/$k/asker"   # the loop runs in its checkout
   read -r o _ _ top <<<"$(owner_line "$k")"
   tev takeover_asked "$top" "from agent $o: $(grep "^$k " <<<"$why" | head -1)"
-  log "team: nothing to build - asked agent $o for $k (a slower agent; other tasks wait on it)"
+  if [ "$kind" = parked ]; then log "team: nothing to build - asked agent $o for $k (it holds $k but is building something else)"
+  else log "team: nothing to build - asked agent $o for $k (a slower agent; other tasks wait on it)"; fi
   return 0
 }
 team_put_back() {  # team_put_back <key> <why> [paths] : that task's files on this branch become main's again; its other work stays
@@ -587,7 +627,8 @@ team_takeover_give() {  # team_takeover_give <key> now|later : the holder gives 
   rm -rf "$d"; rm -f ".agent/progress-$k"
   [ "$2" = now ] && team_takeover_settle
   tev takeover "$top" "to agent $a${why:+ ($why)}: $(wc -w <<<"$paths") file(s) of its work go with it ($(git rev-parse --short "$sha"))$(sed 's/^/; /' "$err" | tr -d '\n' | cut -c1-200)"
-  if [ -n "$why" ]; then log "team: gave $k to agent $a (tasks ${why#cycle } wait on each other: one agent builds them all) - $(wc -w <<<"$paths") file(s) of its work go with it"
+  if [ "$why" = parked ]; then log "team: gave $k to agent $a (this agent was building something else, and agent $a had nothing to build) - $(wc -w <<<"$paths") file(s) of its work go with it"
+  elif [ -n "$why" ]; then log "team: gave $k to agent $a (tasks ${why#cycle } wait on each other: one agent builds them all) - $(wc -w <<<"$paths") file(s) of its work go with it"
   else log "team: gave $k to agent $a (a faster agent with nothing to build; other tasks wait on it) - $(wc -w <<<"$paths") file(s) of its work go with it"; fi
   rm -f "$err"
 }
@@ -653,7 +694,7 @@ team_forward_answers() {  # answered requests about a task another agent now hol
   done
   return 0
 }
-team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; team_forward_answers; team_release_finished; team_cycles_sync; }   # before every pick
+team_takeover_sync() { team_takeover_settle; team_takeover_answer; team_takeover_receive; team_forward_answers; team_release_finished; team_cycles_sync; team_carve_apply; }   # before every pick
 TAKEOVER_CUT=""
 team_takeover_poll() {  # team_takeover_poll [task file of the running session] : during a session, every TEAM_TAKEOVER_POLL_S
   local cur="" d k a
@@ -665,7 +706,8 @@ team_takeover_poll() {  # team_takeover_poll [task file of the running session] 
     if [ "$k" != "$cur" ]; then team_takeover_give "$k" later; continue; fi   # parked: given at once
     [ "$TAKEOVER_CUT" = "$k" ] && continue
     read -r a _ < "$d/asker"; TAKEOVER_CUT=$k
-    if [ -f "$d/why" ]; then echo "agent $a takes this task over: tasks $(sed 's/^cycle //' "$d/why") wait on each other, so one agent builds them all" > .agent/handover-now
+    if [ "$(cat "$d/why" 2>/dev/null)" = parked ]; then echo "agent $a has nothing to build and takes this task over" > .agent/handover-now
+    elif [ -f "$d/why" ]; then echo "agent $a takes this task over: tasks $(sed 's/^cycle //' "$d/why") wait on each other, so one agent builds them all" > .agent/handover-now
     else echo "agent $a, on a faster card, has nothing to build and takes this task over (other tasks wait on it)" > .agent/handover-now; fi
     tev takeover_cut "$1" "asked by agent $a"; log "team: agent $a asked for $k - this session is told to write its hand-over and end"
   done
@@ -675,7 +717,9 @@ team_session_watch() { TAKEOVER_CUT=""; while sleep "${TEAM_TAKEOVER_POLL_S:-20}
 team_takeover_note() {  # team_takeover_note <task file> : the prompt's note on a task just taken over (its first session only)
   local f h s why; f=.agent/taken-over-$(claim_key "$1")
   [ -f "$f" ] || return 0; read -r h s why < "$f"; rm -f "$f"
-  if [[ $why == cycle* ]]; then
+  if [ "$why" = parked ]; then
+    printf '%s' " TAKEN OVER: agent $h held this task but was building another one, and you had nothing to build, so the driver gave it to you. Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read the hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
+  elif [[ $why == cycle* ]]; then
     printf '%s' " TAKEN OVER: agent $h was building task $(claim_key "$1"), part of a cycle of tasks that wait on each other; the driver gave it to you (see CYCLE). Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read that hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
   else
     printf '%s' " TAKEN OVER: agent $h, on a slower card, was building this task; the driver gave it to you because other tasks wait on it. Its work so far is in your branch (commit $s): the task file's hand-over, its ticked boxes and its code. Read the hand-over, check that work against the acceptance criteria, then continue from it; redo only what is wrong."
@@ -950,7 +994,9 @@ team_prep_watch() {  # team_prep_watch <task file> : in the background during a 
     team_beat
     team_takeover_poll   # this agent's own claims a faster agent asked for are given at once (none is being built)
     if prep_ready "$f"; then why="task $(task_id "$f") can be built now (its dependencies are in main, or another agent took it)"
-    elif t=$(team_takeover_candidate) && [ -n "$t" ]; then why="task $t, held by slower agent $(claim_owner "$t"), can be taken over by you (other tasks wait on it)"
+    elif t=$(team_takeover_candidate) && [ -n "$t" ]; then
+      if [ "${t#* }" = parked ]; then t=${t%% *}; why="task $t, which agent $(claim_owner "$t") holds but is not building, can be taken over by you"
+      else why="task $t, held by slower agent $(claim_owner "$t"), can be taken over by you (other tasks wait on it)"; fi
     else t=$(next_task); [ -n "$t" ] || continue; why="task $(task_id "$t") is free for you to build"; fi
     echo "$why" > .agent/wrapup-now
     log "prep $(task_id "$f"): $why - the session is told to write its notes and end"; tev prep_cut "$f" "$why"
@@ -1016,6 +1062,181 @@ team_prep_note() {  # team_prep_note <task file> : the session prompt's pointer 
   else
     printf '%s' " Prep notes for this task: $pf."
   fi
+}
+
+# Carve: an idle agent carves the work another agent has not started out of the task that agent is building, as new
+# top-level tasks (the parts) that it and the other idle agents build at the same time. frontpage 2026-10-07: agent a
+# built 234 for 90 minutes while c had nothing to build for 30 and b for 90. The holder's own split (team_split_note)
+# comes only in its next session, after an idle wait of TEAM_IDLE_SPLIT_MIN, and its 19:46 split of 234 gave nobody
+# work (the new 263 waited for 234). The idle agent has a fresh window and nothing else to do, so it divides, at once:
+#   - target (team_carve_target): a claim another running agent is building now (loops/<id>.task: its current or last
+#     session; a parked claim is taken over instead), not 000/999, open or in progress, no `Split: no`, no unfinished
+#     subtasks, no split session on it ($TEAM/splitting/<key>), at least two unticked boxes, small enough to read (the
+#     prep budget), not tried on this version of the holder's task file ($TEAM/carve-tries/<key> = its sha); the highest
+#     rank first. One carver per task ($TEAM/carve/<key>/owner).
+#   - session (team_carve_prompt): the holder's task read live from its checkout, read only, its boxes numbered, the
+#     files it changed so far; writes the parts (`Carved from: <key>`) and tasks/carve/<key>.md ("<box> -> <part>" per
+#     moved box, or "none: <reason>"). Only those files are kept; the branch is put back as it was (like prep).
+#   - check (team-carve check): moved boxes unticked, the holder keeps one; parts open, with Depends on (never the
+#     holder's task) and Touches (none of the holder's changed files) and a box; at least one part can start now.
+#   - publish: the parts into main, their numbers into the Depends on line of every open task in main that waits for
+#     the holder's task; $TEAM/carved/<key> = the moved boxes and the Touches paths the parts took (touches_of leaves
+#     them out at once, so the parts can start before the holder's session ends); the holder hears it mid-session.
+#   - apply (team_carve_apply, the holder's loop, right after each session and before every pick): moved boxes become
+#     "- [moved to <part>]", the paths leave its Touches line, one driver commit; its next prompt says so, once.
+TEAM_CARVE_SKIP='^(PROGRESS\.md|DECISIONS(-archive)?\.md|PITFALLS\.md|CODEMAP\.md|codemap/|tasks/)'
+task_boxes() {  # task_boxes <task file> : "<n> TAB <x or space> TAB <first line>" per acceptance box above the hand-over
+  sed '/^## Hand-over/,$d' "$1" 2>/dev/null | grep -E '^[[:space:]]*- \[[ x]\]' \
+    | awk '{ s = ($0 ~ /^[[:space:]]*- \[x\]/) ? "x" : " "; l = $0; sub(/^[[:space:]]*- \[[ x]\][[:space:]]*/, "", l); printf "%d\t%s\t%s\n", NR, s, l }'
+}
+holder_changed() {  # holder_changed <checkout> : the files its branch changed since main or has uncommitted (memory and task files aside)
+  { git -C "$1" diff --name-only main...HEAD 2>/dev/null
+    git --no-optional-locks -C "$1" status --porcelain 2>/dev/null | cut -c4- | sed 's/.* -> //'; } \
+    | grep -vE "$TEAM_CARVE_SKIP" | sort -u
+}
+team_carve_target() {  # the claim this idle agent carves now: "<key> <holder> <holder's task file>", or nothing
+  [ "${TEAM_CARVE:-1}" = 1 ] || return 0
+  local o a f k hw t ranks r best="" br=-1 sha
+  team_planning && return 0   # the plan may change every task
+  ranks=$(team_ranks)
+  for o in "$TEAM"/claims/*/owner; do
+    [ -f "$o" ] || continue
+    read -r a _ _ f < "$o"; k=$(basename "$(dirname "$o")")
+    case $k in 000|999) continue ;; esac
+    [ -n "$a" ] && [ "$a" != "$AGENT_ID" ] && agent_running "$a" || continue
+    [ -f "$TEAM/loops/$a.task" ] && ! claim_parked "$a" "$k" || continue
+    hw=${f%/tasks/*}; f=$(compgen -G "$hw/tasks/$k-*.md" | head -1); [ -n "$f" ] || continue
+    case $(status_of "$f") in open|in-progress) ;; *) continue ;; esac
+    grep -qiE '^Split:[[:space:]]*no' "$f" && continue
+    { [ -f "$TEAM/splitting/$k" ] && agent_running "$(cat "$TEAM/splitting/$k")"; } && continue
+    { carve_busy "$k" || [ -f "$TEAM/carved/$k" ]; } && continue   # one at a time; the last one applied first
+    for t in "$hw"/tasks/"$k"[a-z]*-*.md; do [ -f "$t" ] || continue; case $(status_of "$t") in done|dropped) ;; *) continue 2 ;; esac; done
+    [ "$(task_boxes "$f" | awk -F'\t' '$2 == " "' | grep -c .)" -ge 2 ] || continue
+    sha=$(sha256sum < "$f" | cut -c1-12); [ "$(cat "$TEAM/carve-tries/$k" 2>/dev/null)" = "$sha" ] && continue
+    [ "$(prep_read_bytes "$f")" -le "$(prep_budget_bytes)" ] || continue
+    r=$(claim_rank "$k" "$ranks"); [ "$r" -gt "$br" ] && { best="$k $a $f"; br=$r; }
+  done
+  echo "$best"
+}
+carve_busy() {  # carve_busy <key> : an agent whose loop runs is carving that task
+  local p=""; [ -f "$TEAM/carve/$1/owner" ] || return 1
+  { read -r _ p _ < "$TEAM/carve/$1/owner"; } 2>/dev/null; kill -0 "${p:-0}" 2>/dev/null
+}
+carve_lock() {  # carve_lock <key> : one carver per task (atomic); a lock whose loop is gone is taken over
+  local d=$TEAM/carve/$1 p=""; mkdir -p "$TEAM/carve"
+  if ! mkdir "$d" 2>/dev/null; then
+    { read -r _ p _ < "$d/owner"; } 2>/dev/null; kill -0 "${p:-0}" 2>/dev/null && return 1
+    mv "$d" "$TEAM/carve/.stale-$1-$$-$(date +%s)" 2>/dev/null && mkdir "$d" 2>/dev/null || return 1
+  fi
+  echo "$AGENT_ID $$ $(date +%s)" > "$d/owner"; return 0
+}
+team_carve_prompt() {  # team_carve_prompt <key> <holder> <holder's task file> <iteration> : the whole prompt of a carve session
+  local k=$1 a=$2 f=$3 mf=tasks/carve/$1.md boxes ch r why
+  boxes=$(task_boxes "$f" | awk -F'\t' '{ printf "  %d. [%s] %s\n", $1, $2, substr($3, 1, 200) }')
+  ch=$(holder_changed "${f%/tasks/*}" | tr '\n' ' ' | sed 's/ $//')
+  r=$(claim_rank "$k" "$(team_ranks)")
+  if [ "$r" -ge 2 ]; then why="$((r - 1)) more task(s) wait on it, one after another"; else why="it is the last work left"; fi
+  printf '%s' "You are iteration $4 of an autonomous coding loop, in a CARVE SESSION: you have nothing to build, while agent $a builds task $k and $why. Carve out of $k the work agent $a has not started yet, as new top-level tasks that you and the other idle agents can build now, beside agent $a. Read $f (agent $a's checkout: read only, never change anything there), the code and tests it names, and agent $a's work so far (\`git log main..agent/$a\`, \`git diff main...agent/$a\`). Its acceptance boxes, numbered (x = done):
+$boxes
+Files agent $a has changed so far (they stay with it): ${ch:-none yet}.
+Write each part as tasks/<number>-<name>.md in your own checkout, numbers from the lowest free in $(task_range): first line \`Status: open\`, then \`# <number>: <title>\`, a line \`Carved from: $k\`, a Goal, testable Acceptance criteria (the boxes it takes over, reworded where needed), a \`Depends on:\` line and a \`Touches:\` line. A part must not depend on $k and must not touch a file agent $a has changed; at least one part must be able to start now (its dependencies done in main). Take only boxes that are not ticked and that agent $a has not started (not the step its hand-over names next), and leave it at least one. Then write $mf with one line per moved box: \`<box number> -> <part number>\`. If nothing can be carved out (every unticked box needs agent $a's unfinished work or the files it changes), write $mf with the single line \`none: <reason>\`. This session is not a task step: AGENTS.md's rules for the hand-over, PROGRESS.md, DECISIONS.md and task status do not apply (its reading rules do). Change nothing but these files: the driver keeps only them. Commit (\`git add tasks && git commit -m \"carve $k: <parts>\"\`) and end the session: the driver checks the parts, puts them into main, tells agent $a, and marks the moved boxes in $k."
+}
+team_carve_watch() {  # team_carve_watch <key> <holder> : in the background during a carve session: once the holder no longer
+  # holds the task (finished, released, given away) or work is free for this agent, the session writes what it has and ends
+  local why t
+  while sleep "${TEAM_PREP_POLL_S:-20}"; do
+    team_beat; team_takeover_poll
+    if [ "$(claim_owner "$1")" != "$2" ]; then why="task $1 is no longer agent $2's (finished, or given to another agent)"
+    else t=$(next_task); [ -n "$t" ] || continue; why="task $(task_id "$t") is free for you to build"; fi
+    echo "$why" > .agent/wrapup-now; log "carve $1: $why - the session is told to end"; tev carve_cut "tasks/$1" "$why"
+    return 0
+  done
+}
+CARVE_RESULT=""
+team_carve_finish() {  # team_carve_finish <key> <holder> <holder's task file> <commit before the session> : check, publish, tell
+  local k=$1 a=$2 hf=$3 h0=$4 mf=tasks/carve/$1.md tmp p parts="" pf="" x out rc f t ids boxes files msg ms dep changed=""
+  commit_leftovers "uncommitted work after the carve session for $k"
+  tmp=$(mktemp -d)
+  for p in $(git diff --name-only --diff-filter=A "$h0" HEAD -- 'tasks/[0-9]*.md'); do cp "$p" "$tmp/"; parts+=" $(basename "$p")"; done
+  [ -f "$mf" ] && cp "$mf" "$tmp/carve-list.md"
+  x=$(git diff --name-only "$h0" HEAD | grep -vxF "$mf" | grep -vE '^tasks/[0-9][^/]*\.md$' || true)
+  [ -n "$x" ] && { log "carve $k: put back $(wc -w <<<"$x") other changed file(s): $(echo $x | cut -c1-150)"; tev carve_reverted "tasks/$k" "$(echo $x | cut -c1-200)"; }
+  git reset -q --hard "$h0"   # nothing of the session stays on this branch: the parts reach it through main
+  rm -rf "${TEAM:?}/carve/$k"
+  if [ "$(claim_owner "$k")" != "$a" ] || [ ! -f "$hf" ]; then
+    CARVE_RESULT=moot; log "carve $k: agent $a no longer holds it - nothing published"; tev carve_moot "tasks/$k" ""; rm -rf "$tmp"; return 0
+  fi
+  for p in $parts; do pf+=" $tmp/$p"; done
+  # shellcheck disable=SC2086
+  out=$({ holder_changed "${hf%/tasks/*}" | sed 's/^/changed\t/'
+          for t in $(others_tasks); do [ "$(claim_key "$t")" = "$k" ] && continue; printf 'claim\t%s\t%s\n' "$(claim_key "$t")" "$(touches_of "$t" | tr '\n' ' ')"; done
+        } | team-carve check "$k" "$hf" "$tmp/carve-list.md" "$TEAM_DIR/tasks" $pf 2> "$tmp/why"); rc=$?
+  mkdir -p "$TEAM/carve-tries"
+  if [ "$rc" -eq 2 ]; then
+    CARVE_RESULT=none; sha256sum < "$hf" | cut -c1-12 > "$TEAM/carve-tries/$k"
+    log "carve $k: nothing to carve - ${out#none }"; tev carve_none "tasks/$k" "${out#none }"; rm -rf "$tmp"; return 0
+  elif [ "$rc" -ne 0 ]; then
+    CARVE_RESULT=rejected; sha256sum < "$hf" | cut -c1-12 > "$TEAM/carve-tries/$k"
+    log "carve $k: parts not published - $(tr '\n' ';' < "$tmp/why" | cut -c1-300)"; tev carve_rejected "tasks/$k" "$(tr '\n' ';' < "$tmp/why" | cut -c1-300)"; rm -rf "$tmp"; return 0
+  fi
+  boxes=$(sed -n 's/^box //p' <<<"$out" | awk '{ printf "%s:%s ", $1, $2 }' | sed 's/ $//')
+  files=$(sed -n 's/^files //p' <<<"$out"); ids=$(for p in $parts; do task_id "$p"; done | tr '\n' ' ' | sed 's/ $//')
+  exec 8> "$TEAM/merge.lock"; flock 8
+  for p in $parts; do cp "$tmp/$p" "$TEAM_DIR/tasks/$p"; done
+  for f in "$TEAM_DIR"/tasks/[0-9]*.md; do   # what waited for the holder's task waits for its parts too
+    case $(status_of "$f") in done|dropped) continue ;; esac
+    [ "$(claim_key "$f")" = "$k" ] && continue
+    for dep in $(deps_of "$f"); do
+      [[ $dep =~ ^[0-9]+$ ]] && [ "$((10#$dep))" = "$((10#$k))" ] || continue
+      sed -i "0,/^Depends on:/I{s/^\(Depends on:.*[^[:space:]]\)[[:space:]]*$/\1, $(sed 's/ /, /g' <<<"$ids")/I}" "$f"; changed+=" tasks/$(basename "$f")"; break
+    done
+  done
+  # shellcheck disable=SC2086
+  if git -C "$TEAM_DIR" add -- $(for p in $parts; do echo "tasks/$p"; done) $changed \
+     && git -C "$TEAM_DIR" commit -q -m "[driver] $k carved by agent $AGENT_ID: parts $ids (boxes $(sed 's/:[^ ]*//g' <<<"$boxes")) while agent $a builds the rest" -- $(for p in $parts; do echo "tasks/$p"; done) $changed; then
+    mkdir -p "$TEAM/carved"
+    { printf 'by %s %s\nholder %s\nboxes %s\nfiles %s\nparts %s\n' "$AGENT_ID" "$(date +%s)" "$a" "$boxes" "$files" "$ids"; grep '^text ' <<<"$out"; } > "$TEAM/carved/.$k.$$"
+    mv "$TEAM/carved/.$k.$$" "$TEAM/carved/$k"
+    CARVE_RESULT=published; tev carve_published "tasks/$k" "parts $ids; boxes $boxes; files $files"
+    log "team: carved $k (agent $a builds it): parts $ids published to main, boxes $boxes${files:+, files $files}"
+  else
+    # only what this carve wrote goes back (main's checkout may hold other changes: never reset it whole)
+    # shellcheck disable=SC2086
+    for p in $parts; do git -C "$TEAM_DIR" rm -q --cached --ignore-unmatch "tasks/$p" > /dev/null 2>&1; rm -f "${TEAM_DIR:?}/tasks/$p"; done
+    # shellcheck disable=SC2086
+    [ -z "$changed" ] || { git -C "$TEAM_DIR" reset -q -- $changed 2>/dev/null; git -C "$TEAM_DIR" checkout -q HEAD -- $changed 2>/dev/null; }
+    CARVE_RESULT=failed; tev carve_publish_failed "tasks/$k" "$ids"; log "WARNING team: could not publish the carve of $k to main"
+  fi
+  flock -u 8
+  if [ "$CARVE_RESULT" = published ]; then   # the holder hears it after its current turn (human-messages, [driver])
+    msg="[driver] carve $k"$'\n'"Agent $AGENT_ID has taken part of your task $k as new task(s) $ids, which other agents build now, beside you: box(es) $(sed 's/:[^ ]*//g; s/ /, /g' <<<"$boxes") of your Acceptance criteria.${files:+ The file(s) $files are theirs now.} Do not build those boxes${files:+ or change those files}, and leave the boxes as they are: after this session the driver marks them moved in your task file${files:+ and takes the files off its Touches line}. Carry on with the rest of $k."
+    mkdir -p "${hf%/tasks/*}/.agent/inbox"; ms=$(( $(date +%s%N) / 1000000 ))
+    printf '%s\n' "$msg" > "${hf%/tasks/*}/.agent/inbox/.$ms.tmp" && mv "${hf%/tasks/*}/.agent/inbox/.$ms.tmp" "${hf%/tasks/*}/.agent/inbox/$ms.md"
+  fi
+  rm -rf "$tmp"; return 0
+}
+team_carve_apply() {  # the holder: carves other agents made of its claims, into its task files (before verify, before a pick)
+  local c k f by boxes files parts r
+  for c in "$TEAM"/carved/*; do
+    [ -f "$c" ] || continue; k=$(basename "$c")
+    [ "$(claim_owner "$k")" = "$AGENT_ID" ] || continue
+    f=$(compgen -G "tasks/$k-*.md" | head -1); [ -n "$f" ] || continue
+    by=$(sed -n 's/^by \([^ ]*\).*/\1/p' "$c"); boxes=$(sed -n 's/^boxes //p' "$c"); files=$(sed -n 's/^files //p' "$c"); parts=$(sed -n 's/^parts //p' "$c")
+    commit_leftovers "uncommitted work before applying the carve of $k"
+    r=$(team-carve apply "$f" "$c" 2>&1) || { log "WARNING team: could not apply the carve of $k: $r"; continue; }
+    [ -n "$r" ] && { tev carve_conflict "$f" "$(echo $r)"; log "WARNING team: carve of $k - box(es) this agent ticked meanwhile or no longer has ($(echo $r)); its part may repeat that work"; }
+    git diff --quiet -- "$f" || git add "$f" && git diff --cached --quiet -- "$f" || git commit -q -m "[driver] $k carved by agent $by: box(es) $(sed 's/:[^ ]*//g' <<<"$boxes") moved to $parts${files:+, $files off its Touches}" -- "$f"
+    for m in .agent/inbox/[0-9]*.md; do [ -f "$m" ] && [ "$(head -1 "$m")" = "[driver] carve $k" ] && rm -f "$m"; done   # undelivered: the task file says it now
+    printf '%s\t%s\t%s\t%s\n' "$by" "$(sed 's/:[^ ]*//g; s/ /, /g' <<<"$boxes")" "$(sed 's/ /, /g' <<<"$parts")" "$files" > ".agent/carved-note-$k"
+    mv "$c" "$TEAM/carved/.applied-$k-$(date +%s)"; tev carve_applied "$f" "$boxes"
+    log "team: $k carved by agent $by - box(es) $boxes marked moved in $f${files:+, $files off its Touches}"
+  done
+  return 0
+}
+team_carved_note() {  # team_carved_note <task file> : the prompt's note on a carve of this task (its first session after it only)
+  local n=.agent/carved-note-$(claim_key "$1") by bx parts files
+  [ -f "$n" ] || return 0; IFS=$'\t' read -r by bx parts files < "$n"; rm -f "$n"
+  printf '%s' " CARVED: while you worked, agent $by took box(es) $bx of this task as new task(s) $parts, which other agents build beside you (they show as [moved to ...] in your task file)${files:+; the file(s) $files left your Touches line}. Do not build those boxes${files:+ or change those files}; finish the rest."
 }
 
 # Planning a team project: tasks must say what they need and what they touch, so the scheduler can run them in parallel.

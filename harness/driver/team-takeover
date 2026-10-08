@@ -6,9 +6,12 @@ team-takeover pick < facts
     team_takeover_facts with the driver's own dependency, size and file-overlap checks (so this can never disagree with
     the scheduler about what is free):
         <key> TAB <holder> TAB <holder's speed> TAB <this agent's speed> TAB <rank> TAB <why this agent cannot build it>
-    A claim qualifies when its holder is slower, other open tasks wait on it (rank 2 or more: the task itself plus at
-    least one behind it) and the last field is empty. Prints the key with the highest rank (lowest key on a tie), or
-    nothing. stderr: one line per claim, why it was or was not chosen.
+        TAB <parked: 1 when the holder is building another task now, else 0 (missing = 0)>
+    A claim qualifies when nothing stops this agent building it (the why field is empty) and either its holder is
+    building another task (parked: any rank, any speed - the holder is not using it), or its holder is slower and other
+    open tasks wait on it (rank 2 or more: the task itself plus at least one behind it). Prints the key with the
+    highest rank (lowest key on a tie), followed by TAB "parked" for a parked claim, or nothing. stderr: one line per
+    claim, why it was or was not chosen.
 
 team-takeover paths <key> <base> <head> [ledger]
     The files one task's work changed on a branch, so that work can move to another branch, or off this one, without
@@ -57,25 +60,27 @@ def pick(lines):
     for line in lines:
         if not line.strip():
             continue
-        key, holder, hs, ms, rank, why = (line.rstrip("\n").split("\t") + [""] * 6)[:6]
+        key, holder, hs, ms, rank, why, parked = (line.rstrip("\n").split("\t") + [""] * 7)[:7]
         try:
-            slower, rank = float(hs) < float(ms), int(rank)
+            slower, rank, parked = float(hs) < float(ms), int(rank), parked == "1"
         except ValueError:
             print(f"{key}: bad line {line.strip()!r}", file=sys.stderr)
             continue
-        if not slower:
-            reason = f"agent {holder} is not slower"
+        if why:
+            reason = why
+        elif parked:
+            reason = ""
+        elif not slower:
+            reason = f"agent {holder} is not slower, and it is building this task"
         elif rank < 2:
             reason = "nothing waits on it"
-        elif why:
-            reason = why
         else:
             reason = ""
-            if best is None or (rank, -int(key)) > (best[1], -int(best[0])):
-                best = (key, rank)
-        print(f"{key} (agent {holder}, rank {rank}): {reason or 'can be taken over'}", file=sys.stderr)
+        if not reason and (best is None or (rank, -int(key)) > (best[1], -int(best[0]))):
+            best = (key, rank, parked)
+        print(f"{key} (agent {holder}, rank {rank}{', parked' if parked else ''}): {reason or 'can be taken over'}", file=sys.stderr)
     if best:
-        print(best[0])
+        print(best[0] + ("\tparked" if best[2] else ""))
 
 
 def git(*args):

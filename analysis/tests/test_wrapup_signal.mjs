@@ -40,6 +40,7 @@ if (process.env.CASE) {   // child: one case
 	await sleep(1600);
 	out.sent = sent; out.signalLeft = existsSync(sig);
 	out.notesEdit = await on.tool_call({ toolName: "edit", input: { path: "tasks/prep/231.md" } });
+	out.carveEdit = await on.tool_call({ toolName: "edit", input: { path: "tasks/carve/234.md" } });
 	out.codeRead = await on.tool_call({ toolName: "read", input: { path: "src/app.py" } });
 	out.gitShow = await on.tool_call({ toolName: "bash", input: { command: "git show agent/a:src/app.py" } });
 	const turn = { message: { content: [{ type: "toolCall" }] } };
@@ -74,4 +75,10 @@ const e = run({ CASE: "checkpoint", NOTES_EXIST: "1", WRAPUP_PREP_FILE: "tasks/p
 check(e.sent1.length === 0, "notes already written: no checkpoint");
 const t = run({ CASE: "checkpoint", WRAPUP_PREP_CHECKPOINT_TOKENS: "500", WRAPUP_HANDOVER: "task" });
 check(t.sent1.length === 0, "not a prep session: no checkpoint");
+const cv = run({ WRAPUP_PREP_FILE: "tasks/carve/234.md", WRAPUP_CARVE: "1", WRAPUP_DRIVER_TURNS: "2", WRAPUP_HANDOVER: "task" });
+check(cv.sent.length === 1 && cv.sent[0].includes("CARVE ENDS NOW: task 231") && cv.sent[0].includes('"none: <reason>"') && cv.sent[0].includes("tasks/carve/234.md") && !cv.sent[0].includes("assumptions"),
+	"carve session: the driver signal steers it into the parts and the carve list, in its own words");
+check(cv.carveEdit === undefined && cv.codeRead?.block === true && cv.abortAfter2 === 1, "carve session: the carve list stays editable after the steer, code reads are blocked, it ends after 2 turns");
+const cc = run({ CASE: "checkpoint", WRAPUP_PREP_FILE: "tasks/carve/234.md", WRAPUP_CARVE: "1", WRAPUP_PREP_CHECKPOINT_TOKENS: "500", WRAPUP_HANDOVER: "task" });
+check(cc.sent1.length === 0, "carve session: no notes checkpoint");
 process.exit(fail);

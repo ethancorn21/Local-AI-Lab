@@ -11,12 +11,37 @@
 #   a prep session (team mode): writes the notes file it is asked for, plus a stray code file the driver must drop.
 #        With STUB_PREP_WAIT it first waits (up to that many seconds) for the driver's cut signal, .agent/wrapup-now,
 #        the way the wrapup extension makes a real session end.
+#   a carve session (team mode): carves what `Stub-carve: <box> <path>` in the holder's task file names, as one part with
+#        that Touches path and the lowest free number of its range, plus the carve list; "none" without that line.
+#   CREATE THE PARTS FIRST in the prompt: writes each named part (Touches src/part<n>/), commits, ends the session.
+#   A driver message in .agent/inbox ("[driver] carve ...", delivered by the human-messages extension in a real
+#        session): the stub leaves the boxes and files it names alone, as the message says.
 # When the driver asks for a merge with main, the stub merges it, conflicts resolved to this side.
 [ "${1:-}" = --version ] && { echo "stub-team-pi 0"; exit 0; }
 PROMPT="${@: -1}"
 TASK=$(grep -oE 'Your task file is tasks/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^Your task file is //')
 mkdir -p .agent; printf '%s\n---\n' "$PROMPT" >> .agent/stub-prompts.txt
 sleep "${STUB_SLEEP:-3}"
+if grep -q 'in a CARVE SESSION' <<<"$PROMPT"; then
+  HF=$(grep -oE 'Read /[^ ]+\.md \(agent' <<<"$PROMPT" | head -1 | sed 's/^Read //; s/ (agent$//')
+  LF=$(grep -oE 'write tasks/carve/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^write //')
+  n=$(grep -oE 'lowest free in [0-9]+' <<<"$PROMPT" | head -1 | grep -oE '[0-9]+$')
+  sc=$(sed -n 's/^Stub-carve:[[:space:]]*//p' "$HF" 2>/dev/null); mkdir -p tasks/carve
+  if [ -z "$sc" ]; then echo "none: nothing in this task can go without the holder (stub)" > "$LF"
+  else
+    while compgen -G "tasks/$n-*.md" > /dev/null; do n=$((n + 1)); done
+    printf 'Status: open\n# %s: carved part\nCarved from: %s\n\nDepends on: none\nTouches: %s\n\n## Acceptance criteria\n- [ ] the carved box\n' \
+      "$n" "$(basename "$HF" | cut -d- -f1)" "${sc#* }" > "tasks/$n-carved.md"
+    echo "${sc%% *} -> $n" > "$LF"
+  fi
+  git add -A && git commit -q -m "carve: stub by agent ${AGENT_ID:-?}"; echo '{"type":"stub"}'; exit 0
+fi
+if [ -n "$TASK" ] && grep -q 'CREATE THE PARTS FIRST' <<<"$PROMPT"; then
+  for n in $(grep -oE 'names task\(s\) [0-9, ]+, but' <<<"$PROMPT" | grep -oE '[0-9]+'); do
+    printf 'Status: open\n# %s: a part\n\nDepends on: none\nTouches: src/part%s/\n\n## Acceptance criteria\n- [ ] the part\n' "$n" "$n" > "tasks/$n-part.md"
+  done
+  git add -A && git commit -q -m "$(basename "$TASK" .md | cut -d- -f1): wrote its parts"; echo '{"type":"stub"}'; exit 0
+fi
 if grep -q 'in a PREP SESSION' <<<"$PROMPT"; then
   PF=$(grep -oE 'Write tasks/prep/[^ ]+\.md' <<<"$PROMPT" | head -1 | sed 's/^Write //')
   for _ in $(seq 1 "${STUB_PREP_WAIT:-0}"); do [ -f .agent/wrapup-now ] && break; sleep 1; done
@@ -35,6 +60,13 @@ if [ -n "$TASK" ] && nd=$(sed -n 's/^Stub-needs:[[:space:]]*//p' "$TASK") && [ -
   git add -A && git commit -q -m "$(basename "$TASK" .md | cut -d- -f1): cannot finish before $nd - added it to Depends on"
   echo '{"type":"stub"}'; exit 0
 fi
+skipf="" skipb=""   # what a driver carve message took away (read after this step's work time, as a session would see it)
+for m in .agent/inbox/[0-9]*.md; do
+  [ -f "$m" ] && [ "$(head -c 14 "$m")" = "[driver] carve" ] || continue
+  skipf+=" $(grep -oE 'The file\(s\) .* are theirs now' "$m" | sed 's/^The file(s) //; s/ are theirs now$//')"
+  skipb+=" $(grep -oE 'box\(es\) [0-9, ]+ of your' "$m" | grep -oE '[0-9]+' | tr '\n' ' ')"
+  mkdir -p .agent/inbox/delivered; mv "$m" .agent/inbox/delivered/
+done
 case $TASK in
   tasks/000-*)
     for f in "$STUB_FIXTURES"/*.md; do [ -e "tasks/$(basename "$f")" ] || cp "$f" tasks/; done   # a re-plan keeps the tasks it has
@@ -43,13 +75,14 @@ case $TASK in
     printf '# GOAL-CHECK\n\nEverything met.\n' > GOAL-CHECK.md ;;
   *)
     for p in $(sed -n 's/^Touches:[[:space:]]*//p' "$TASK" | tr ',' ' '); do
+      case " $skipf " in *" $p "*|*" ${p%/} "*) continue ;; esac
       case $p in */) mkdir -p "$p"; p="${p}part-$(basename "$TASK" .md).txt" ;; *) mkdir -p "$(dirname "$p")" ;; esac
       echo "$(basename "$TASK" .md) by agent ${AGENT_ID:-?}" >> "$p"
     done
     w=$(sed -n 's/^Stub-writes:[[:space:]]*//p' "$TASK")
     [ -n "$w" ] && echo "written by $(basename "$TASK" .md)" > "$w" ;;
 esac
-sed -i -e '/^## Hand-over/,$!s/^- \[ \]/- [x]/' "$TASK"
+awk -v skip=" $skipb " '/^## Hand-over/ { h = 1 } !h && /^[[:space:]]*- \[[ x]\]/ { n++; if (index(skip, " " n " ") == 0) sub(/- \[ \]/, "- [x]") } { print }' "$TASK" > "$TASK.stub" && mv "$TASK.stub" "$TASK"
 # STUB_NO_STATUS: a pattern of tasks whose status the stub "forgets" to set (it still ticks every box)
 if [ -z "${STUB_NO_STATUS:-}" ] || ! grep -qE "$STUB_NO_STATUS" <<<"$TASK"; then sed -i '1s/.*/Status: done/' "$TASK"; fi
 git add -A && git commit -q -m "$(basename "$TASK" .md): stub step by agent ${AGENT_ID:-?}"

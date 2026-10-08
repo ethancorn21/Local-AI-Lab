@@ -9,6 +9,9 @@
  *  - driver signal: when the driver writes .agent/wrapup-now in a prep session (the task being prepared can be built
  *    now, or other work is free), or .agent/handover-now in a build session (a faster agent takes the task over, team
  *    mode, 2026-10-06), the same steer, tool limit and hard stop apply, with DRIVER_TURNS turns
+ *  - a carve session (WRAPUP_CARVE=1, team mode, 2026-10-07: an idle agent writes new tasks carved out of a task another
+ *    agent builds) is a prep session whose output is those task files and WRAPUP_PREP_FILE, the carve list: its own
+ *    wording, no notes checkpoint
  *  - a prep session (WRAPUP_PREP_FILE set) hands over into its notes file, not the task's hand-over; and once its
  *    context reaches PREP_CHECKPOINT with no notes file yet, it is told to write what it has now and go on (agent b,
  *    2026-10-05: read ~90k tokens for 231, then tried to write all its notes in one last call at the window's edge;
@@ -39,6 +42,7 @@ const TASK_HANDOVER = process.env.WRAPUP_HANDOVER === "task";
 const MAX_TURNS = Number(process.env.WRAPUP_MAX_TURNS ?? 10);
 const HANDOVER_THINKING = Number(process.env.WRAPUP_HANDOVER_THINKING ?? 2048);
 const PREP_FILE = process.env.WRAPUP_PREP_FILE ?? "";   // a prep session: these notes are its only output
+const CARVE = process.env.WRAPUP_CARVE === "1";   // a carve session: its output is new task files and PREP_FILE, the carve list
 const DRIVER_TURNS = Number(process.env.WRAPUP_DRIVER_TURNS ?? 4);
 const PREP_CHECKPOINT = Number(process.env.WRAPUP_PREP_CHECKPOINT_TOKENS ?? Math.round(SOFT * 0.6));
 
@@ -60,7 +64,15 @@ const handoverMessage = (why: string, turns = MAX_TURNS) =>
 const message = (tokens: number) =>
 	handoverMessage(`CONTEXT LIMIT: this session's context is at ${tokens} tokens, past the ${SOFT}-token hand-over limit.`);
 
-const prepMessage = (why: string) =>
+const carveMessage = (why: string) =>
+	`[harness] ${why} Stop now. From now on only these tools work: reading or editing task files, and ` +
+	`git add/commit/status/diff/log/show.\n` +
+	`1. FIRST: finish the part task files you have begun and ${PREP_FILE} (one line per moved box: "<box number> -> ` +
+	`<part number>"); with no part ready, write the single line "none: <reason>" into ${PREP_FILE}.\n` +
+	`2. Commit right away: git add tasks && git commit -m "carve: parts".\n` +
+	`3. End your turn with no further tool calls.\n` +
+	`The harness ends this session after a few more turns regardless.`;
+const prepMessage = (why: string) => CARVE ? carveMessage(why) :
 	`[harness] ${why} Stop researching now. From now on only these tools work: reading or editing task files and ` +
 	`tasks/prep/ notes, and git add/commit/status/diff/log/show.\n` +
 	`1. FIRST, in one edit or write: put everything you have into ${PREP_FILE}: assumptions, plan, tests, open ` +
@@ -71,7 +83,7 @@ const prepMessage = (why: string) =>
 
 // After the hand-over message, tools are limited to the hand-over itself (enforced, not requested: iteration 66 kept
 // debugging failing tests for all its remaining turns and was cut off without saving its notes).
-const MEMORY_FILE = /(^|\/)(PROGRESS|DECISIONS|CODEMAP)\.md$|(^|\/)codemap\/.+\.md$|(^|\/)tasks\/(prep\/)?[^/]+\.md$/;
+const MEMORY_FILE = /(^|\/)(PROGRESS|DECISIONS|CODEMAP)\.md$|(^|\/)codemap\/.+\.md$|(^|\/)tasks\/((prep|carve)\/)?[^/]+\.md$/;
 const READERS = /^(cat|head|tail|grep|wc|sed)\b(.*)$/;
 // Split a shell command on unquoted ; && || | and newlines. Quoted text becomes the placeholder Q, so a ';' or '>'
 // inside a commit message is not mistaken for a command separator or a redirect (iteration 81's commits were blocked
@@ -144,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 		turnsSinceSteer = 0;
 		turnLimit = DRIVER_TURNS;
 		mark(`driver-stop ${why.slice(0, 160)}`);
-		pi.sendUserMessage(PREP_FILE ? prepMessage(`PREP ENDS NOW: ${why}.`) : handoverMessage(`HAND-OVER NOW: ${why}.`, DRIVER_TURNS),
+		pi.sendUserMessage(PREP_FILE ? prepMessage(`${CARVE ? "CARVE" : "PREP"} ENDS NOW: ${why}.`) : handoverMessage(`HAND-OVER NOW: ${why}.`, DRIVER_TURNS),
 			{ deliverAs: "steer" });
 	}, 1000);
 	iv.unref?.();
@@ -207,7 +219,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (tokens >= HARD) return stop(ctx, `tokens=${tokens} before any hand-over`);
 			const continuing = (event.message?.content ?? []).some((c: any) => c?.type === "toolCall");
-			if (PREP_FILE && !checkpointed && continuing && tokens >= PREP_CHECKPOINT && tokens < SOFT &&
+			if (PREP_FILE && !CARVE && !checkpointed && continuing && tokens >= PREP_CHECKPOINT && tokens < SOFT &&
 				!existsSync(join(process.cwd(), PREP_FILE))) {
 				checkpointed = true;
 				mark(`prep-checkpoint tokens=${tokens}`);

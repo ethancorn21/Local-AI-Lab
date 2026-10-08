@@ -272,8 +272,65 @@ The first live takeover (2026-10-06 18:42): a asked for 253 while b was between 
 and a's first session on it started a minute after the ask. A takeover in the middle of a slow-card session has not
 happened live yet.
 
+**Parked claims go to anyone.** An agent can hold two claims and build only one; the other is *parked*. On 2026-10-07
+agent a held 236 while it built 234 for 90 minutes. 236 headed the longest chain left (236, then 237, then 238), and
+its split was already designed, but agents b and c had nothing to build and could not ask for it: both are slower
+than a, and only a faster agent could ask. Now any idle agent, faster or slower, may ask for a parked claim, whatever
+waits on it. The holder is not using it, so speed does not matter. The driver knows what each agent is building from a
+small file that exists only while a session runs. Between sessions nothing counts as parked: the first version of
+this rule let two waiting agents pass one task back and forth every second, which the end-to-end test caught.
+
 The decisions behind this (which claim to ask for, which files belong to a task) are in a small Python helper,
 `team-takeover`; the bash driver does the moving.
+
+### When one agent builds what everyone waits for: carving
+
+Even with all the rules above, the team can end up waiting on one task that one agent is building: everything else
+depends on it. The holder could split it, but only in its next session, and only after the others have been idle for
+20 minutes. On 2026-10-07 agent a's split of 234 made one new task, and that task depended on 234, so it gave nobody
+any work.
+
+So the idle agent does the dividing itself, at once. It has a fresh context window and nothing else to do. This is
+**carving**:
+
+```
+before:  agent a  [234: box1 box2 box3 box4 ...........................]  merge
+         agent c  .......................... waiting ....................  then 238
+
+after:   agent a  [234: box1 box2 box4 ...............]  merge
+         agent c  [carve] [800: box3 ........]  merge         then 238 (waits for 234 and 800)
+```
+
+1. **Which task.** One another agent is building right now, with at least two acceptance boxes still open, the one
+   with the most work waiting behind it first. Only one agent carves a task at a time.
+2. **The carve session.** The idle agent reads the holder's task file live from the holder's checkout (read only),
+   sees its boxes numbered and the files the holder has changed so far, and writes the work the holder has not started
+   as new tasks (the *parts*), plus a short list: which box went to which part. If nothing can be split off, it says
+   so (`none: <reason>`) and the driver does not try that task again until the holder's task file changes.
+3. **The check.** The driver publishes the parts only if they make sense: the moved boxes are still open, the holder
+   keeps at least one, no part depends on the holder's task or touches a file the holder has changed, and at least one
+   part can start right now.
+4. **Publishing.** The parts go into `main`. Every task that waited for the holder's task now waits for the parts too.
+   The parts' files stop counting as the holder's at once, so another agent can start a part while the holder's session
+   is still running.
+5. **Telling the holder.** A message goes into the holder's inbox, marked as coming from the driver. The running
+   session gets it after its current turn: these boxes and files belong to another task now, don't build them. When
+   that session ends, before the holder's work is checked, the driver marks those boxes `[moved to 800]` in the holder's
+   task file and takes the files off its `Touches:` line. The holder's next prompt says what happened.
+
+If the holder ticks a moved box anyway (it built that box before the message arrived), the tick stays and the driver
+logs it, since the part may then repeat work. The decisions (is this carve acceptable, which box is which) are in a
+small Python helper, `team-carve`.
+
+**Parts named but never written.** A split can go wrong another way. On 2026-10-07 a's split session designed 236's
+four parts (259-262), wrote their numbers into 236's `Depends on:` line, and ended with "the next session creates
+them". The driver published 236, which from then on waited for four tasks that did not exist, so no session on it ever
+came to create them. Now a dependency number with no task file is work to create, not something to wait for: the task
+can be picked up, and that session is told to write those parts first, with exactly those numbers. The console board
+marks such a dependency "not written".
+
+The order an idle agent tries things in: take over a claim (a parked one, or the slow card's critical-path task), then
+carve, then prepare a task, then wait.
 
 ### When tasks wait on each other: cycles
 
@@ -348,7 +405,7 @@ Per agent, in `~/.agent-kit/agents/<id>.env` (copied into the agent's worktree b
 Driver-wide (environment, defaults shown): `ITER_TIMEOUT` 2700 s per session, `TEAM_STALE_MIN` 120 (minutes before a
 dead agent's claim can be taken), `TEAM_HANDOVER_SESSIONS` 3, `TEAM_PREP` 1 (0 turns prep off),
 `TEAM_PREP_HANDOFF_S` 300, `TEAM_PREP_RESERVE_TOKENS` 25000, `TEAM_TAKEOVER` 1 (0 turns takeover off),
-`TEAM_TAKEOVER_POLL_S` 20, `TEAM_CYCLE_FIX` 1 (0 turns the cycle rule off), `TEAM_STALL_MIN` 15 (0 turns the stall
+`TEAM_TAKEOVER_POLL_S` 20, `TEAM_CARVE` 1 (0 turns carving off), `TEAM_CYCLE_FIX` 1 (0 turns the cycle rule off), `TEAM_STALL_MIN` 15 (0 turns the stall
 net off), `TEAM_STALL_FORCES` 2.
 
 ## Glossary
@@ -356,7 +413,7 @@ net off), `TEAM_STALL_FORCES` 2.
 | Term | Meaning |
 |---|---|
 | Session (iteration) | One fresh agent run: start, orient, one step, notes, commit, exit |
-| Driver | `agent-loop` plus `agent-team-lib`: the bash script that runs the sessions and enforces the rules, with small Python helpers for some decisions (`plan-schedule`, `team-takeover`) |
+| Driver | `agent-loop` plus `agent-team-lib`: the bash script that runs the sessions and enforces the rules, with small Python helpers for some decisions (`plan-schedule`, `team-takeover`, `team-carve`) |
 | Task, subtask | A file in `tasks/` with a goal and acceptance boxes; `025a` is a subtask of `025` |
 | Acceptance criteria (boxes) | The checklist that defines done; the human's cannot be changed by agents |
 | Hand-over (notes) | The `## Hand-over` section a session leaves for the next one on the same task |
@@ -370,7 +427,9 @@ net off), `TEAM_STALL_FORCES` 2.
 | Prep, prep notes | Notes an idle agent writes for a task that starts later |
 | Cut | The driver's signal that ends a prep session early because real work is free |
 | Hand-off | A claiming agent waiting for, and receiving, another agent's prep notes |
-| Takeover | A fast agent with nothing to build taking a task that others wait on from a slower agent, with its work so far |
+| Takeover | An idle agent taking a task from the agent that holds it, with its work so far: a parked claim (its holder is building something else), or a slower agent's task that others wait on |
+| Parked claim | A task an agent holds but is not building right now (its session is on another task) |
+| Carve, parts | An idle agent splitting off the unstarted work of a task another agent is building, as new tasks (the parts) it and the other idle agents build at the same time |
 | Cycle | Tasks that wait on each other, so none can start first; all of them go to one agent |
 | Stall | Every agent waiting for the others, with work left and nobody asked: the driver tells the human and starts work anyway |
 | Ledger | One JSON line per session with its result and the exact harness version |

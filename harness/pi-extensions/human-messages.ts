@@ -9,6 +9,8 @@
  *  - A stop request only stops the session it was sent to: one older than this session (left by an older driver that
  *    does not put messages into the prompt) is delivered as a normal message, or every new session would abort.
  *  - Messages are only delivered while a run is active; anything that arrives between runs waits for the driver.
+ *  - A message whose first line starts with "[driver]" comes from the loop's driver, not the human (team mode: another
+ *    agent carved part of this task, 2026-10-07): that line is dropped and it is delivered as the driver's.
  * Markers "[human] ..." go to PI_LOOP_MARKERS (or stderr) for the loop ledger.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -62,7 +64,10 @@ export default function (pi: ExtensionAPI) {
 			const text = readFileSync(join(inbox, f), "utf8").trim();
 			renameSync(join(inbox, f), join(inbox, "delivered", f));
 			if (!text) continue;
-			pi.sendUserMessage(`[Message from the human, typed while you were working]\n${text}`, { deliverAs: "steer" });
+			const driver = text.startsWith("[driver]");
+			const body = driver ? text.split("\n").slice(1).join("\n").trim() : text;
+			pi.sendUserMessage(driver ? `[Message from the driver (the harness), sent while you were working]\n${body}`
+				: `[Message from the human, typed while you were working]\n${text}`, { deliverAs: "steer" });
 			mark(`delivered ${f} chars=${text.length}`);
 		}
 	};
