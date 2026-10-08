@@ -148,6 +148,9 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 - Tools: the Pi coding agent with the lab's extensions, the driver and its helpers, the operator tools, Playwright.
 - After a reboot the tunnels, the relay client and SearXNG come back by themselves; the agent loops
   (`agent-team start`) and the frontpage preview (a loop that serves `main` after every merge) are started by hand.
+- frontpage mirror (`harness/tools/frontpage-mirror`, a systemd timer every minute, comes back after a reboot):
+  pushes frontpage `main` to a private GitHub repository when it changes, with a deploy key that can write to that
+  one repository only and never force-pushes. The human pulls it on the Mac and runs it there (`frontpage-up`).
 
 ## Projects
 

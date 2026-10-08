@@ -1,0 +1,12 @@
+# /etc/systemd/system/frontpage-mirror.timer: runs frontpage-mirror.service every minute, from boot.
+# Enable: sudo systemctl enable --now frontpage-mirror.timer
+[Unit]
+Description=frontpage GitHub mirror, every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

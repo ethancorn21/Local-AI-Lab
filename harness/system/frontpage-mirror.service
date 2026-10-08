@@ -1,0 +1,11 @@
+# /etc/systemd/system/frontpage-mirror.service: push frontpage main to its private GitHub repo when it changed.
+# Started every minute by frontpage-mirror.timer. Script and notes: harness/tools/frontpage-mirror.
+[Unit]
+Description=frontpage GitHub mirror (main only)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=agent
+ExecStart=/home/agent/frontpage-mirror/mirror.sh

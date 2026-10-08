@@ -1,19 +1,20 @@
 /* Layout: a workbench for three channels. The ground is calm (soft type, quiet surfaces, agent colours as a stripe and a
    faint wash), and the labels are loud: every kind of event (thought, answer, bash, read, edit, write, search, ask,
    driver) is a filled chip in its own vivid hue, so a glance at a feed says what each agent is doing without reading.
-   Red and green are kept for fail and pass, never a label. Two themes: off-white, and a dark brown (#242116).
+   Red and green are kept for fail and pass, never a label. Two themes on the Espresso & Foil base
+   (~/code/projects/design/espresso-foil.md): latte, and espresso (#2B211C).
    The Live page tiles the channels like the operator's monitor: one tall pane, two stacked.
    Agent text arrives as data and is only ever set as text (textContent), never parsed as HTML. */
 :root {
-  --bg: #e7e4da; --raise: #efece3; --sunk: #dbd7ca; --line: #cdc8b8; --line-2: #b6b09e;
-  --fg: #23221d; --fg-2: #4f4d43; --muted: #817d6d;
+  --bg: #E9DCCB; --raise: #F5EEDF; --sunk: #E3D5C3; --line: #CDB9A2; --line-2: #B39C83;   /* latte */
+  --fg: #2B211C; --fg-2: #4F3F33; --muted: #6E5A49;
   --ch-a: #6f74d8; --ch-b: #cf7d93; --ch-c: #4fa595;
   --wash: 15%;   /* how much of an agent's colour tints its header */
   --attn: #d9a43b; --attn-ink: #6e500f; --attn-wash: #efdfba;
   --crit: #c4372b; --good: #2f8f3a; --crit-wash: #f0d6cf;
   --add-bg: #d8e4c8; --add-fg: #375f25; --del-bg: #eed5ca; --del-fg: #8f3627;
   --kw: #7d4a88; --str: #50722f; --com: #8f8b7a; --fn: #3a68a8;
-  --shadow: rgba(35, 34, 29, 0.18);
+  --shadow: rgba(43, 33, 28, 0.18);
   /* the labels: vivid, the same in both themes, dark ink on top */
   --k-think: #a970ff; --k-say: #b4e33d; --k-bash: #ff8b2b; --k-read: #33b8ff; --k-edit: #ffd23f; --k-write: #2ad4c0;
   --k-web: #6b84ff; --k-ask: #ff3b6b; --k-driver: #ff4fb4; --k-tool: #a7b0c4; --k-wait: #8f8a78; --k-ink: #17140c;
@@ -23,8 +24,8 @@
   color-scheme: light;
 }
 :root[data-theme="dark"] {
-  --bg: #1c1a11; --raise: #242116; --sunk: #18160e; --line: #39341f; --line-2: #554e36;
-  --fg: #ece6d3; --fg-2: #c3bba3; --muted: #8e866c;
+  --bg: #2B211C; --raise: #362B23; --sunk: #241B17; --line: #4E3D33; --line-2: #6A5444;   /* espresso */
+  --fg: #EFE6DC; --fg-2: #D3C6B8; --muted: #B5A493;
   --ch-a: #8f94f0; --ch-b: #e397ab; --ch-c: #63bfae;
   --wash: 17%;
   --attn: #e0a93a; --attn-ink: #f2cf86; --attn-wash: #3b311a;

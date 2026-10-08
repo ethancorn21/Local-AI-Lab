@@ -1,0 +1,21 @@
+#!/bin/bash
+# frontpage GitHub mirror (agent account): pushes `main` of the team project to the private repo
+# github.com/ethancorn21/frontpage whenever it changes, so the human can pull it on a laptop and run it there.
+# Run every minute by frontpage-mirror.timer (harness/system). Only main is pushed, never the agent branches, and
+# never with --force: a rejected push is logged and retried next minute. The key is a deploy key that can write to
+# that one repository and nothing else (agents have root on this VM, so any key here is theirs too).
+# Install: ~agent/frontpage-mirror/mirror.sh (mode 755) + the two units in /etc/systemd/system.
+# Log: ~agent/frontpage-mirror/mirror.log
+set -u
+M=$HOME/projects/frontpage; S=$HOME/frontpage-mirror; REPO=git@github.com:ethancorn21/frontpage.git
+head=$(git -C "$M" rev-parse main) || exit 1
+[ "$head" = "$(cat "$S/pushed" 2>/dev/null)" ] && exit 0
+export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/frontpage_github_deploy -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_github -o ConnectTimeout=15"
+if out=$(git -C "$M" push --quiet "$REPO" "$head:refs/heads/main" 2>&1); then
+  echo "$head" > "$S/pushed"
+  echo "$(date '+%F %T') pushed $(git -C "$M" log -1 --format='%h %s' "$head" | cut -c1-100)" >> "$S/mirror.log"
+else
+  echo "$(date '+%F %T') push FAILED for ${head:0:7}: $(echo "$out" | tr '\n' ' ' | cut -c1-300)" >> "$S/mirror.log"
+  exit 1
+fi
