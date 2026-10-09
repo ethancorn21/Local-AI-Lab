@@ -72,8 +72,20 @@ Why: an agent remembers nothing between sessions, so anything worth keeping is w
 
 ### Done checks
 
-- The driver re-checks every done claim: every box ticked, and the test suite run twice (a failure that disappears on
-  the rerun is logged as flaky, not blamed on the task).
+- The driver re-checks every done claim: every box ticked, and the test suite run once, rerun only if it fails (a
+  failure that disappears on the rerun is logged as flaky, not blamed on the task). In a team that run happens at the
+  merge (below). Each run's failing tests are kept under a key of the committed code (notes excluded), so a task's
+  baseline at its first hand-out is read, not run, when that code was tested already.
+- **Tests that use the product the way the human does** (`USER_TESTS`, a project setting): a done claim is rejected
+  when the task added a test file whose text does not match the setting, or added tests to such a file; editing and
+  deleting old tests is fine, timing tests are exempt (`user-tests`, called from `verify_done`). frontpage:
+  `USER_TESTS=playwright`, every test drives the site in a browser. Why: Ethan on 2026-10-08, "we need tests that
+  mimic the user experience. A user is never going to call an internal function, that is purely for us the
+  developers." The audit that day: 74% of the lines added in a sprint were tests, 1.3 MB of tests for 0.56 MB of
+  code, and a quarter of the app's functions called directly by tests, all under a `GOAL.md` that already said no
+  unit tests. A rule in prose had not held, so it is in code.
+- **Project settings** live outside the repo, never in an agent's checkout: `~/.agent-kit/projects/<name>.env`
+  (`<name>` = the project folder, for a team its main checkout), read by `agent-loop` after `.agent/team.env`.
 - The human's tasks need a fully green suite. The agent's own tasks may finish with tests that were already failing
   when the task was first handed out, never with new failures.
 - Removing one of the human's acceptance boxes gets the claim rejected. `## Proposed changes` is the way to say a
@@ -238,12 +250,28 @@ merged from the others', so tasks the agents created do not become the human's.
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
   small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
   holds other claims (a full reset once cost it a parked task's work).
-- **Sync and merge.** Before every session the driver merges `main` into the agent's branch. An accepted task goes into
-  `main` under a lock, with the tests re-run if `main` changed; a conflict or a new failure reopens the task.
+- **Sync and merge, one test run per task.** Before every session the driver merges `main` into the agent's branch.
+  An accepted task goes into `main` under the merge lock: `main` merged into the branch, the suite run once on that
+  result (verify leaves it to the merge in team mode), `main` fast-forwarded; a conflict or a new failure reopens the
+  task. Every driver run's failing tests are recorded under a key of the committed code without the notes
+  (`.agent/team/tested/`), and a task's baseline at its first hand-out, and the start-up audit, read that record
+  instead of running the suite again. Why: the frontpage audit of 2026-10-08 ([experiments.md](experiments.md#test-quality-what-the-tests-catch))
+  found three full runs per task (baseline, verify, post-merge) and none of the 458 runs since 10-02 caught a product
+  bug: 159 baselines found no real failure, 149 post-merge re-runs never failed.
+- **Timing tests run on `main`, in the background.** Test files named `*perf*` are left out of every ordinary pytest run
+  in team mode (`pylib/agent_testlock.py`, which says so on the terminal; naming the file runs them, alone on the VM).
+  After every fast-forward of `main`, `timing-watch` runs them in a worktree of its own (`.agent/team/timing/wt`):
+  first alongside the agents' runs, without a lock; only if that fails, the failing tests again alone (exclusive
+  `tests.lock`, waiting up to an hour for a quiet moment). A pass alone = noise from the load, logged. A failure alone
+  writes `tasks/998-timing-check.md` into `main`: the failing tests, the merges since the last green run, and
+  `Priority: first`, which puts it ahead of everything but an agent's own claims, so the next agent to finish a task
+  takes it. While 998 is open nothing more is written; once done, the next failure opens it again. Merges close together
+  are tested as one (one watch at a time; a merge during a run makes it test the newest `main` next). Runs:
+  `.agent/team/timing/runs.jsonl`, events `timing_*`. Why: the six timing tests of frontpage were 75% of its suite's
+  time and every run that included them locked the other checkouts out; Ethan: "I would rather the agent commit, move
+  to next task, the test fails, a new task is created to fix it, the agent circles back around after the task."
 - **Shared memory files merge cleanly.** Journals keep both sides' entries, generated files are regenerated, hand-over
   notes live in task files only the claiming agent edits, and each agent numbers new tasks from its own range.
-- **Timing tests run alone.** A test with `perf` in its file name takes a team-wide lock, so another checkout's suite
-  cannot slow it down and fail it.
 - **Planning for a team.** The planning task must give every task `Depends on:` and `Touches:`. `plan-schedule`
   replays the schedule and sends the plan back once if shared files would make agents wait.
 - **Idle and stop.** An agent with nothing to take asks for a claim it can take over, else carves, else prepares a task
@@ -285,6 +313,8 @@ Every driver change comes with a test that fails on the code before it. They run
 | Test | Covers |
 |---|---|
 | `test_single_regression.sh` | One agent: identical logs, history and task files with the old and new driver |
+| `test_team_timing.sh` | One test run per merged task, baselines read from recorded results, timing tests left out of every ordinary run; the timing watch on `main` (unlocked, then alone; noise; 998 opened once, taken next, closed by the fix; merges coalesced; nobody waits for it) |
+| `test_user_tests.sh` | `USER_TESTS`: a new non-browser test file and a test added to an old one rejected, the browser and timing tests accepted, editing and deleting old tests allowed, nothing checked without the setting |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
@@ -326,6 +356,8 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-07 | Cycles gathered on one agent; blocked needs an open request; the stall net | All three agents sat idle 4 hours on 256/257 waiting for each other, and the human found out from the silent GPU fans |
 | 10-07 | Split the task the team waits on after 20 idle minutes; stale prep notes prepared again | Before that deadlock, a and b waited 168 and 221 minutes behind 256 (busy 47% and 45% overnight) with every waiting task already "prepared" |
 | 10-07 | Lab archive: every agent session, event and hardware reading kept on the AI box, nightly CSV export ([archive/](../archive/README.md)) | The console keeps two sessions per agent; the VM's disk lasts weeks and its agents run as root. Kept at least a year for a capstone analysis |
+| 10-08 | One test run per task, after `main` is merged in; results kept by code; timing tests on `main` in the background, a failure opens task 998 | Three full runs per task caught no product bug in 458 runs; timing tests were 75% of the suite's time and locked the other checkouts out |
+| 10-08 | Tests use the product the way the human does, only (frontpage: in a browser); enforced at verify (`USER_TESTS`) | "A user is never going to call an internal function"; 1.3 MB of tests for 0.56 MB of code under a GOAL that already said no unit tests |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for

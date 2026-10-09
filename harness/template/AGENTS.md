@@ -48,12 +48,15 @@ The next agent has to change what you write. Keep it easy:
   Length is the warning sign: a function over about 50 lines is almost always doing several jobs.
 - **One place for each piece of knowledge.** Before copying code or a rule, use or extract the one that exists.
   Only merge code that would change for the same reason: two things that merely look alike stay separate.
-- **Tests, in this order of preference:** end-to-end (the whole app driven the way its user drives it: the page in a
-  browser, the command line, the HTTP API), integration (several real parts working together), golden (run on a
-  fixed input and compare the output with an approved file in the repo; regenerate the file only for an intended
-  change). **No unit tests**: never test one function or module on its own. When code feels like it needs one, have
-  it re-read instead: add `Re-read: <file>:<function> - <what to check>` to your hand-over, and the next agent
-  reviews it with fresh eyes.
+- **Tests use the product the way its user does, and only that way** (GOAL.md says how: the page in a browser, the
+  command line, an API the user calls). A user never calls an internal function, so no test does: **no unit tests**,
+  no test of one function or module, no test that reads a page's HTML as text. Setting up for a test (seeding data,
+  serving sample responses locally) may use the code; what the test checks, it checks through the product. Few,
+  long tests: one trip through the product checks many things. A golden test compares what the user sees for a
+  fixed input with an approved file in the repo (regenerate the file only for an intended change). When code feels
+  like it needs a unit test, have it re-read instead: add `Re-read: <file>:<function> - <what to check>` to your
+  hand-over, and the next agent reviews it with fresh eyes. In a team, timing tests (files named `*perf*`) are left
+  out of ordinary test runs: the driver runs them after every merge. Name the file to run one yourself.
 - **Edge cases belong in the spec and the code, not in a test of their own.** When you find an input the code
   mishandles (empty, zero, the largest value, malformed), fix the implementation, then add the case to the
   acceptance boxes of your own task, or to `## Proposed changes` on the human's task. Cover it with an end-to-end or

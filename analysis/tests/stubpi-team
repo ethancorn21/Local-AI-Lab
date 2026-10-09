@@ -14,6 +14,7 @@
 #   a carve session (team mode): carves what `Stub-carve: <box> <path>` in the holder's task file names, as one part with
 #        that Touches path and the lowest free number of its range, plus the carve list; "none" without that line.
 #   CREATE THE PARTS FIRST in the prompt: writes each named part (Touches src/part<n>/), commits, ends the session.
+#   STUB_ON_998: a command the stub runs in its step on task 998 (the driver's timing-check task), e.g. a fix.
 #   A driver message in .agent/inbox ("[driver] carve ...", delivered by the human-messages extension in a real
 #        session): the stub leaves the boxes and files it names alone, as the message says.
 # When the driver asks for a merge with main, the stub merges it, conflicts resolved to this side.
@@ -79,6 +80,7 @@ case $TASK in
       case $p in */) mkdir -p "$p"; p="${p}part-$(basename "$TASK" .md).txt" ;; *) mkdir -p "$(dirname "$p")" ;; esac
       echo "$(basename "$TASK" .md) by agent ${AGENT_ID:-?}" >> "$p"
     done
+    case $TASK in tasks/998-*) [ -n "${STUB_ON_998:-}" ] && eval "$STUB_ON_998" ;; esac
     w=$(sed -n 's/^Stub-writes:[[:space:]]*//p' "$TASK")
     [ -n "$w" ] && echo "written by $(basename "$TASK" .md)" > "$w" ;;
 esac

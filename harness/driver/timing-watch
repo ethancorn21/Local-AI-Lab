@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""timing-watch <team dir> <agent checkout> : the timing tests of main, after every merge, in the background (team mode).
+
+Timing tests (test files whose name contains AGENT_TEST_LOCK_EXCLUSIVE, default "perf") are left out of every other
+test run (pylib/agent_testlock.py): before 2026-10-08 frontpage ran its six in every run, 75% of the suite's time,
+and each such run locked the other checkouts out. agent-team-lib starts this after each fast-forward of main and
+nobody waits for it. Ethan (2026-10-08): "I would rather the agent commit, move to next task, the test fails, a new
+task is created to fix it, the agent circles back around after the task."
+
+  - One watch runs at a time ($TEAM/timing/run.lock). A merge during a run leaves $TEAM/timing/again, and the running
+    watch then tests the newest main: merges close together are tested as one, the culprit is one of them.
+  - Code already tested (same tree without the notes: top-level *.md, tasks/, codemap/) is not tested again.
+  - Main is checked out in a worktree of its own, $TEAM/timing/wt (ignored files such as downloaded models stay).
+  - First run: no lock, alongside the agents' test runs. Only when that fails, the failing tests run again alone on
+    the VM (exclusive tests.lock, waiting up to an hour for a quiet moment); a pass then = noise from the load, logged.
+  - Failing alone too: task 998 (tasks/998-timing-check.md) is written into main, under the merge lock, with
+    `Priority: first` (the next agent to finish a task takes it), the failing tests, and the merges since the last
+    green run. While 998 is open nothing more is written; once it is done, the next failure opens it again.
+  - Every run: one line in $TEAM/timing/runs.jsonl and an event in $TEAM/events.jsonl (agent "timing").
+"""
+import fcntl, hashlib, json, os, re, subprocess, sys, time
+
+TEAM_DIR, SRC = os.path.realpath(sys.argv[1]), sys.argv[2]
+TEAM = os.path.join(TEAM_DIR, ".agent/team")
+D = os.path.join(TEAM, "timing")
+WT = os.path.join(D, "wt")
+WORD = os.environ.get("AGENT_TEST_LOCK_EXCLUSIVE", "perf")
+TASK = "tasks/998-timing-check.md"
+FAILED = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.M)
+NOTES = re.compile(r"^([^/]+\.md|tasks/.*|codemap/.*)$")
+
+
+def git(*a, cwd=TEAM_DIR, check=False):
+    r = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"git {' '.join(a)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def event(ev, detail, task=""):
+    with open(os.path.join(TEAM, "events.jsonl"), "a") as f:
+        f.write(json.dumps({"time": now(), "agent": "timing", "event": ev, "task": task, "detail": detail[:300]}) + "\n")
+
+
+def code_key(sha):
+    lines = [l for l in git("ls-tree", "-r", sha).splitlines() if not NOTES.match(l.split("\t", 1)[-1])]
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
+
+
+def load_state():
+    try:
+        return json.load(open(os.path.join(D, "state.json")))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    tmp = os.path.join(D, "state.json.tmp")
+    json.dump(st, open(tmp, "w"), indent=1)
+    os.replace(tmp, os.path.join(D, "state.json"))
+
+
+def checkout(sha):
+    if not os.path.exists(os.path.join(WT, ".git")):
+        git("worktree", "prune")
+        git("worktree", "add", "-q", "--detach", WT, sha, check=True)
+    else:
+        git("checkout", "-q", "--detach", "-f", sha, cwd=WT, check=True)
+        git("clean", "-fdq", cwd=WT)   # untracked files go, ignored ones (models, node_modules) stay
+
+
+def python():
+    # the interpreter of the project's test command: the agent checkout's .venv (same requirements: main is its branch)
+    v = os.path.join(SRC, ".venv/bin/python")
+    return v if ".venv/bin/python" in os.environ.get("TEST_CMD", "") and os.access(v, os.X_OK) else "python3"
+
+
+def pytest(args, alone):
+    env = dict(os.environ, AGENT_TIMING="1")
+    if alone:
+        env.pop("AGENT_TEST_LOCK_HELD", None)
+        env["AGENT_TEST_LOCK_WAIT"] = "3600"
+    else:
+        env["AGENT_TEST_LOCK_HELD"] = "1"   # the plugin takes no lock: the agents' runs go on
+    t0 = time.time()
+    try:
+        r = subprocess.run([python(), "-m", "pytest", "-q", "-rfE", "-p", "no:cacheprovider", *args], cwd=WT, env=env,
+                           capture_output=True, text=True, timeout=900)
+        out, rc = r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:   # (its output comes as bytes, text=True or not)
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out, rc = out + "\n(timing-watch: no result within 900 s)", 124
+    return rc, out, round(time.time() - t0)
+
+
+def culprits(last_green, sha):
+    if not last_green or subprocess.run(["git", "-C", TEAM_DIR, "merge-base", "--is-ancestor", last_green, sha]).returncode:
+        return "    (no earlier green run of the timing tests on record)"
+    lines = [l for l in git("log", "--oneline", "--no-merges", f"{last_green}..{sha}").splitlines() if "[driver]" not in l]
+    more = f"\n    ... and {len(lines) - 15} more" if len(lines) > 15 else ""
+    return "\n".join("    " + l for l in lines[:15]) + more if lines else "    (no agent commits in between)"
+
+
+def open_task(sha, failing, out, st):
+    lock = os.open(os.path.join(TEAM, "merge.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        path = os.path.join(TEAM_DIR, TASK)
+        if os.path.exists(path):
+            status = open(path).readline().split(":", 1)[-1].strip().lower()
+            if status not in ("done", "dropped"):
+                return f"998 already open ({status}): not written again"
+        report = os.path.join(D, "last-failure.txt")
+        open(report, "w").write(out)
+        names = "\n".join("    " + n for n in failing) or "    (no test could be named: see the full output)"
+        short = git("rev-parse", "--short", sha).strip()
+        text = f"""Status: open
+# 998: Timing tests fail on main
+Priority: first
+
+Depends on: none
+Touches:
+
+## Goal
+The timing tests (test files named *{WORD}*) failed on main at {short}: once while the other checkouts ran their
+tests, then again alone on the VM. They are not part of the test run before a merge; the driver runs them on main in
+the background after every merge and opened this task. Make them pass again by making the app fast again: the time
+budgets come from GOAL.md and are not this task's to change.
+
+## Failing on main at {short} (run alone)
+{names}
+
+## Merged since the last green run of the timing tests: one of these made it slower
+{culprits(st.get("last_green"), sha)}
+
+## Acceptance criteria
+- [ ] Every timing test named above passes in your checkout. Run them by naming their file (`python3 -m pytest -q tests/<file>`): named timing tests run alone on the VM.
+- [ ] DECISIONS.md says what made it slow (which merge, which code) and what the fix changed.
+
+## Notes
+Add the files you change to the `Touches:` line above before you change them.
+The full output of the failing run: {report}
+"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(text)
+        git("add", TASK, check=True)
+        git("commit", "-q", "-m", f"[driver] timing check: {len(failing) or 'the'} timing test(s) fail on main at {short} - 998 opened",
+            "--", TASK, check=True)
+        return "998 opened"
+    finally:
+        os.close(lock)
+
+
+def check(sha, st):
+    key = code_key(sha)
+    if key == st.get("key"):
+        return
+    checkout(sha)
+    files = sorted(p for p in git("ls-files", cwd=WT).splitlines()
+                   if os.path.basename(p).startswith("test_") and p.endswith(".py") and WORD in os.path.basename(p))
+    rec = {"time": now(), "sha": sha[:12], "files": len(files)}
+    if not files:
+        rec["result"] = "none"
+    else:
+        rc, out, rec["secs"] = pytest(files, alone=False)
+        if rc in (0, 5):
+            rec["result"] = "pass"
+        else:
+            failing = sorted(set(FAILED.findall(out)))
+            rc2, out2, rec["secs_alone"] = pytest(failing or files, alone=True)
+            if rc2 in (0, 5):
+                rec["result"], rec["noise"] = "noise", failing
+            else:
+                failing = sorted(set(FAILED.findall(out2)))
+                rec["result"], rec["failing"] = "fail", failing
+                rec["task"] = open_task(sha, failing, out2, st)
+    if rec["result"] == "pass":
+        st["last_green"] = sha
+    st.update(key=key, sha=sha, result=rec["result"])
+    save_state(st)
+    with open(os.path.join(D, "runs.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    detail = f"{rec['sha']} {rec['result']}" + (f": {' '.join(rec.get('failing') or rec.get('noise') or [])}" if rec["result"] in ("fail", "noise") else "")
+    event("timing_" + rec["result"], detail + (f" - {rec['task']}" if rec.get("task") else ""), TASK if rec.get("task") == "998 opened" else "")
+
+
+def main():
+    os.makedirs(D, exist_ok=True)
+    again = os.path.join(D, "again")
+    while True:
+        fd = os.open(os.path.join(D, "run.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            open(again, "w").close()   # the running watch takes the newest main when it is done
+            return
+        try:
+            while True:
+                try:
+                    os.remove(again)
+                except FileNotFoundError:
+                    pass
+                check(git("rev-parse", "main").strip(), load_state())
+                if not os.path.exists(again):
+                    break
+        finally:
+            os.close(fd)
+        if not os.path.exists(again):   # a merge between the last look and the unlock would otherwise go untested
+            return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:   # a background helper: say what broke where the monitoring looks
+        try:
+            event("timing_error", f"{type(e).__name__}: {e}")
+        finally:
+            raise

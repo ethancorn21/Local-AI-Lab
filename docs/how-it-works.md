@@ -77,8 +77,11 @@ electricity.
 3. **Build.** Agents take tasks one session at a time (next section) until each task's boxes are ticked and its tests
    pass. Agents split big tasks and add tasks for what they discover (bugs, missing pieces, refactors).
 4. **Verify and merge.** When an agent claims a task is done, the driver checks it: every box ticked, the human's
-   criteria untouched, the test suite run twice by the driver. In a team, the accepted branch is merged with everyone
-   else's finished work and tested again before it goes into `main`.
+   criteria untouched, the test suite passing when the driver runs it (rerun once on a failure, to tell a flaky test
+   from a broken one). In a team that one run happens after the branch is merged with everyone else's finished work,
+   on exactly what goes into `main`. Timing tests are not part of it: they run on `main` in the background after every
+   merge, and a failure becomes a task (998) that the next free agent takes. A project can also require that every
+   test uses the product the way its human does (frontpage: in a browser); a task that adds any other test is sent back.
 5. **Goal check (task 999).** When the queue is empty, one agent checks the whole project against `GOAL.md` point by
    point, with evidence, and adds tasks for anything missing. The loop stops after a check that adds nothing.
 6. **Iterate.** The human tries the result and edits `GOAL.md`. The driver notices the change, reopens the plan with the
@@ -166,8 +169,10 @@ throughput of one: the card's spare capacity is already used by speculative deco
   over only if its agent's loop has been gone for two hours.
 - A task is offered only when its `Depends on:` tasks are finished in `main`, and never while another agent holds a
   task whose `Touches:` files overlap (two agents editing the same file at once is how merge conflicts happen).
-- **Merging.** An accepted task is merged under a lock: `main` into the branch, the tests re-run if `main` brought
-  anything new, then `main` fast-forwarded. A conflict or a new test failure reopens the task with the reason.
+- **Merging.** An accepted task is merged under a lock: `main` into the branch, the tests run once on the result, then
+  `main` fast-forwarded. A conflict or a new test failure reopens the task with the reason. The result of every test
+  run is kept by the code it tested, so the next task's starting point (`main` as that merge left it) is not run
+  again. Then the timing tests of the new `main` start in the background (`timing-watch`); nobody waits for them.
 - Shared memory files merge cleanly by design: journals keep both sides' entries, generated files are regenerated, and
   hand-over notes live in task files, which only the claiming agent edits. New top-level task numbers come from each
   agent's own range, so two branches never create the same number.

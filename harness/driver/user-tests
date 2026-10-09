@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""user-tests <base commit> : test files a task added or grew since <base> that do not test the way the human works.
+
+A project that sets USER_TESTS (a regex, ~/.agent-kit/projects/<name>.env) wants every test to use the product the
+way its human does; frontpage: USER_TESTS=playwright, every test drives the site in a browser. Ethan (2026-10-08):
+"we need tests that mimic the user experience. A user is never going to call an internal function, that is purely
+for us the developers." The audit that day: 74% of the lines the agents added in a sprint were tests, 1.3 MB of tests
+for 0.56 MB of code, and a quarter of the app's functions were called directly by tests, under a GOAL.md that already
+said no unit tests. So the rule is in code: verify_done rejects a task whose diff since <base> (team: the merge base
+with main; single: the commit at the task's first hand-out)
+  - adds a test file whose text does not match USER_TESTS, or
+  - adds test functions to such a file (editing or deleting the tests in it is fine: that is how old tests go).
+Test files: test_*.py, *_test.py, *.spec.* and *.test.* (js, mjs, cjs, ts). Timing tests (file name containing
+AGENT_TEST_LOCK_EXCLUSIVE, default "perf") are exempt: they measure the product, they do not call it.
+Prints one line per file: "<path>: <why>". Nothing printed = nothing wrong.
+"""
+import os, re, subprocess, sys
+
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.(spec|test)\.[mc]?[jt]s)$")
+TEST_FN = re.compile(r"^\s*(?:async\s+)?def test_\w*\s*\(|^\s*(?:test|it)(?:\.\w+)?\s*\(", re.M)
+
+
+def git(*a):
+    return subprocess.run(["git", *a], capture_output=True, text=True).stdout
+
+
+def show(rev, path):
+    return git("show", f"{rev}:{path}")
+
+
+def main():
+    want = os.environ.get("USER_TESTS", "")
+    if not want:
+        return
+    base = sys.argv[1]
+    word = os.environ.get("AGENT_TEST_LOCK_EXCLUSIVE", "perf")
+    for line in git("diff", "--no-renames", "--name-status", base, "HEAD").splitlines():
+        st, _, path = line.partition("\t")
+        if st not in ("A", "M") or not TEST_FILE.search(path) or word in os.path.basename(path):
+            continue
+        now = show("HEAD", path)
+        if re.search(want, now):
+            continue
+        if st == "A":
+            print(f"{path}: a new test file that does not match USER_TESTS ({want})")
+        else:
+            n0, n1 = len(TEST_FN.findall(show(base, path))), len(TEST_FN.findall(now))
+            if n1 > n0:
+                print(f"{path}: {n1 - n0} test(s) added to a file that does not match USER_TESTS ({want})")
+
+
+if __name__ == "__main__":
+    main()

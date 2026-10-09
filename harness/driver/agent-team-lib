@@ -212,10 +212,11 @@ team_sync() {
   log "team: main conflicts with $BRANCH in: $SYNC_CONFLICT - the next session resolves it"; tev sync_conflict "" "$SYNC_CONFLICT"
   return 1
 }
-# Accepted: bring the branch into main. Under the team's merge lock: merge main into the branch, re-run the tests if
-# main brought anything, then fast-forward main. A conflict or a new test failure reopens the task with the reason.
+# Accepted: bring the branch into main. Under the team's merge lock: merge main into the branch, run the tests once on
+# exactly what main becomes (the task's one test run: verify_done leaves it to here), then fast-forward main. A conflict
+# or a new test failure reopens the task with the reason. Then the timing tests of the new main start in the background.
 team_merge() {  # team_merge <task file>
-  local f=$1 files cur new base d
+  local f=$1 files merged=""
   exec 8> "$TEAM/merge.lock"; flock 8
   commit_leftovers "before merging $(task_id "$f") into main"
   if ! git merge-base --is-ancestor main HEAD; then
@@ -226,22 +227,26 @@ team_merge() {  # team_merge <task file>
       reopen "$f" "- Accepted, but it cannot go into main yet: your branch conflicts with main (the other agent's finished work) in: $files"$'\n'"    Run \`git merge main\`, resolve each conflict keeping both sides' intent, run the tests, commit, then set the task done again."$'\n'
       return 1
     fi
-    if ! run_tests; then
-      cur=$(failing_set "$TEST_OUT"); base=.agent/baselines/$(task_id "$f").txt; [ -f "$base" ] || base=$BASELINE
-      new=$(comm -13 <(sort -u "$base" 2>/dev/null) <(echo "$cur" | sed '/^$/d'))
-      if [ -n "$new" ] || [ -z "$cur" ]; then
-        flock -u 8; tev post_merge_fail "$f" "$(echo $new | cut -c1-200)"; log "team: tests fail after merging main into $BRANCH - $f reopened"
-        VERIFY=rejected
-        reopen "$f" "- Accepted on its own, but after merging main (the other agent's finished work) these tests fail:"$'\n'"${TEST_REPORT:-$(sed 's/^/    /' <<<"$new")}"$'\n'"    Fix the combination (your branch now contains main), then set the task done again."$'\n'
-        return 1
-      fi
+    merged=yes
+  fi
+  test_gate "$f"
+  if [ -n "$TEST_REASONS" ]; then
+    flock -u 8; VERIFY=rejected
+    if [ -n "$merged" ]; then
+      tev post_merge_fail "$f" "$(failing_set "$TEST_OUT" | tr '\n' ' ' | cut -c1-200)"; log "team: tests fail after merging main into $BRANCH - $f reopened"
+      reopen "$f" "${TEST_REASONS}    (run after merging main, the other agents' finished work, into your branch: fix the combination)"$'\n'
+    else
+      tev test_fail "$f" "$(failing_set "$TEST_OUT" | tr '\n' ' ' | cut -c1-200)"; log "team: tests fail - $f reopened"
+      reopen "$f" "$TEST_REASONS"
     fi
+    return 1
   fi
   if git -C "$TEAM_DIR" merge --ff-only -q "$BRANCH" > /dev/null 2>&1; then
     rm -f .agent/merge-pending
     tev merge "$f" "$(git rev-parse --short HEAD)"; log "team: $f merged into main ($(git rev-parse --short HEAD))"
     d=$(ls "$TEAM_DIR"/tasks/[0-9]*.md 2>/dev/null | xargs -n1 basename | cut -d- -f1 | sort | uniq -d | tr '\n' ' ')
     [ -n "$d" ] && { tev dup_task_id "" "$d"; log "WARNING team: duplicate task numbers in main: $d"; }
+    timing_kick
   else
     touch .agent/merge-pending
     tev merge_failed "$f" "main refused a fast-forward (uncommitted changes in $TEAM_DIR?)"
@@ -250,11 +255,18 @@ team_merge() {  # team_merge <task file>
   flock -u 8
   return 0
 }
+# The timing tests (test files named *perf*, left out of every other run by pylib/agent_testlock.py) of the new main, in
+# the background: nobody waits for them. timing-watch opens task 998 when they fail; see that file.
+timing_kick() {
+  command -v timing-watch > /dev/null || return 0
+  TEST_CMD=$TEST_CMD setsid timing-watch "$TEAM_DIR" "$P" > /dev/null 2>&1 < /dev/null 8>&- 9>&- &
+}
 team_retry_merge() {  # a fast-forward that main refused earlier, retried before the next pick
   [ -f .agent/merge-pending ] || return 0
   exec 8> "$TEAM/merge.lock"; flock 8
   if git merge-base --is-ancestor main HEAD && git -C "$TEAM_DIR" merge --ff-only -q "$BRANCH" > /dev/null 2>&1; then
     rm -f .agent/merge-pending; tev merge "" "retry $(git rev-parse --short HEAD)"; log "team: pending merge into main done"
+    timing_kick
   fi
   flock -u 8
 }
@@ -477,7 +489,8 @@ own_claims() { local o; for o in "$TEAM"/claims/*/owner; do [ -f "$o" ] && [ "$(
 team_pick_order() {  # the task files in the order this agent takes them: the planning task; then its own claims, the
   # highest rank first, slow agent or not: finishing what it holds comes first (frontpage 2026-10-06: agent b held 253,
   # which five tasks waited on, and 243b, which nothing did; its lowest-rank-first order took 243b and parked 253 for
-  # 39 minutes while agent a waited); then the rest by rank (a slower agent the lowest first, see above)
+  # 39 minutes while agent a waited); then a task with the line `Priority: first` (the driver's own: 998, timing tests
+  # failing on main), so the next agent to finish a task takes it; then the rest by rank (a slower agent the lowest first)
   local f k ranks slow="" own
   ranks=$(team_ranks); team_is_slow && slow=1
   own=" $(own_claims | tr '\n' ' ')"
@@ -487,8 +500,9 @@ team_pick_order() {  # the task files in the order this agent takes them: the pl
     case $f in tasks/000-*) continue ;; esac
     k=$(claim_key "$f")
     if [[ $own == *" $k "* ]]; then printf '0 -%s -%s %s\n' "$(claim_rank "$k" "$ranks")" "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
-    elif [ -n "$slow" ]; then printf '1 %s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
-    else printf '1 -%s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"; fi
+    elif grep -qx 'Priority: first' "$f"; then printf '1 0 0 %s\n' "$f"
+    elif [ -n "$slow" ]; then printf '2 %s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"
+    else printf '2 -%s 0 %s\n' "$(rank_of "$(task_id "$f")" "$ranks")" "$f"; fi
   done | sort -k1,1n -k2,2n -k3,3n -k4,4 | cut -d' ' -f4
 }
 

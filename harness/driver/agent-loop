@@ -26,6 +26,10 @@ DRIVER_FILE=$(realpath "${BASH_SOURCE[0]}")
 P=$(realpath "${1:?usage: agent-loop <project dir>}")
 [ -f "$P/.agent/team-main" ] && { echo "$P is the main checkout of a team project: start the team with agent-team start" >&2; exit 1; }
 if [ -z "${TEAM_DIR:-}" ] && [ -f "$P/.agent/team.env" ]; then set -a; . "$P/.agent/team.env"; set +a; fi
+# The human's settings for one project, kept outside the repo (never in an agent's checkout):
+# ~/.agent-kit/projects/<name>.env, <name> = the project folder (a team's main checkout). Example: USER_TESTS (below).
+PROJECT_ENV=$HOME/.agent-kit/projects/$(basename "${TEAM_DIR:-$P}").env
+if [ -f "$PROJECT_ENV" ]; then set -a; . "$PROJECT_ENV"; set +a; fi
 MAX_ITERS=${MAX_ITERS:-200}
 ITER_TIMEOUT=${ITER_TIMEOUT:-2700}
 NO_PROGRESS_LIMIT=${NO_PROGRESS_LIMIT:-5}
@@ -534,7 +538,7 @@ compact_list() {  # compact_list <name> < lines
   [ "$n" -gt 8 ] && echo "    ... and $((n - 8)) more (full list: .agent/reports/$1.txt)"
   return 0
 }
-VERIFY="" FLAKY=false TEST_OUT=""
+VERIFY="" FLAKY=false TEST_OUT="" TEST_HANG=false
 failing_names() { grep -E '^not ok|FAILED|^E ' <<<"$1" | head -10 | sed 's/^/    /'; }
 # Names of failing tests (node --test TAP "not ok N - name" at any depth, pytest "FAILED path::name"), sorted, unique.
 failing_set() { grep -E '^[[:space:]]*not ok [0-9]+ - |^FAILED ' <<<"$1" | sed -E 's/^[[:space:]]*not ok [0-9]+ - //; s/^FAILED ([^ ]+).*/\1/; s/ # .*$//' | sort -u; }
@@ -544,24 +548,52 @@ failing_set() { grep -E '^[[:space:]]*not ok [0-9]+ - |^FAILED ' <<<"$1" | sed -
 # task at the top still needs a fully green suite. .agent/test-baseline.txt is the loop-start fallback.
 BASELINE=.agent/test-baseline.txt
 mkdir -p .agent/baselines
+# Test results by code: the failing tests of every tree the driver tested, under a key of the committed tree without
+# the notes (top-level *.md, tasks/, codemap/), shared by a team. A task's first hand-out is main as the last merge
+# left it, which that merge's test run already judged: the baseline is read, not run again (frontpage 2026-10-02..08:
+# 159 baseline runs of the full suite, not one found a bug).
+TESTED_DIR=${TEAM_DIR:+$TEAM_DIR/.agent/team/tested}; TESTED_DIR=${TESTED_DIR:-.agent/tested}
+code_key() {  # code_key : prints the key of the committed code; fails when the checkout has uncommitted changes
+  [ -z "$(git status --porcelain)" ] || return 1
+  git ls-tree -r HEAD | grep -vE $'\t''([^/]+\.md|tasks/.*|codemap/.*)$' | sha256sum | cut -c1-16
+}
+tested_record() {  # tested_record <key> <rc> : this run's failing tests (none when green) for that code
+  [ -n "$1" ] || return 0
+  mkdir -p "$TESTED_DIR"
+  if [ "$2" -eq 0 ]; then : > "$TESTED_DIR/.$1.$$"; else failing_set "$TEST_OUT" > "$TESTED_DIR/.$1.$$"; fi
+  [ "$2" -ne 0 ] && [ ! -s "$TESTED_DIR/.$1.$$" ] && { rm -f "$TESTED_DIR/.$1.$$"; return 0; }   # failed, nothing named: not a result
+  mv "$TESTED_DIR/.$1.$$" "$TESTED_DIR/$1"
+  ls -t "$TESTED_DIR" | tail -n +301 | sed "s|^|$TESTED_DIR/|" | xargs -r rm -f
+}
 task_baseline() {  # task_baseline <task file> : record the failing tests at the task's first hand-out
-  local b=.agent/baselines/$(task_id "$1").txt
+  local b=.agent/baselines/$(task_id "$1").txt k
   [ -f "$b" ] && return
+  git rev-parse HEAD > "${b%.txt}.head"   # where the task started (user-tests, single mode)
+  if k=$(code_key) && [ -f "$TESTED_DIR/$k" ]; then
+    cp "$TESTED_DIR/$k" "$b"; log "baseline for $(task_id "$1"): $(grep -c . "$b") failing test(s), recorded for this code (not run again)"; return
+  fi
   if run_tests; then : > "$b"; else failing_set "$TEST_OUT" > "$b"; fi
   log "baseline for $(task_id "$1"): $(grep -c . "$b") failing test(s) at its first hand-out"
   if [ -n "$(git status --porcelain DECISIONS.md)" ]; then git add DECISIONS.md && git commit -q -m "[driver] flaky test logged (baseline run)"; fi
 }
-run_tests() {
+run_tests() {  # the suite, rerun once if it fails (a pass then = a flaky test); the result is recorded for the code
+  local k rc
+  k=$(code_key) || k=""
+  run_suite; rc=$?
+  [ "$TEST_HANG" = true ] || tested_record "$k" $rc
+  return $rc
+}
+run_suite() {
   ensure_venv
   pick_test_cmd
   local out1 out2 rc
-  TEST_OUT=""
+  TEST_OUT="" TEST_HANG=false
   out1=$(timeout 900 bash -c "$TEST_CMD" 2>&1 8>&- 9>&-); rc=$?
   [ $rc -eq 0 ] && return 0
   # pytest exits 5 when it collects no tests: a project with no tests yet is not a failing one
   [ $rc -eq 5 ] && [[ $TEST_CMD == *pytest* ]] && return 0
   if [ $rc -eq 124 ]; then   # a hang, not a flake: a rerun would only burn another 900 s
-    TEST_OUT=$out1
+    TEST_OUT=$out1 TEST_HANG=true
     mkdir -p .agent/reports; printf '%s\n' "$out1" > .agent/reports/last-test-output.txt
     TEST_REPORT="    The test suite did not finish within 900 s: a test hangs. Run \`$TEST_CMD\` with a \`timeout\` (pytest: -x -v) to find it."$'\n'"$(tail -4 <<<"$out1" | sed 's/^/    /')"$'\n'"    (output up to the timeout: .agent/reports/last-test-output.txt)"
     log "test suite timed out after 900 s (a test hangs) - not rerun"
@@ -712,8 +744,40 @@ PY
   git add PROGRESS.md "$1" && git commit -q -m "[driver] moved PROGRESS.md notes into $(task_id "$1")'s hand-over"
   log "hand-over guard: the agent wrote PROGRESS.md - moved into $1"
 }
+# The tests' verdict on a task, in TEST_REASONS (empty = pass). The agent's own tasks are judged against the tests that
+# failed at their first hand-out (known failures are allowed, new ones are not); the human's need a green suite.
+test_gate() {  # test_gate <task file>
+  local f=$1 cur new base
+  TEST_REASONS=""
+  if run_tests; then : > "$BASELINE"; return 0; fi
+  if [ "$(task-audit owner "$f")" = agent ]; then
+    cur=$(failing_set "$TEST_OUT")
+    base=.agent/baselines/$(task_id "$f").txt; [ -f "$base" ] || base=$BASELINE
+    new=$(comm -13 <(sort -u "$base" 2>/dev/null) <(echo "$cur" | sed '/^$/d'))
+    if [ -z "$cur" ]; then TEST_REASONS="- Test suite failed twice, and no failing test could be named (crash?):"$'\n'"$TEST_REPORT"$'\n'
+    elif [ -n "$new" ]; then TEST_REASONS="- Tests failing that were not failing before this task (known failures are allowed, new ones are not):"$'\n'"$(compact_list "new-failures-$(task_id "$f")" <<<"$new")"$'\n'
+    else log "accepting $f with $(wc -l <<<"$cur") known failing test(s), none new"
+    fi
+  else
+    TEST_REASONS="- Test suite failed twice when the driver ran \`$TEST_CMD\`:"$'\n'"$TEST_REPORT"$'\n'
+  fi
+}
+# Tests that use the product the way the human does, only (USER_TESTS, a regex every new test file must match; the
+# reasons and the rule: user-tests). Since: team, the merge base with main (the branch's work not in main yet);
+# single, the commit at the task's first hand-out.
+user_tests_check() {  # user_tests_check <task file> : prints the reopen reason, if any
+  [ -n "${USER_TESTS:-}" ] || return 0
+  local base v
+  if [ -n "${TEAM_DIR:-}" ]; then base=$(git merge-base main HEAD); else base=$(cat ".agent/baselines/$(task_id "$1").head" 2>/dev/null); fi
+  [ -n "$base" ] || return 0
+  v=$(user-tests "$base")
+  [ -n "$v" ] || return 0
+  printf '%s\n' "- Tests must use the product the way the human does (${USER_TESTS_HOW:-their text must match \`$USER_TESTS\`}). These test files add tests that do not:" \
+    "$(sed 's/^/    /' <<<"$v")" \
+    "    Check the same things through the product in a test that does, or leave them out. Editing or deleting existing tests is fine."
+}
 verify_done() {
-  local f=$1 reasons="" u gone new cur
+  local f=$1 reasons="" u gone ut
   u=$(unticked "$f")
   [ -n "$u" ] && reasons+="- Acceptance criteria not ticked (verify each one, then tick it):"$'\n'"$(sed 's/^/    /' <<<"$u")"$'\n'
   gone=$(task-audit missing "$f")
@@ -724,19 +788,9 @@ verify_done() {
     [ -n "${TEAM_DIR:-}" ] && reasons+=$(team_plan_check)
   fi
   [ "$f" = tasks/999-goal-check.md ] && [ ! -f GOAL-CHECK.md ] && reasons+="- GOAL-CHECK.md does not exist."$'\n'
-  if run_tests; then
-    : > "$BASELINE"
-  elif [ "$(task-audit owner "$f")" = agent ]; then
-    cur=$(failing_set "$TEST_OUT")
-    local base=.agent/baselines/$(task_id "$f").txt; [ -f "$base" ] || base=$BASELINE
-    new=$(comm -13 <(sort -u "$base" 2>/dev/null) <(echo "$cur" | sed '/^$/d'))
-    if [ -z "$cur" ]; then reasons+="- Test suite failed twice, and no failing test could be named (crash?):"$'\n'"$TEST_REPORT"$'\n'
-    elif [ -n "$new" ]; then reasons+="- Tests failing that were not failing before this task (known failures are allowed, new ones are not):"$'\n'"$(compact_list "new-failures-$(task_id "$f")" <<<"$new")"$'\n'
-    else [ -z "$reasons" ] && log "accepting $f with $(wc -l <<<"$cur") known failing test(s), none new"
-    fi
-  else
-    reasons+="- Test suite failed twice when the driver ran \`$TEST_CMD\`:"$'\n'"$TEST_REPORT"$'\n'
-  fi
+  ut=$(user_tests_check "$f"); [ -n "$ut" ] && reasons+="$ut"$'\n'
+  # One test run per task: a team runs it when the task goes into main, after main is merged in (team_merge)
+  if [ -z "${TEAM_DIR:-}" ]; then test_gate "$f"; reasons+=$TEST_REASONS; fi
   [ -z "$reasons" ] && { VERIFY=accepted; log "verified done: $f"; return 0; }
   VERIFY=rejected
   reopen "$f" "$reasons"
@@ -860,7 +914,13 @@ for f in tasks/[0-9]*.md; do
   u=$(unticked "$f")
   if [ -n "$u" ]; then reopen "$f" "- Acceptance criteria not ticked (verify each one, then tick it):"$'\n'"$(sed 's/^/    /' <<<"$u")"$'\n'; fi
 done
-if ! run_tests; then
+k=$(code_key) || k=""
+if [ -n "$k" ] && [ -f "$TESTED_DIR/$k" ]; then   # this code was tested already (a restarted team loads main as the last merge left it)
+  TEST_OUT=$(sed 's/^/FAILED /' "$TESTED_DIR/$k"); TEST_REPORT=$(sed 's/^/    /' "$TESTED_DIR/$k")
+  start_ok=$([ -s "$TESTED_DIR/$k" ] && echo false || echo true)
+  log "start-up audit: the test results recorded for this code are used, the suite is not run again"
+elif run_tests; then start_ok=true; else start_ok=false; fi
+if [ "$start_ok" = false ]; then
   failing_set "$TEST_OUT" > "$BASELINE"
   if cmp -s "$BASELINE" .agent/reports/start-failing-last.txt 2>/dev/null; then
     log "test suite failing at loop start: the same $(grep -c . "$BASELINE") test(s) as at the last start (not re-logged)"
