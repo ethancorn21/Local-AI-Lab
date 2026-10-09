@@ -264,7 +264,8 @@ merged from the others', so tasks the agents created do not become the human's.
   (`.agent/team/tested/`), and a task's baseline at its first hand-out, and the start-up audit, read that record
   instead of running the suite again. Why: the frontpage audit of 2026-10-08 ([experiments.md](experiments.md#test-quality-what-the-tests-catch))
   found three full runs per task (baseline, verify, post-merge) and none of the 458 runs since 10-02 caught a product
-  bug: 159 baselines found no real failure, 149 post-merge re-runs never failed.
+  bug: 159 baselines found no real failure, 150 verifies rejected 5 times for test reasons (a flaky timing test, two
+  lock timeouts, two tests out of step with the code), 149 post-merge re-runs never failed.
 - **Timing tests run on `main`, in the background.** Test files named `*perf*` are left out of every ordinary pytest run
   in team mode (`pylib/agent_testlock.py`, which says so on the terminal; naming the file runs them, alone on the VM).
   After every fast-forward of `main`, `timing-watch` runs them in a worktree of its own (`.agent/team/timing/wt`):
