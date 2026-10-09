@@ -140,7 +140,8 @@ def main():
             continue
         tid, name = m.group(1), m.group(2)
         first = open(f).readline()
-        status[tid] = re.sub(r"^status:\s*", "", first.strip().lower())
+        m = re.match(r"\s*status:\s*([a-z-]+)", first.lower())   # the first word (agent-loop status_of)
+        status[tid] = m.group(1) if m else ""
         names[tid] = name
     act_lines, arc_lines = read(ACTIVE), read(ARCHIVE)
     if not act_lines:

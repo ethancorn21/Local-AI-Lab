@@ -348,7 +348,7 @@ def parse_task(text):
         return None
     lines = text.splitlines()
     t = {"status": "", "title": "", "depends": [], "touches": [], "goal": "", "checks": []}
-    m = re.match(r"\s*Status:\s*(\S+)", lines[0] if lines else "", re.I)
+    m = re.match(r"\s*Status:\s*([A-Za-z-]+)", lines[0] if lines else "", re.I)
     t["status"] = m.group(1).lower() if m else ""
     section, item = None, None
     goal = []
@@ -394,7 +394,7 @@ def parse_task(text):
 
 
 def task_status(path):
-    m = re.match(r"\s*Status:\s*(\S+)", read(path, 200) or "", re.I)
+    m = re.match(r"\s*Status:\s*([A-Za-z-]+)", read(path, 200) or "", re.I)
     return m.group(1).lower() if m else ""
 
 

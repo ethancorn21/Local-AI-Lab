@@ -209,7 +209,7 @@ path, diff, when = sys.argv[1], open(sys.argv[2]).read(), sys.argv[3]
 t = open(path).read()
 # A plan that was finished has every earlier change planned in: drop those notes (they only cost the next session
 # context). An unfinished plan keeps them, since its last change may not be planned in yet.
-if re.match(r"\s*Status:\s*done", t, re.I) and "## GOAL.md changed" in t:
+if re.match(r"\s*Status:\s*done(?![A-Za-z-])", t, re.I) and "## GOAL.md changed" in t:
     t = re.sub(r"(?ms)^## GOAL\.md changed .*?(?=^## |\Z)", "", t)
     t = re.sub(r"(?m)^(## Notes\n)", r"\1- Earlier GOAL.md changes are planned in already: `git log -p GOAL.md` has them.\n", t, count=1) \
         if "Earlier GOAL.md changes" not in t else t
@@ -299,7 +299,10 @@ harness_stamp() {  # sets HARNESS (compact JSON) and HARNESS_ID (12 hex)
   HARNESS_ID=$(sha256sum <<<"$HARNESS" | cut -c1-12)
 }
 
-status_of() { head -1 "$1" | sed -E 's/^Status:[[:space:]]*//I' | tr -d '[:space:]' | tr 'A-Z' 'a-z'; }
+# A task's status: the first word after `Status:` on its first line, lowercased ("Status: Done (verified)" -> done).
+# Every reader in the harness uses this rule (decisions-archive, sprint-progress, team-carve, task-audit, the console's
+# shipper): they disagreed until 2026-10-08 (refactor map, card 2), so one file read as done by one tool and open by another.
+status_of() { head -1 "$1" | sed -nE 's/^[[:space:]]*Status:[[:space:]]*([A-Za-z-]+).*/\1/Ip' | tr 'A-Z' 'a-z'; }
 task_id() { basename "$1" .md | cut -d- -f1; }
 # Sessions a task has run since it last finished (0 after an accepted done): a reopened task, such as a re-plan after
 # a GOAL.md change, starts again from 0 for the split nudge and the STALLED flag.
@@ -1054,6 +1057,9 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
     fi
   fi
   PROMPT="$PROMPT$REVIVED"
+  # Task files an earlier session left in a form the driver cannot read (task-audit format), checked again now
+  fmt=""; [ -f .agent/format-files ] && fmt=$(task-audit format ${TEAM_DIR:+--team} $(cat .agent/format-files) | tr '\n' ' ')
+  [ -n "$fmt" ] && PROMPT="$PROMPT FIRST, fix these task files: the driver cannot read them as written. $fmt"
   # A memory file that outgrew its budget gets cleaned up first, by the agent that reads it (it knows what is current).
   pb=$(stat -c %s PROGRESS.md 2>/dev/null || echo 0)
   [ "$pb" -gt 30720 ] && PROMPT="$PROMPT FIRST, before anything else: PROGRESS.md is $((pb / 1024)) KB, far over its ~150-line budget. Rewrite it to the current state only (drop finished and superseded notes; git history keeps them) and commit that on its own." \
@@ -1159,6 +1165,14 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     sed -i "s/^added=.*/added=$(( $(ls tasks/[0-9]*.md | grep -vc '/999-') - gc_start ))/" .agent/goal-check
   fi
   task_scan
+  # The task files this session changed, in a form the driver can read? (task-audit format; the next prompt says what
+  # to fix, until it is fixed)
+  fmt_files=$({ git diff --name-only "$head0" HEAD -- tasks/ 2>/dev/null; cat .agent/format-files 2>/dev/null; } | grep -E '^tasks/[0-9]{3}[a-z]*-[^/]+\.md$' | sort -u)
+  fmt=$([ -n "$fmt_files" ] && task-audit format ${TEAM_DIR:+--team} $fmt_files)
+  if [ -n "$fmt" ]; then
+    grep -oE '^tasks/[^ ]+\.md' <<<"$fmt" | sort -u > .agent/format-files
+    while IFS= read -r l; do log "task format: $l"; done <<<"$fmt"
+  else rm -f .agent/format-files; fi
   # AGENTS.md is harness config, not agent memory: flag (don't revert) an agent that edits its own instructions.
   md_changed=false
   if [ "$(sha256sum < AGENTS.md 2>/dev/null)" != "$md0" ]; then md_changed=true; log "WARNING: AGENTS.md changed during iteration $i (not reverted)"; fi

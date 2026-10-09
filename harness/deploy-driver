@@ -7,7 +7,8 @@
 set -euo pipefail
 VM=${VM:-harnessvm} GU=${AGENT_USER:-agent}
 D=$(cd "$(dirname "$0")/driver" && pwd)
-FILES="agent-loop agent-team agent-team-lib team-takeover team-carve plan-schedule timing-watch user-tests"
+FILES="agent-loop agent-team agent-team-lib team-takeover team-carve plan-schedule timing-watch user-tests task-audit decisions-archive"
+TD=$(cd "$(dirname "$0")/tools" && pwd) TOOLS="sprint-progress agent-start"   # operator tools that read task files
 B=/home/$GU/bin
 PL=/home/$GU/.agent-kit/pylib PYLIB="agent_testlock.py"   # pytest plugins agent-team-lib loads
 X=$(cd "$(dirname "$0")/pi-extensions" && pwd); XB=/home/$GU/.pi/agent/extensions
@@ -20,11 +21,14 @@ if [ -n "${EXPECT:-}" ]; then
 fi
 stamp=$(date +%F-%H%M)
 ssh "$VM" "set -e; sudo -u $GU mkdir -p /home/$GU/.agent-kit/backups
-  for f in $FILES; do [ -f $B/\$f ] && sudo -u $GU cp -p $B/\$f /home/$GU/.agent-kit/backups/\$f.bak-$stamp || true; done
+  for f in $FILES $TOOLS; do [ -f $B/\$f ] && sudo -u $GU cp -p $B/\$f /home/$GU/.agent-kit/backups/\$f.bak-$stamp || true; done
   for f in $EXTS; do [ -f $XB/\$f ] && sudo -u $GU cp -p $XB/\$f /home/$GU/.agent-kit/backups/\$f.bak-$stamp || true; done
   for f in $PYLIB; do [ -f $PL/\$f ] && sudo -u $GU cp -p $PL/\$f /home/$GU/.agent-kit/backups/\$f.bak-$stamp || true; done"
 for f in $FILES; do
   ssh "$VM" "sudo -u $GU tee $B/$f.new >/dev/null && sudo -u $GU chmod 0755 $B/$f.new && sudo -u $GU mv $B/$f.new $B/$f" < "$D/$f"
+done
+for f in $TOOLS; do
+  ssh "$VM" "sudo -u $GU tee $B/$f.new >/dev/null && sudo -u $GU chmod 0755 $B/$f.new && sudo -u $GU mv $B/$f.new $B/$f" < "$TD/$f"
 done
 for f in $EXTS; do   # (the .new name does not end in .ts: Pi never loads a half-written file)
   ssh "$VM" "sudo -u $GU tee $XB/$f.new >/dev/null && sudo -u $GU chmod 0644 $XB/$f.new && sudo -u $GU mv $XB/$f.new $XB/$f" < "$X/$f"
@@ -34,6 +38,9 @@ for f in $PYLIB; do   # (a running pytest has the old one loaded already; the re
 done
 for f in $FILES; do
   [ "$(ssh "$VM" "sudo -u $GU cat $B/$f" | h)" = "$(h < "$D/$f")" ] || { echo "$f did not arrive intact"; exit 1; }
+done
+for f in $TOOLS; do
+  [ "$(ssh "$VM" "sudo -u $GU cat $B/$f" | h)" = "$(h < "$TD/$f")" ] || { echo "tool $f did not arrive intact"; exit 1; }
 done
 for f in $PYLIB; do
   [ "$(ssh "$VM" "sudo -u $GU cat $PL/$f" | h)" = "$(h < "$D/pylib/$f")" ] || { echo "pylib $f did not arrive intact"; exit 1; }

@@ -37,6 +37,7 @@ them while they work.
 | Path | What |
 |---|---|
 | [docs/how-it-works.md](docs/how-it-works.md) | The guide: start here |
+| [CLAUDE.md](CLAUDE.md) | For agents that change this repository: what lives where, house rules, testing, deploying |
 | [docs/agent-harness.md](docs/agent-harness.md) | Every rule with its reason, the harness's tests, decisions, commands |
 | [docs/experiments.md](docs/experiments.md) | What was measured and what it decided; long write-ups: [effort-ab.md](docs/effort-ab.md), [model-choice.md](docs/model-choice.md), [type1.md](docs/type1.md) |
 | [docs/ai-lab.md](docs/ai-lab.md) | Hardware, power and heat, model serving, network and security, changelog |

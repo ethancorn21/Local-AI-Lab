@@ -10,6 +10,11 @@ The human owns WHAT done means: the acceptance boxes of tasks the agent did not 
                log) new tasks, human tasks whose boxes went missing, and new or changed `## Proposed changes` sections
   owner FILE   print human or agent
   missing FILE print the human's boxes that are no longer in the file (one per line)
+  format [--team] FILE..  what the driver cannot read in these task files, in plain words, one line each (run after
+               every session on the task files it changed; the next session's prompt says what to fix). The lines the
+               driver reads: line 1 `Status: <word>`, `Depends on: 229, 231` (or none), in a team `Touches: <paths>`.
+               A local model copies the example it is shown, and the format guide showed `## Depends on` with a list
+               until 2026-10-08: such a task got no dependencies at all and nobody was told (refactor map, card 2).
 Box identity = the first line of a `- [ ]` / `- [x]` item, whitespace-normalised, tick state ignored.
 """
 import glob, hashlib, json, os, re, sys
@@ -72,8 +77,55 @@ def missing(reg, tid, f):
     return [b for b in e["boxes"] if b not in have]
 
 
+STATUSES = ("open", "in-progress", "split", "done", "blocked", "dropped")
+DEP_LINE = re.compile(r"^Depends on:[ \t]*(.*)$", re.I)      # agent-team-lib deps_of reads the first such line
+DEP_HEAD = re.compile(r"^#+\s*Depends on\b", re.I)
+TASK_NO = re.compile(r"\b[0-9]+[a-z]*\b")
+
+
+def format_problems(f, team):
+    lines = open(f, encoding="utf-8", errors="replace").read().splitlines()
+    first = lines[0] if lines else ""
+    out = []
+    m = re.match(r"\s*Status:\s*([A-Za-z-]+)", first, re.I)   # the first word (agent-loop status_of)
+    status = m.group(1).lower() if m else ""
+    if status not in STATUSES:
+        out.append(f"line 1 is `{first[:60]}`: the first line must be `Status: <word>`, the word one of {', '.join(STATUSES)}")
+    deps = [(i, l) for i, l in enumerate(lines, 1) if DEP_LINE.match(l)]
+    heads = [i for i, l in enumerate(lines, 1) if DEP_HEAD.match(l)]
+    if heads and not deps:
+        i, ids = heads[0], []
+        for l in lines[i:]:
+            if l.startswith("#"):
+                break
+            ids += TASK_NO.findall(l) if l.lstrip().startswith(("-", "*")) else []
+        out.append(f"line {i}: `{lines[i - 1].strip()}` is a heading, and the driver reads dependencies only from one line "
+                   f"`Depends on: 229, 231` (or `Depends on: none`), so this task has none. Write `Depends on: {', '.join(ids) or 'none'}` instead")
+    if deps:
+        i, l = deps[0]
+        v = DEP_LINE.match(l).group(1).strip()
+        if not TASK_NO.search(v) and not re.fullmatch(r"(none|-)?\.?\s*(\(.*\))?", v, re.I):
+            out.append(f"line {i}: `{l.strip()[:80]}` names no task number the driver can read; write the numbers "
+                       "(`Depends on: 229, 231`) or `Depends on: none`")
+    mt = TASK_FILE.match(os.path.basename(f))
+    tid = mt.group(1) if mt else ""
+    top = re.fullmatch(r"\d{3}", tid) and tid not in ("000", "998", "999")   # subtasks share their parent's claim
+    if team and top and status in ("open", "in-progress", "blocked") \
+            and not any(re.match(r"^Touches:", l, re.I) for l in lines):
+        out.append("no `Touches:` line, so the driver cannot keep the other agents off this task's files: "
+                   "add `Touches: <the files and folders it changes>`")
+    return [f"{f} {p}" for p in out]
+
+
 def main():
     cmd = sys.argv[1]
+    if cmd == "format":
+        team = "--team" in sys.argv[2:]
+        for f in (a for a in sys.argv[2:] if a != "--team"):
+            if os.path.isfile(f):
+                for p in format_problems(f, team):
+                    print(p)
+        return 0
     reg, ts = load(), tasks()
     if cmd == "init":
         n = 0

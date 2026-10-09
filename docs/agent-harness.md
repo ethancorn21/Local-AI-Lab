@@ -91,6 +91,13 @@ Why: an agent remembers nothing between sessions, so anything worth keeping is w
 - Removing one of the human's acceptance boxes gets the claim rejected. `## Proposed changes` is the way to say a
   criterion is wrong.
 - A task unfinished after 8 sessions is flagged STALLED, and the agent is nudged to split after 5.
+- **Task files the driver can read.** It reads three lines: line 1 `Status: <word>` (the first word only, in every
+  reader: `Status: Done (verified)` is done), `Depends on: 229, 231` (or `none`) and, in a team, `Touches: <paths>`.
+  After every session `task-audit format` checks the task files the session changed; what it cannot read goes to the
+  loop log and into the next prompt ("FIRST, fix these task files ... Write `Depends on: 229` instead") until fixed.
+  Why (refactor map card 2, 2026-10-08): the format guide showed `## Depends on` with a list, which the scheduler
+  never read (such a task had no dependencies, silently), and five readers parsed the status line five ways:
+  `Done (verified)` was done for two of them and open for the others.
 
 ## Projects that start from GOAL.md
 
@@ -315,6 +322,7 @@ Every driver change comes with a test that fails on the code before it. They run
 |---|---|
 | `test_single_regression.sh` | One agent: identical logs, history and task files with the old and new driver |
 | `test_team_timing.sh` | One test run per merged task, baselines read from recorded results, timing tests left out of every ordinary run; the timing watch on `main` (unlocked, then alone; noise; 998 opened once, taken next, closed by the fix; merges coalesced; nobody waits for it) |
+| `test_task_format.sh` | `Status: Done (verified)` read as done by the loop, the archive and the sprint count; a `## Depends on` heading named in the log and the next prompt, with the line to write; the note gone once fixed |
 | `test_user_tests.sh` | `USER_TESTS`: a new non-browser test file and a test added to an old one rejected, the browser and timing tests accepted, editing and deleting old tests allowed, nothing checked without the setting |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
@@ -358,6 +366,7 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-07 | Split the task the team waits on after 20 idle minutes; stale prep notes prepared again | Before that deadlock, a and b waited 168 and 221 minutes behind 256 (busy 47% and 45% overnight) with every waiting task already "prepared" |
 | 10-07 | Lab archive: every agent session, event and hardware reading kept on the AI box, nightly CSV export ([archive/](../archive/README.md)) | The console keeps two sessions per agent; the VM's disk lasts weeks and its agents run as root. Kept at least a year for a capstone analysis |
 | 10-08 | One test run per task, after `main` is merged in; results kept by code; timing tests on `main` in the background, a failure opens task 998 | Three full runs per task caught no product bug in 458 runs; timing tests were 75% of the suite's time and locked the other checkouts out |
+| 10-08 | One task-status rule for every reader; a format check after each session; the format guide shows the lines the driver reads; a front-door `CLAUDE.md` | Readers disagreed on `Done (verified)`; the guide's `## Depends on` example gave tasks no dependencies; the lab's own rules sat deep in long docs (refactor map, cards 2 and 8) |
 | 10-08 | Tests use the product the way the human does, only (frontpage: in a browser); enforced at verify (`USER_TESTS`) | "A user is never going to call an internal function"; 1.3 MB of tests for 0.56 MB of code under a GOAL that already said no unit tests |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);

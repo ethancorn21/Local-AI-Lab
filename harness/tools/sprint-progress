@@ -19,7 +19,7 @@ SKIP = ("000", "999")
 
 
 def status_of(text):
-    m = re.match(r"\s*Status:\s*(\S+)", text or "", re.I)
+    m = re.match(r"\s*Status:\s*([A-Za-z-]+)", text or "", re.I)   # the first word (agent-loop status_of)
     return m.group(1).lower() if m else ""
 
 

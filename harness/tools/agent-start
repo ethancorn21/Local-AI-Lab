@@ -14,7 +14,7 @@ if ! flock -n "$P/.agent/loop.lock" true; then echo "Already running. Watch it: 
 # With a GOAL.md the loop always has work (planning, the tasks, or checking the result against the goal). Without
 # one it needs a task whose first line says it is open.
 if [ ! -f "$P/GOAL.md" ]; then
-  open=$(for f in "$P"/tasks/[0-9]*.md; do [ -f "$f" ] && head -1 "$f"; done | grep -ciE '^status:[[:space:]]*(open|in-progress|split)')
+  open=$(for f in "$P"/tasks/[0-9]*.md; do [ -f "$f" ] && head -1 "$f"; done | grep -ciE '^status:[[:space:]]*(open|in-progress|split)([^A-Za-z-]|$)')
   if [ "${open:-0}" -eq 0 ]; then
     echo "Nothing to work on: put a GOAL.md in $P (what you want built, in your own words)."; exit 1
   fi
