@@ -12,6 +12,7 @@ the result and the decision for each experiment. Long write-ups have their own p
 | [A mixture-of-experts model on the RTX 5060 Ti](#a-mixture-of-experts-model-on-the-rtx-5060-ti) | 2026-10-02 | Not a general coding agent; the card runs the dense 27B |
 | [Model choice: 27B vs Flash-Next vs Swift](#model-choice) | 2026-10-05 | Keep the 27B; end capped thinking with a wrap-up sentence |
 | [Thinking cap: 8k, 16k, 32k](#thinking-cap) | 2026-10-06 | 16k |
+| [Baseline: where a card's day goes](#baseline-where-a-cards-day-goes) | 2026-10-08 | The baseline to beat: 42% of the day generating, 31.5% on tests |
 | [Type-1 log triage model](type1.md) | 2026-09-29 on | A small fine-tuned model leads; paused |
 
 ## Hand-over notes in the task file
@@ -93,3 +94,46 @@ Same 14 tasks, production settings, only the per-response thinking cap changed:
 
 On the hard tasks the model thinks until whatever cap it is given. Cutting it at 8k cost correctness; going past 16k
 bought nothing. The cap is 16k. Details: [model-choice.md](model-choice.md).
+
+## Baseline: where a card's day goes
+
+**Question.** With the team rules in place (cycles, takeover, carving: deployed 2026-10-07 21:43), what share of each
+GPU's day is spent generating, and what is the rest spent on? The lockup before those rules is left out.
+
+**How.** frontpage, three agents, 2026-10-07 21:43 to 10-08 19:44 (22 h). Model time from each server's own counters:
+tokens generated and prompt tokens per minute (lab archive) times seconds per token from the servers' lifetime timing
+totals. Session, waiting and driver time from the ledgers, the team event log and the loop logs. Time inside a session
+when the card was idle is split by the tool each turn was waiting on. Scripts: [analysis/baseline/](../analysis/baseline/).
+
+| Share of the day | a, RTX 3090 Ti | c, RTX 3090 | b, RTX 5060 Ti | Average |
+|---|---|---|---|---|
+| Generating | 28.6% | 41.3% | 56.3% | **42.1%** |
+| Reading the prompt | 8.4% | 10.7% | 2.6% | 7.2% |
+| Tests the agent runs in its session | 17.8% | 11.9% | 7.7% | 12.5% |
+| Tests the driver runs (baseline, verify, after merge) | 22.9% | 22.2% | 11.9% | 19.0% |
+| Other tools (shell, installs, file edits) | 10.5% | 7.9% | 4.9% | 7.8% |
+| Other driver work | 6.6% | 2.3% | 3.8% | 4.2% |
+| Waiting, nothing it may take | 5.3% | 3.5% | 12.7% | 7.2% |
+
+| Baseline per day | |
+|---|---|
+| Acceptance boxes delivered (ticked, verified, in main) | ~187 |
+| Verified tasks merged | 39 |
+| Tokens generated | 6.34M (a 2.31M, c 3.03M, b 1.00M); 17.2M if every card generated all day |
+| Prompt tokens read | 278M, 96% from the prefix cache |
+| Output tokens per acceptance box | ~34k |
+
+**Result.** 58% of each card's day is not generating, and 31.5% is test runs. The driver alone runs the full suite
+about three times per task, ~18 minutes: before the task's first session (a baseline, median 6 min), to verify the
+done claim (6.5 min) and again after merging main (5.5 min). The harness VM's CPUs were 85% idle that day (peak load
+2.3 on 6 cores), so the suite is slow because it runs serially, and any run that includes the timing tests holds the
+team-wide test lock alone. The 5060 Ti generates the largest share only because it is slow; the same waits are a
+smaller part of its day.
+
+**Decision.** This is the baseline. Changes are judged by acceptance boxes per day; the generating share and tokens
+per box explain why it moved. Tokens per day alone are not work: more thinking, polling turns or rejected claims all
+raise it. Candidate changes, by time at stake: reuse the test result of a tree that was just tested instead of a new
+baseline run (~7.5%), verify in the background while the agent starts its next task (~11.5%), a parallel suite with
+the timing tests outside the shared run, targeted tests inside sessions, a streamed plan (~7% waiting), and a re-run
+of the two-agents-per-card test now that the cards sit idle half the day.
+
