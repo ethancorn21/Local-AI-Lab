@@ -138,12 +138,17 @@ wait = defaultdict(int)
 for e in ev:
     if e["event"] == "wait_end":
         wait[e["agent"]] += int(e["detail"] or 0)
-agents = sorted({e["agent"] for e in ev})
+agents = sorted({e["agent"] for e in ev} - {"timing"})   # "timing": timing-watch, not an agent
 for a in agents:
     print(f"agent {a}: claims {c[(a, 'claim')]}, merged {c[(a, 'merge')]}, waited {wait[a] // 60} min, "
           f"merge conflicts {c[(a, 'merge_conflict')]}, sync conflicts {c[(a, 'sync_conflict')]}, "
           f"failed after merge {c[(a, 'post_merge_fail')]}, stale claims taken {c[(a, 'stale_claim')]}")
-bad = [e for e in ev if e["event"] in ("merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "dup_task_id", "merge_failed")]
+tm = [e for e in ev if e["agent"] == "timing"]
+if tm:
+    n = Counter(e["event"][7:] for e in tm)
+    print(f"timing tests on main: last {tm[-1]['detail'][:100]} ({tm[-1]['time'][5:16]}); "
+          + ", ".join(f"{k} {v}" for k, v in sorted(n.items())))
+bad = [e for e in ev if e["event"] in ("merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "dup_task_id", "merge_failed", "timing_error")]
 for e in bad[-6:]:
     print(f"  {e['time'][5:16]} {e['agent']} {e['event']} {e['task']} {e['detail'][:120]}")
 PY

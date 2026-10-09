@@ -10,7 +10,8 @@
 #   - the next agent to finish a task takes 998 (Priority: first); its fix (STUB_ON_998) goes into main, the timing
 #     run after that passes, 998 stays done; every task done, the goal check, both loops stop.
 # Scenario 2 (tw): timing-watch run directly on a team folder: load noise (fails unlocked, passes alone) opens nothing;
-#   a real failure opens 998 once, a second failure while 998 is open writes nothing; code already tested is not run
+#   an alone run that cannot get the VM to itself is "busy" (no task, tried again); a real failure opens 998 once, a
+#   second failure while 998 is open writes nothing; code already tested is not run
 #   again; a watch started while another runs leaves the "again" marker and exits. Plus the pytest plugin: an ordinary
 #   run leaves the timing test out and says so, naming the file runs it.
 set -u
@@ -164,7 +165,11 @@ echo n > "$W/src/noisy.txt"; git -C "$W" add -A && git -C "$W" commit -qm noisy;
 [ "$(last)" = noise ] && [ ! -f "$W/tasks/998-timing-check.md" ] && ok "tw: fails unlocked, passes alone: noise, no task" || bad "tw: noise case: $(last)"
 git -C "$W" commit -q --allow-empty -m "notes only"; echo note >> "$W/PROGRESS.md"; git -C "$W" add -A && git -C "$W" commit -qm notes
 n=$(nruns); tw; [ "$(nruns)" = "$n" ] && ok "tw: same code (notes changed only): not run again" || bad "tw: same code ran again"
-git -C "$W" rm -q src/noisy.txt; echo s > "$W/src/slow.txt"; git -C "$W" add -A && git -C "$W" commit -qm "slow down"; tw
+git -C "$W" rm -q src/noisy.txt; echo s > "$W/src/slow.txt"; git -C "$W" add -A && git -C "$W" commit -qm "slow down"
+python3 -c 'import fcntl,os,sys,time; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT); fcntl.flock(fd,fcntl.LOCK_SH); time.sleep(6)' "$AGENT_TEST_LOCK" & LP=$!
+sleep 0.5; TIMING_ALONE_WAIT=2 tw; wait $LP
+[ "$(last)" = busy ] && [ ! -f "$W/tasks/998-timing-check.md" ] && ok "tw: the alone run never got the VM to itself: busy, no task" || bad "tw: busy case: $(last)"
+tw
 [ "$(last)" = fail ] && grep -q '^Status: open' "$W/tasks/998-timing-check.md" && grep -q 'slow down' "$W/tasks/998-timing-check.md" \
   && ok "tw: real failure: 998 opened, naming the commit" || bad "tw: real failure: $(last)"
 echo y >> "$W/src/app.txt"; git -C "$W" add -A && git -C "$W" commit -qm "more"; tw

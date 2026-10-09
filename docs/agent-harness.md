@@ -262,12 +262,13 @@ merged from the others', so tasks the agents created do not become the human's.
   in team mode (`pylib/agent_testlock.py`, which says so on the terminal; naming the file runs them, alone on the VM).
   After every fast-forward of `main`, `timing-watch` runs them in a worktree of its own (`.agent/team/timing/wt`):
   first alongside the agents' runs, without a lock; only if that fails, the failing tests again alone (exclusive
-  `tests.lock`, waiting up to an hour for a quiet moment). A pass alone = noise from the load, logged. A failure alone
+  `tests.lock`, waiting up to an hour for a quiet moment). A pass alone = noise from the load, logged; no quiet moment
+  in that hour = "busy", inconclusive, tried again after the next merge. A failure alone
   writes `tasks/998-timing-check.md` into `main`: the failing tests, the merges since the last green run, and
   `Priority: first`, which puts it ahead of everything but an agent's own claims, so the next agent to finish a task
   takes it. While 998 is open nothing more is written; once done, the next failure opens it again. Merges close together
   are tested as one (one watch at a time; a merge during a run makes it test the newest `main` next). Runs:
-  `.agent/team/timing/runs.jsonl`, events `timing_*`. Why: the six timing tests of frontpage were 75% of its suite's
+  `.agent/team/timing/runs.jsonl`, events `timing_*` (agent `timing`; `agent-team status` shows the last one). Why: the six timing tests of frontpage were 75% of its suite's
   time and every run that included them locked the other checkouts out; Ethan: "I would rather the agent commit, move
   to next task, the test fails, a new task is created to fix it, the agent circles back around after the task."
 - **Shared memory files merge cleanly.** Journals keep both sides' entries, generated files are regenerated, hand-over

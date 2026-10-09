@@ -12,13 +12,15 @@ task is created to fix it, the agent circles back around after the task."
   - Code already tested (same tree without the notes: top-level *.md, tasks/, codemap/) is not tested again.
   - Main is checked out in a worktree of its own, $TEAM/timing/wt (ignored files such as downloaded models stay).
   - First run: no lock, alongside the agents' test runs. Only when that fails, the failing tests run again alone on
-    the VM (exclusive tests.lock, waiting up to an hour for a quiet moment); a pass then = noise from the load, logged.
+    the VM (exclusive tests.lock, waiting up to TIMING_ALONE_WAIT s, default an hour, for a quiet moment); a pass then
+    = noise from the load, logged. If it never got the VM to itself (the plugin gave up waiting), the result is
+    "busy": inconclusive, no task, and the same code is tested again after the next merge.
   - Failing alone too: task 998 (tasks/998-timing-check.md) is written into main, under the merge lock, with
     `Priority: first` (the next agent to finish a task takes it), the failing tests, and the merges since the last
     green run. While 998 is open nothing more is written; once it is done, the next failure opens it again.
   - Every run: one line in $TEAM/timing/runs.jsonl and an event in $TEAM/events.jsonl (agent "timing").
 """
-import fcntl, hashlib, json, os, re, subprocess, sys, time
+import datetime, fcntl, hashlib, json, os, re, subprocess, sys, time
 
 TEAM_DIR, SRC = os.path.realpath(sys.argv[1]), sys.argv[2]
 TEAM = os.path.join(TEAM_DIR, ".agent/team")
@@ -37,8 +39,8 @@ def git(*a, cwd=TEAM_DIR, check=False):
     return r.stdout
 
 
-def now():
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+def now():   # as the driver's events (date -Iseconds)
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def event(ev, detail, task=""):
@@ -83,7 +85,7 @@ def pytest(args, alone):
     env = dict(os.environ, AGENT_TIMING="1")
     if alone:
         env.pop("AGENT_TEST_LOCK_HELD", None)
-        env["AGENT_TEST_LOCK_WAIT"] = "3600"
+        env["AGENT_TEST_LOCK_WAIT"] = os.environ.get("TIMING_ALONE_WAIT", "3600")
     else:
         env["AGENT_TEST_LOCK_HELD"] = "1"   # the plugin takes no lock: the agents' runs go on
     t0 = time.time()
@@ -174,17 +176,20 @@ def check(sha, st):
             rc2, out2, rec["secs_alone"] = pytest(failing or files, alone=True)
             if rc2 in (0, 5):
                 rec["result"], rec["noise"] = "noise", failing
+            elif "agent_testlock: gave up after" in out2:   # ran under load after all: says nothing about the code
+                rec["result"], rec["busy"] = "busy", sorted(set(FAILED.findall(out2)))
             else:
                 failing = sorted(set(FAILED.findall(out2)))
                 rec["result"], rec["failing"] = "fail", failing
                 rec["task"] = open_task(sha, failing, out2, st)
     if rec["result"] == "pass":
         st["last_green"] = sha
-    st.update(key=key, sha=sha, result=rec["result"])
-    save_state(st)
+    if rec["result"] != "busy":   # (busy: this code gets another try)
+        st.update(key=key, sha=sha, result=rec["result"])
+        save_state(st)
     with open(os.path.join(D, "runs.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
-    detail = f"{rec['sha']} {rec['result']}" + (f": {' '.join(rec.get('failing') or rec.get('noise') or [])}" if rec["result"] in ("fail", "noise") else "")
+    detail = f"{rec['sha']} {rec['result']}" + (f": {' '.join(rec.get('failing') or rec.get('noise') or rec.get('busy') or [])}" if rec["result"] in ("fail", "noise", "busy") else "")
     event("timing_" + rec["result"], detail + (f" - {rec['task']}" if rec.get("task") else ""), TASK if rec.get("task") == "998 opened" else "")
 
 

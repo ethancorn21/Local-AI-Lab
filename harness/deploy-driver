@@ -7,7 +7,7 @@
 set -euo pipefail
 VM=${VM:-harnessvm} GU=${AGENT_USER:-agent}
 D=$(cd "$(dirname "$0")/driver" && pwd)
-FILES="agent-loop agent-team-lib team-takeover team-carve plan-schedule timing-watch user-tests"
+FILES="agent-loop agent-team agent-team-lib team-takeover team-carve plan-schedule timing-watch user-tests"
 B=/home/$GU/bin
 PL=/home/$GU/.agent-kit/pylib PYLIB="agent_testlock.py"   # pytest plugins agent-team-lib loads
 X=$(cd "$(dirname "$0")/pi-extensions" && pwd); XB=/home/$GU/.pi/agent/extensions
