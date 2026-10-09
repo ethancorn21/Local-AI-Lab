@@ -13,6 +13,7 @@ the result and the decision for each experiment. Long write-ups have their own p
 | [Model choice: 27B vs Flash-Next vs Swift](#model-choice) | 2026-10-05 | Keep the 27B; end capped thinking with a wrap-up sentence |
 | [Thinking cap: 8k, 16k, 32k](#thinking-cap) | 2026-10-06 | 16k |
 | [Baseline: where a card's day goes](#baseline-where-a-cards-day-goes) | 2026-10-08 | The baseline to beat: 42% of the day generating, 31.5% on tests |
+| [Test quality: what the tests catch](#test-quality-what-the-tests-catch) | 2026-10-08 | One test run per task instead of three; timing tests out of the per-task run; no direct-call tests |
 | [Type-1 log triage model](type1.md) | 2026-09-29 on | A small fine-tuned model leads; paused |
 
 ## Hand-over notes in the task file
@@ -136,4 +137,53 @@ raise it. Candidate changes, by time at stake: reuse the test result of a tree t
 baseline run (~7.5%), verify in the background while the agent starts its next task (~11.5%), a parallel suite with
 the timing tests outside the shared run, targeted tests inside sessions, a streamed plan (~7% waiting), and a re-run
 of the two-agents-per-card test now that the cards sit idle half the day.
+
+## Test quality: what the tests catch
+
+**Question.** The driver runs the full suite before a task (baseline), at the done claim (verify) and again after
+merging main; agents run it during sessions too. Tests are 31.5% of each card's day. Which of these runs catch real
+bugs, and how good is the suite itself?
+
+**How.** Three sources. (1) Every driver run on frontpage since 2026-10-02 (loop logs, decision journals). (2) Every
+failing test run inside a session since 10-06: was the failing test older than the session, and did the agent then
+change app code or test code? (3) Mutation testing on a clone of main (04cf1bc) on a Mac: 48 single-point bugs planted
+in the app (Python, page JavaScript, templates: flipped comparisons, deleted statements, changed constants, dropped
+template values), the suite run on each with the timing tests left out, and each catch attributed to the kind of test
+that failed (classified statically: browser, HTTP request to the app, direct call of app functions, golden file).
+Scripts: [analysis/test-quality/](../analysis/test-quality/).
+
+| Run | Count | Real bugs it caught |
+|---|---|---|
+| Baseline before a task's first session | 159 | 0 (6 found reds, all already known) |
+| Verify at the done claim | 150 claims | 0 of 5 test-related rejections: 1 timing flake, 2 suite timeouts caused by the test lock, 2 tests out of step with an intended change |
+| Re-run after merging main | 149 merges | 0 failures |
+| Agents' own runs (since 10-06) | 687 | 21 failures of tests older than the session: 0 fixed by app code alone, 10 by editing the test, 6 passed on a re-run |
+
+| Mutation result (48 planted bugs) | |
+|---|---|
+| No user-visible effect (chunk size, an unused embedder, a boundary never hit) | 6 |
+| Caught by the suite | 37 of 42 (88%), one of them as a hang |
+| Missed | 5: four in the page JavaScript (infinite scroll dropping the filter or the sort; the seen timer), one config check |
+| Caught by browser tests | 17; 7 only by them (all JavaScript) |
+| Caught by HTTP tests, never by a browser test | 20 (sources and read pages, fetchers, migration, a missing commit) |
+| Caught by direct-call tests | 8; 1 by nothing else |
+
+| Suite time by kind (Mac, 629 tests, 185 s) | Tests | Share of time |
+|---|---|---|
+| Timing tests (test_perf.py, 12k-item corpus) | 6 | 75% |
+| Browser | 16 | 19% |
+| HTTP | 488 | 6% |
+| Direct calls | 114 | 0.2% |
+
+**Result.** The suite is good at catching bugs (88%), but in practice it almost never catches one: the agents rarely
+break existing behaviour, and when an old test fails they edit the test about as often as anything else. Running it
+three times per task buys nothing over running it once. Six timing tests take three quarters of its time, catch speed
+regressions only, and hold the team-wide test lock alone, which caused waits and two false rejections. Direct-call
+tests (a quarter of the test functions) added one catch of their own. Browser tests alone would have caught 17 of the
+42 bugs; the HTTP tests cover pages and pipelines the browser tests never reach. Agents wrote about three lines of test
+per line of app code in the 10-07/08 sprint. Side findings: the browser tests hard-code the Linux browser path (they
+cannot run on the Mac), and the pinned feedparser 6.0.10 does not import on Python 3.13+.
+
+**Decision.** Proposed, not yet decided: one full run per task (merge main first, verify once; baseline from the last
+result for the same tree); timing tests out of the per-task run, on a schedule instead; no new direct-call tests.
 
