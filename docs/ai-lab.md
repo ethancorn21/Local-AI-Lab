@@ -109,7 +109,8 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 |---|---|
 | 8080 | vLLM on the 3090 Ti (production) |
 | 8081 | vLLM on the 3090 (agent c) |
-| 8082 | llama.cpp on the 5060 Ti |
+| 8082 | llama.cpp on the 5060 Ti (stopped 2026-10-10 for the Clef-flash test below) |
+| 8083 | Clef-flash 9B decision model, 8-bit, on the 5060 Ti: temporary, for the Ancient Works Finder re-ranker test (`/opt/llm/clef`) |
 | 8090 | Reserved: the type-1 log triage model |
 | 8700 | The lab console ([dashboard/](../dashboard/README.md)), on the AI box's localhost; the operator's Mac reaches it through its own SSH tunnel |
 
@@ -183,6 +184,7 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-01 | Thinking-effort results; RTX 5060 Ti in; "refactor first, then add". |
 | 10-02 | Team mode; frontpage, the first team project; pinned per-project Python packages; per-GPU temperature alerts. |
 | 10-03 | No more unit tests: end-to-end, integration and golden tests only. |
+| 10-10 | Clef-flash (Cloudflare's 9B decision model) on the 5060 Ti in place of its llama.cpp server, as a re-ranker test for the Ancient Works Finder. |
 | 10-04 | `agent-watch` rebuilt; `PITFALLS.md` split from the journal (14k tokens read at start-up instead of 63k); critical-path scheduling and prep for idle agents. |
 | 10-05 | Model choice test: the 27B stays; capped thinking now ends with a wrap-up sentence. |
 | 10-06 | Request deadline and required recommendation; `GOAL.md` numbers as intuition; one project per GPU; thinking cap back to 16k; takeover; plain-text requests answered in Telegram; second RTX 3090 in, agent c on it (`agent-team add`); both 24 GB cards at 300 W; OS updates on both machines; `agent-watch` status line reads task name, then sprint done · being built · not started. |
