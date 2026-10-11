@@ -69,6 +69,13 @@ sleep 6
 lab run lj a 004 --why "written while a waited" > /dev/null
 until_ 60 'ended 004' && ok "B2: a's job 004, written into main while a waited, ended done" || bad "B2: a's job 004: $(ended_any 004)"
 
+# B3: a job whose sessions commit only the task file and notes ends as no progress (ancient-works 2026-10-11: a
+# "re-verified" 206 for 8+ sessions while it waited on its dependencies; each session committed, so the job never ended)
+{ sed -e 's/003-third/005-fifth/; s#src/third/#src/fifth/#' "$FX/003-third.md"; echo "Stub-reverify: yes"; } > "$PR/lj/tasks/005-fifth.md"
+git -C "$PR/lj" add tasks/005-fifth.md && git -C "$PR/lj" commit -qm "[lead] 005"
+lab run lj a 005 --why "a task that only gets re-verified" > /dev/null
+until_ 60 'ended_any 005 | grep -q "no progress"' && ok "B3: a's job 005, only re-verified, ended as no progress" || bad "B3: a's job 005: '$(ended_any 005)'"
+
 # C: release - the team rules finish the rest
 lab lead release lj > /dev/null
 until_ 60 '[ "$(st tasks/001-first.md)" = "Status: done" ] && [ "$(st tasks/002-second.md)" = "Status: done" ]' \

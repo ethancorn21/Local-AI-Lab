@@ -61,6 +61,12 @@ if [ -n "$TASK" ] && nd=$(sed -n 's/^Stub-needs:[[:space:]]*//p' "$TASK") && [ -
   git add -A && git commit -q -m "$(basename "$TASK" .md | cut -d- -f1): cannot finish before $nd - added it to Depends on"
   echo '{"type":"stub"}'; exit 0
 fi
+# `Stub-reverify: yes` in a task file: every session "re-verifies" - a line in the task file and DECISIONS.md, committed,
+# nothing else, never done (ancient-works 2026-10-11: a on 206, waiting on its dependencies, 8+ sessions like this)
+if [ -n "$TASK" ] && grep -q '^Stub-reverify: yes' "$TASK"; then
+  echo "- re-verified by agent ${AGENT_ID:-?}" >> "$TASK"; echo "- $(basename "$TASK" .md): re-verified" >> DECISIONS.md
+  git add -A && git commit -q -m "$(basename "$TASK" .md | cut -d- -f1): re-verification"; echo '{"type":"stub"}'; exit 0
+fi
 skipf="" skipb=""   # what a driver carve message took away (read after this step's work time, as a session would see it)
 for m in .agent/inbox/[0-9]*.md; do
   [ -f "$m" ] && [ "$(head -c 14 "$m")" = "[driver] carve" ] || continue

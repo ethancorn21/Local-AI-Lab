@@ -486,6 +486,9 @@ answered_first() {
 LEAD_DIR=$HOME/.agent-kit/lead
 LEAD_STALE_MIN=${LEAD_STALE_MIN:-30}
 JOB_NO_PROGRESS=${JOB_NO_PROGRESS:-3}
+# sessions in a row whose commits touch only the task file and notes: higher, since a real investigation writes notes
+# only for 2 sessions at times (ancient-works c on 301 and 302a, 2026-10-11) while a stuck one goes on for 8+ (a on 206)
+JOB_NOTES_ONLY=${JOB_NOTES_ONLY:-5}
 lead_project() { basename "${TEAM_DIR:-$P}"; }
 lead_fresh() {  # true while a lead holds this project; prints "<holder> <minutes since its last lab call>"
   local h t; read -r h t < "$LEAD_DIR/$(lead_project).lock" 2>/dev/null || return 1
@@ -1022,6 +1025,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   while :; do
     if [ -f .agent/job ]; then   # the lead's job (Lab v2 above)
       job_pick
+      [ "$(job_task)" = "${job_of:-}" ] || { job_of=$(job_task); job_still=0; }   # a new job starts its count afresh
       if [ -n "$task" ] && { [ -z "${TEAM_DIR:-}" ] || claim_task "$task"; }; then LEAD_WAITING=""; break; fi
       [ -n "$task" ] && JOB_END="agent $(claim_owner "$(claim_key "$task")") holds $(claim_key "$task")"
       job_end "$JOB_END"; task=""; continue
@@ -1209,6 +1213,16 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   elif [ "$code_leftovers" -gt 0 ]; then no_progress=0; log "no agent commit, but the driver saved $code_leftovers changed code file(s) - counts as progress"
   elif ! server_ok; then log "model server down during iteration $i - not counted toward the no-progress limit"
   else no_progress=$((no_progress + 1)); log "no agent commit ($no_progress/$NO_PROGRESS_LIMIT)"; fi
+  # In a job, a session whose commits touch only the task file and the notes did nothing the lead can use
+  # (ancient-works 2026-10-11: a "re-verified" 206 in 8+ sessions, each committing only its task file and DECISIONS.md,
+  # while 206 waited on its dependencies; every session had a commit, so the job never ended).
+  if [ -f .agent/job ]; then
+    # first parent, no merges: this agent's own commits and the driver's save of its leftovers, not main's work
+    if git log --first-parent --no-merges --format= --name-only "$head0..HEAD" \
+        | grep -vE '^(tasks/|(PROGRESS|DECISIONS|CODEMAP|PITFALLS)\.md$|codemap/)' | grep -q .; then
+      job_still=0
+    else job_still=$(( ${job_still:-0} + 1 )); log "job: no change outside the task file and notes ($job_still/$JOB_NOTES_ONLY)"; fi
+  fi
   if [ -f .agent/stalled ]; then   # the watchdog stopped the session: say what hung, in the task the next session reads
     stalled_s=$(cat .agent/stalled); rm -f .agent/stalled
     log "STALL: iteration $i stopped by the watchdog after ${stalled_s}s without output"
@@ -1300,7 +1314,10 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   fi
   # A job that makes no progress goes back to the lead, which decides what next (Lab v2 above).
   if [ -f .agent/job ] && [ "$no_progress" -ge "$JOB_NO_PROGRESS" ]; then
-    job_end "no progress: $no_progress sessions without an agent commit"; no_progress=0; continue
+    job_end "no progress: $no_progress sessions without an agent commit"; no_progress=0; job_still=0; continue
+  fi
+  if [ -f .agent/job ] && [ "${job_still:-0}" -ge "$JOB_NOTES_ONLY" ]; then
+    job_end "no progress: $job_still sessions changed only the task file and notes"; job_still=0; continue
   fi
   if [ "$no_progress" -ge "$NO_PROGRESS_LIMIT" ]; then
     { echo "# STUCK - $(date '+%F %T')"; echo; echo "$NO_PROGRESS_LIMIT iterations in a row without an agent commit on $task."; echo;

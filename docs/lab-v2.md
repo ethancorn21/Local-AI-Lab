@@ -64,8 +64,9 @@ lab log                                           the journal; also the console'
 lab lead release ancient-works                    back to the team rules
 ```
 
-A job ends by itself: the task is done and merged, it waits on a request to the human, or 3 sessions in a row make
-no commit. The worker writes why in the journal and waits for the next job. A waiting worker does not sync with main,
+A job ends by itself: the task is done and merged, it waits on a request to the human, 3 sessions in a row make
+no commit, or 5 in a row commit only the task file and notes (`JOB_NOTES_ONLY`: a worker re-checking a task it
+cannot close). The worker writes why in the journal and waits for the next job. A waiting worker does not sync with main,
 so when a job names a task it cannot see, it merges main first: the lead may have just written the task there.
 
 ## The pieces
