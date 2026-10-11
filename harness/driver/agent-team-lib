@@ -172,6 +172,13 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
     u=$(touches_of "$1" | grep -c .)
     [ "$u" -gt "$TEAM_MAX_TOUCHES" ] && { echo "too big for this agent's window ($u files > $TEAM_MAX_TOUCHES)"; return 0; }
   fi
+  # The planning task never waits for the files other agents' tasks touch. ancient-works 2026-10-10: GOAL.md changed at
+  # 21:11 and 000 was reopened on agent a's branch (Touches: PLAN.md, tasks/, tests/, ...); it waited on agent c's 001
+  # (pipeline/, tests/), then also on 200, which c took meanwhile, since nearly every task lists a test file: two hours,
+  # with no end in sight, while a wrote prep notes for eight tasks under the old plan. The re-plan goes ahead, and a
+  # conflict in a shared file is the merge's to resolve; while a holds 000, new tasks on its files wait (this check, run
+  # by the others).
+  case $1 in tasks/000-*) return 0 ;; esac
   for t in $(others_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
   return 0
 }

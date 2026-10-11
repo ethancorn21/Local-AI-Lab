@@ -85,7 +85,8 @@ electricity.
 5. **Goal check (task 999).** When the queue is empty, one agent checks the whole project against `GOAL.md` point by
    point, with evidence, and adds tasks for anything missing. The loop stops after a check that adds nothing.
 6. **Iterate.** The human tries the result and edits `GOAL.md`. The driver notices the change, reopens the plan with the
-   difference, and the cycle runs again. The human is notified when the work is done or when an agent needs something
+   difference, and the cycle runs again. The re-plan goes first: it does not wait for the files other agents are working
+   on, and new tasks on its files wait for it. The human is notified when the work is done or when an agent needs something
    only a person can do.
 
 ## One session, step by step

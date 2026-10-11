@@ -184,7 +184,10 @@ merged from the others', so tasks the agents created do not become the human's.
 - **Claims.** A task and its subtasks belong to one agent. A claim survives restarts; it can be taken over only when
   its agent's loop has been gone for 2 hours (a heartbeat file shows it is alive).
 - **Dependencies and files.** A task is offered only when its `Depends on:` tasks are done in `main`, and never while
-  another agent holds a task whose `Touches:` files overlap.
+  another agent holds a task whose `Touches:` files overlap. The planning task (000) is the exception: it never waits
+  for other agents' files, and while an agent holds it, new tasks on its files wait for it. Why: ancient-works
+  2026-10-10, a re-plan after a `GOAL.md` change waited two hours on agent c's 001, then also on 200, which c took
+  meanwhile (nearly every task lists a test file, as 000 does), while agent a wrote prep notes under the old plan.
 - **Size.** An agent can be limited to tasks that touch at most N files (`TEAM_MAX_TOUCHES`: 8 for agent b). A task too
   big for another running agent gets split first, into new top-level tasks it can take.
 - **Split what the team waits on.** When another running agent has waited for the others `TEAM_IDLE_SPLIT_MIN` (20)
@@ -332,6 +335,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_task_format.sh` | `Status: Done (verified)` read as done by the loop, the archive and the sprint count; a `## Depends on` heading named in the log and the next prompt, with the line to write; the note gone once fixed |
 | `test_user_tests.sh` | `USER_TESTS`: a new non-browser test file and a test added to an old one rejected, the browser and timing tests accepted, editing and deleting old tests allowed, nothing checked without the setting |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
+| `test_team_replan_overlap.sh` | The 2026-10-10 starved re-plan: a reopened 000 is free and first for the lead agent while another agent holds a task on the same files; other tasks on those files still wait; while 000 is held, new tasks on its files wait for it |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
