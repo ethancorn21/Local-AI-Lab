@@ -27,4 +27,19 @@ echo "$out" | grep -q "agent b: stopped, left stopped" && ok "says b was left st
 out=$(timeout 20 bash "$TEAMCMD" restart p 2>&1); rc=$?
 [ $rc -ne 0 ] && [ ! -s "$T/calls" ] && echo "$out" | grep -q "no agent is running" \
   && ok "nothing running: refuses and starts nobody" || bad "nothing running: rc $rc, calls $(cat "$T/calls" | tr '\n' ';')"
+# two restarts overlap (ancient-works 2026-10-11): the first stops a (quick session) and waits for c (long session);
+# the second, started meanwhile, must count the a the first stopped as running and start it again
+mkdir -p "$HOME/projects/p.c/.agent"; echo "$HOME/projects/p.c" > "$HOME/projects/p/.agent/team/agents/c"
+: > "$T/calls"
+flock "$HOME/projects/p.a/.agent/loop.lock" sleep 2 & ha=$!
+flock "$HOME/projects/p.c/.agent/loop.lock" sleep 12 & hc=$!
+sleep 0.5
+timeout 60 bash "$TEAMCMD" restart p > "$T/first" 2>&1 & r1=$!
+sleep 4   # a's session has ended: the first restart stopped it and still waits for c
+out2=$(timeout 60 bash "$TEAMCMD" restart p 2>&1)
+wait $r1; wait $ha $hc 2>/dev/null
+echo "$out2" | grep -q "agent a: stopped, left stopped" && bad "the second restart left a stopped: $out2" || ok "the second restart counts a, stopped by the first, as running"
+[ "$(grep -c "start $HOME/projects/p.a" "$T/calls")" -ge 1 ] && [ "$(grep -c "start $HOME/projects/p.c" "$T/calls")" -ge 1 ] \
+  && ok "a and c both started again" || bad "starts: $(grep start "$T/calls" | tr '\n' ';')"
+[ ! -e "$HOME/projects/p.a/.agent/restarting" ] && [ ! -e "$HOME/projects/p.c/.agent/restarting" ] && ok "no restart marker left" || bad "a marker is left"
 exit $fail

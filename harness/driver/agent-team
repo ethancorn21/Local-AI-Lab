@@ -103,11 +103,14 @@ stop)   # a deliberate stop: fresh heartbeats keep each agent's claims its own (
   for id in $(ids); do touch "$TEAM/loops/$id.beat"; echo "agent $id: $(agent-stop "$(wt "$id")" ${3:-})"; done
   ;;
 restart)   # after a harness change: every running agent finishes its current session, then starts again (new driver
-           # code). An agent that was stopped stays stopped: it may have been stopped on purpose.
-  run=""; for id in $(ids); do flock -n "$(wt "$id")/.agent/loop.lock" true || run="$run $id"; done
+           # code). An agent that was stopped stays stopped: it may have been stopped on purpose. One a restart stopped
+           # (.agent/restarting, until it starts again) counts as running: ancient-works 2026-10-11, two deploys two
+           # minutes apart; the first restart stopped agent a, the second found it stopped and left it so, and the first
+           # still waited for c: a sat idle 33 minutes.
+  run=""; for id in $(ids); do { ! flock -n "$(wt "$id")/.agent/loop.lock" true || [ -f "$(wt "$id")/.agent/restarting" ]; } && run="$run $id"; done
   [ -n "$run" ] || { echo "no agent is running: agent-team start $name starts them all"; exit 1; }
   for id in $(ids); do case " $run " in *" $id "*) ;; *) echo "agent $id: stopped, left stopped (agent-team start $name starts every agent)";; esac; done
-  for id in $run; do agent-stop "$(wt "$id")" > /dev/null; done
+  for id in $run; do touch "$(wt "$id")/.agent/restarting"; agent-stop "$(wt "$id")" > /dev/null; done
   echo "waiting for the current sessions of agent(s)$run to end..."
   while :; do
     n=0; for id in $run; do flock -n "$(wt "$id")/.agent/loop.lock" true || n=$((n + 1)); done
@@ -115,7 +118,7 @@ restart)   # after a harness change: every running agent finishes its current se
   done
   rm -f "$TEAM/STOP"
   for id in $run; do touch "$TEAM/loops/$id.beat"; done   # each agent's claims stay its own while the loops start
-  for id in $run; do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; done
+  for id in $run; do echo "agent $id:"; agent-start "$(wt "$id")" | sed 's/^/  /'; rm -f "$(wt "$id")/.agent/restarting"; done
   ;;
 status)
   [ -f "$P/.agent/team-main" ] || { echo "$P is not a team project"; exit 1; }
