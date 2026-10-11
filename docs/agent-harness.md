@@ -257,8 +257,14 @@ merged from the others', so tasks the agents created do not become the human's.
 - **Handing a task to a bigger agent.** After 3 sessions in a row without a ticked box while a bigger agent waits, the
   small agent gives the task up; its work is kept on a backup branch. Only that task's files leave its branch while it
   holds other claims (a full reset once cost it a parked task's work).
-- **Sync and merge, one test run per task.** Before every session the driver merges `main` into the agent's branch.
-  An accepted task goes into `main` under the merge lock: `main` merged into the branch, the suite run once on that
+- **Sync and merge, one test run per task.** Before every session the driver merges `main` into the agent's branch;
+  a conflict is left to the agent's next session, except two kinds no session would ever come for. A task file that
+  `main` has finished (done or dropped) and the agent does not hold takes `main`'s version, and that task's other work
+  leaves the branch; an agent that waits holding no claim, with any other conflict, has its branch backed up and reset
+  to `main`. Why: frontpage 2026-10-10, agent b's loop stopped stuck on 294, a took the stale claim and finished it, and
+  b's restarted branch kept its notes in the task file: every sync conflicted, b had nothing workable in its stale view
+  of the tasks and so no session, and it sat 10 h idle, 766 commits behind `main`, holding a claim on a task it could
+  not see. An accepted task goes into `main` under the merge lock: `main` merged into the branch, the suite run once on that
   result (verify leaves it to the merge in team mode), `main` fast-forwarded; a conflict or a new failure reopens the
   task. Every driver run's failing tests are recorded under a key of the committed code without the notes
   (`.agent/team/tested/`), and a task's baseline at its first hand-out, and the start-up audit, read that record
@@ -326,6 +332,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_task_format.sh` | `Status: Done (verified)` read as done by the loop, the archive and the sprint count; a `## Depends on` heading named in the log and the next prompt, with the line to write; the note gone once fixed |
 | `test_user_tests.sh` | `USER_TESTS`: a new non-browser test file and a test added to an old one rejected, the browser and timing tests accepted, editing and deleting old tests allowed, nothing checked without the setting |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
+| `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
 | `test_team_add.sh` | Adding an agent to an existing team: its checkout, its settings, and who owns each task |

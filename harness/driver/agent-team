@@ -148,7 +148,7 @@ if tm:
     n = Counter(e["event"][7:] for e in tm)
     print(f"timing tests on main: last {tm[-1]['detail'][:100]} ({tm[-1]['time'][5:16]}); "
           + ", ".join(f"{k} {v}" for k, v in sorted(n.items())))
-bad = [e for e in ev if e["event"] in ("merge_conflict", "sync_conflict", "post_merge_fail", "deps_deadlock", "dup_task_id", "merge_failed", "timing_error")]
+bad = [e for e in ev if e["event"] in ("merge_conflict", "sync_conflict", "sync_reset", "post_merge_fail", "deps_deadlock", "dup_task_id", "merge_failed", "timing_error")]
 for e in bad[-6:]:
     print(f"  {e['time'][5:16]} {e['agent']} {e['event']} {e['task']} {e['detail'][:120]}")
 PY

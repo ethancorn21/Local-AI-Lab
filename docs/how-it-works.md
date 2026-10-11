@@ -387,7 +387,7 @@ The driver handles the routine failures itself and reports the rest:
 | Tasks wait on each other in a cycle | All of them go to one agent, with their work, which builds them together ([cycles](#when-tasks-wait-on-each-other-cycles)) |
 | A task is set blocked, but no request to the human about it is open | Set back in progress; its next session is told to file the request first if it needs the human |
 | Every agent waits 15 minutes for the others, with work left and no request open | A stall: the human is told why each agent waits, and each agent starts its own most important task anyway ([stall](#when-nothing-moves-the-stall-net)) |
-| An agent's branch conflicts with `main` | The next session is told to resolve the merge first |
+| An agent's branch conflicts with `main` | The next session is told to resolve the merge first. A stale copy of a task another agent finished takes `main`'s version at once, and an agent with nothing to build and no task of its own is reset to `main` (its branch kept as a backup) |
 | An agent needs the human | It files a request with its own recommendation; that task waits, other work continues, and the human gets a Telegram message and answers by replying (confidential projects: encrypted, in the telecloak app) |
 | Nobody answers for 2 hours and there is nothing else to build | The agent goes ahead with its recommendation; the human is told and can still override. Things only a person can do (hardware, credentials, money, accounts) keep waiting |
 | A loop starts on a GPU another project is using | The other project's loop finishes its current session and stops; the newest start wins |

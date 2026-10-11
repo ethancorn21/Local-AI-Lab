@@ -199,18 +199,60 @@ task_range() {  # task_range : the numbers this agent gives the top-level tasks 
 }
 
 # Sync: the latest main into this agent's branch before every pick (and during waits). A conflict is left to the next
-# session (SYNC_CONFLICT goes into its prompt); the branch stays as it was.
-SYNC_CONFLICT=""
+# session (SYNC_CONFLICT goes into its prompt); the branch stays as it was. But a session comes only with work to take,
+# and a branch behind main does not even see main's new tasks. frontpage 2026-10-10: agent b's loop stopped STUCK on 294
+# with its research notes in the task file; agent a took the stale claim and finished 294 in main. From b's restart
+# every sync conflicted on that one file, and b, with nothing workable in its stale view of the tasks, never had a
+# session: 325 identical conflicts in 10 hours, 766 commits behind main, holding a claim (318) on a task its checkout
+# could not see, while the team stalled. So two kinds of conflict never wait for a session:
+# - a task file that main has finished (done or dropped) and this agent does not hold: main's version is the task, the
+#   branch's copy is a stale view of it. It takes main's version, and the task's other work leaves the branch
+#   (team_put_back), so it never reaches main with this agent's next merge. The branch's notes stay in its history.
+# - any conflict while this agent waits holding no claim: what its branch holds beyond main belongs to no task of its
+#   (its merged work is in main; given and handed-over work went with the task), so the branch is backed up and reset
+#   to main (team_idle_reset), as a hand-over with no other claim resets it.
+SYNC_CONFLICT="" SYNC_CONFLICT_SEEN=""
+merge_main() {  # merge_main <commit message> : merge main into this branch; on any other conflict, abort with MERGE_FILES set
+  local f u keep="" took="" keys=""
+  MERGE_FILES=""
+  git merge --no-ff --no-edit -m "$1" main > /dev/null 2>&1 && return 0
+  u=$(git diff --name-only --diff-filter=U)
+  for f in $u; do
+    case $f in tasks/000-*|tasks/999-*|tasks/*/*) keep+=" $f"; continue ;; tasks/[0-9]*.md) ;; *) keep+=" $f"; continue ;; esac
+    case $(status_of <(git show "main:$f" 2>/dev/null)) in done|dropped) ;; *) keep+=" $f"; continue ;; esac
+    [ "$(claim_owner "$(claim_key "$f")")" = "$AGENT_ID" ] && { keep+=" $f"; continue; }   # its own: the session decides
+    took+=" $f"; [[ " $keys " == *" $(claim_key "$f") "* ]] || keys+=" $(claim_key "$f")"
+  done
+  # shellcheck disable=SC2086
+  if [ -n "$u" ] && [ -z "$keep" ] && git checkout -q --theirs -- $took && git add -- $took && git commit -q --no-edit; then
+    for f in $keys; do team_put_back "$f" "finished in main by another agent" || true; done
+    tev sync_took_main "" "$(echo $took)"
+    log "team: main has finished$(echo $took | sed 's/^/ /') and this agent does not hold it: main's version taken, its other work put back (this branch's notes stay in its history)"
+    return 0
+  fi
+  MERGE_FILES=$(echo $u); git merge --abort 2>/dev/null
+  return 1
+}
 team_sync() {
   commit_leftovers "uncommitted work before syncing with main"
-  git merge-base --is-ancestor main HEAD && { SYNC_CONFLICT=""; return 0; }
-  if git merge --no-ff --no-edit -m "[driver] sync: merge main into $BRANCH" main > /dev/null 2>&1; then
-    SYNC_CONFLICT=""; log "team: merged the latest main into $BRANCH"; return 0
+  git merge-base --is-ancestor main HEAD && { SYNC_CONFLICT="" SYNC_CONFLICT_SEEN=""; return 0; }
+  if merge_main "[driver] sync: merge main into $BRANCH"; then
+    SYNC_CONFLICT="" SYNC_CONFLICT_SEEN=""; log "team: merged the latest main into $BRANCH"; return 0
   fi
-  SYNC_CONFLICT=$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ $//')
-  git merge --abort 2>/dev/null
+  SYNC_CONFLICT=$MERGE_FILES
+  [ "$SYNC_CONFLICT" = "$SYNC_CONFLICT_SEEN" ] && return 1   # logged once: an idle agent syncs every minute
+  SYNC_CONFLICT_SEEN=$SYNC_CONFLICT
   log "team: main conflicts with $BRANCH in: $SYNC_CONFLICT - the next session resolves it"; tev sync_conflict "" "$SYNC_CONFLICT"
   return 1
+}
+team_idle_reset() {  # after a conflict while waiting: an agent that holds no claim takes main as it is (Sync above)
+  [ -z "$(own_claims)" ] && [ ! -f .agent/merge-pending ] || return 0
+  local b; b="$BRANCH-sync-$(date +%Y%m%d-%H%M%S)"
+  git branch "$b" HEAD || { log "WARNING team: could not back up $BRANCH before resetting it to main"; return 0; }
+  git reset -q --hard main || { log "WARNING team: could not reset $BRANCH to main"; return 0; }
+  tev sync_reset "" "conflict in $SYNC_CONFLICT; backup $b"
+  log "team: $BRANCH conflicted with main in $SYNC_CONFLICT while this agent held no task - the branch is kept on $b, and $BRANCH is reset to main"
+  SYNC_CONFLICT="" SYNC_CONFLICT_SEEN=""
 }
 # Accepted: bring the branch into main. Under the team's merge lock: merge main into the branch, run the tests once on
 # exactly what main becomes (the task's one test run: verify_done leaves it to here), then fast-forward main. A conflict
@@ -220,8 +262,8 @@ team_merge() {  # team_merge <task file>
   exec 8> "$TEAM/merge.lock"; flock 8
   commit_leftovers "before merging $(task_id "$f") into main"
   if ! git merge-base --is-ancestor main HEAD; then
-    if ! git merge --no-ff --no-edit -m "[driver] merge main into $BRANCH before merging $(task_id "$f")" main > /dev/null 2>&1; then
-      files=$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ $//'); git merge --abort 2>/dev/null; flock -u 8
+    if ! merge_main "[driver] merge main into $BRANCH before merging $(task_id "$f")"; then
+      files=$MERGE_FILES; flock -u 8
       tev merge_conflict "$f" "$files"; log "team: $f accepted but conflicts with main in: $files - reopened"
       VERIFY=rejected
       reopen "$f" "- Accepted, but it cannot go into main yet: your branch conflicts with main (the other agent's finished work) in: $files"$'\n'"    Run \`git merge main\`, resolve each conflict keeping both sides' intent, run the tests, commit, then set the task done again."$'\n'
@@ -296,7 +338,7 @@ team_wait() {  # one wait step (60 s) while another agent works
   team_state wait "$TEAM_WAIT_T0"; team_stall_check
   [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting - stopping"; exit 0; }
   sleep "${TEAM_WAIT_S:-60}"
-  team_sync || true
+  team_sync || team_idle_reset
 }
 team_wait_done() {  # a task was picked after a wait: record how long this agent was held up
   [ -n "$TEAM_WAIT_T0" ] || return 0
