@@ -61,6 +61,14 @@ sleep 8
 [ "$(claims_by a | sed 's/003-third-renamed/003-third/')" = "tasks/000-plan.md tasks/003-third.md " ] && ok "B: a claimed only its jobs" || bad "B: a claimed: $(claims_by a)"
 lab log 50 | grep -q "lead claude .* run .* 003-third" && ok "B: lab log shows the lead's run of 003" || bad "B: lab log: $(lab log 5)"
 
+# B2: the lead writes a new task into main while a waits, then gives it to a (ancient-works 2026-10-11: 302 was
+# committed to main after c had started waiting; c's checkout never synced, and the job ended "no such task")
+sed -e 's/003-third/004-fourth/; s#src/third/#src/fourth/#' "$FX/003-third.md" > "$PR/lj/tasks/004-fourth.md"
+git -C "$PR/lj" add tasks/004-fourth.md && git -C "$PR/lj" commit -qm "[lead] 004"
+sleep 6
+lab run lj a 004 --why "written while a waited" > /dev/null
+until_ 60 'ended 004' && ok "B2: a's job 004, written into main while a waited, ended done" || bad "B2: a's job 004: $(ended_any 004)"
+
 # C: release - the team rules finish the rest
 lab lead release lj > /dev/null
 until_ 60 '[ "$(st tasks/001-first.md)" = "Status: done" ] && [ "$(st tasks/002-second.md)" = "Status: done" ]' \

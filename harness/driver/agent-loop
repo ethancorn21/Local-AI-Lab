@@ -506,6 +506,9 @@ job_pick() {  # sets task to the job's next step, or JOB_END to why the job is o
   # by number, not by name: an agent may rename its task file (ancient-works 2026-10-11: a's session turned
   # 204-van-deventer.md into 204-van_deventer.md, and the job ended as "no such task")
   [ -f "$j" ] || j=$(compgen -G "tasks/$id-*.md" | head -1)
+  # a worker waiting for the lead does not sync with main; the lead may have just written the task there
+  # (ancient-works 2026-10-11: 302 committed to main after c started waiting ended as "no such task")
+  [ -f "$j" ] || { [ -n "${TEAM_DIR:-}" ] && team_sync; j=$(job_task); [ -f "$j" ] || j=$(compgen -G "tasks/$id-*.md" | head -1); }
   [ -f "$j" ] || { JOB_END="no such task: $(job_task)"; return; }
   case $(status_of "$j") in done|dropped) JOB_END=$(status_of "$j"); return ;; esac
   WAITING=$(waiting_tasks)

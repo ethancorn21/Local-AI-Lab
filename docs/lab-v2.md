@@ -65,7 +65,8 @@ lab lead release ancient-works                    back to the team rules
 ```
 
 A job ends by itself: the task is done and merged, it waits on a request to the human, or 3 sessions in a row make
-no commit. The worker writes why in the journal and waits for the next job.
+no commit. The worker writes why in the journal and waits for the next job. A waiting worker does not sync with main,
+so when a job names a task it cannot see, it merges main first: the lead may have just written the task there.
 
 ## The pieces
 
