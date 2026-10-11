@@ -42,7 +42,7 @@ const KIND = { Bash: "k-bash", Read: "k-read", Edit: "k-edit", Write: "k-write",
 const chip = (k, text, more) => h("span", { class: `chip ${k}${more ? " " + more : ""}` }, text);
 
 /* ================================================================ state from the server */
-const S = { channels: {}, flow: {}, boards: {}, feed: {}, hw: {}, hist: { minutes: [], temp: {}, power: {} }, skew: 0, online: false };
+const S = { channels: {}, flow: {}, boards: {}, lead: null, feed: {}, hw: {}, hist: { minutes: [], temp: {}, power: {} }, skew: 0, online: false };
 const SUBS = new Set(), TICKERS = new Set(), ACKS = new Map();
 const nowS = () => Date.now() / 1000 + S.skew;
 function notify(ch, kind, ev, extra) { for (const f of [...SUBS]) f(ch, kind, ev, extra); }
@@ -55,7 +55,7 @@ function handle(m) {
       S.channels = {}; for (const [n, c] of Object.entries(m.channels || {})) S.channels[n] = indexChannel(c);
       S.flow = {}; for (const [n, f] of Object.entries(m.flow || {})) S.flow[n] = { since: f.since, done: f.done,
         sessions: new Map((f.sessions || []).map(x => [x.iter, x])), nodes: new Map((f.nodes || []).map(x => [x.id, x])), marks: new Map((f.marks || []).map(x => [x.id, x])) };
-      Object.assign(S, { boards: m.boards || {}, feed: m.feed || {}, hw: m.hw || {}, hist: m.hist || S.hist, skew: (m.now || Date.now() / 1000) - Date.now() / 1000 });
+      Object.assign(S, { boards: m.boards || {}, lead: m.lead || null, feed: m.feed || {}, hw: m.hw || {}, hist: m.hist || S.hist, skew: (m.now || Date.now() / 1000) - Date.now() / 1000 });
       return go(route, true);
     case "reset":
       S.channels[m.ch] = indexChannel({ meta: m.meta || {}, events: [], snap: null, last: m.last });
@@ -87,6 +87,7 @@ function handle(m) {
     }
     case "task": { const c = S.channels[m.ch]; if (!c) return; c.snap = m.snap; notify(m.ch, "task"); return renderChrome(); }
     case "board": if (m.board) S.boards[m.project] = m.board; else delete S.boards[m.project]; notify(null, "board"); return renderChrome();
+    case "lead": S.lead = m.lead; notify(null, "lead"); return renderChrome();
     case "feed": S.feed = m.feed; return renderChrome();
     case "hw": S.hw = m.hw; return notify(null, "hw");
     case "hist": S.hist = m.hist; return notify(null, "hist");
@@ -392,6 +393,7 @@ function renderChrome() {
   $("#nav-main").replaceChildren(h("span", { class: "label" }, "Lab"),
     item("live", h("span", { class: "led " + (chNames().length ? "on" : "") }), "Live", "all agents at once"),
     item("flow", h("span", { class: "led " + (chNames().length ? "on" : "") }), "Timeline", "file changes · sprint"),
+    item("lead", h("span", { class: "led " + (leadOn() ? "on" : "") }), "Lead", leadSub()),
     item("board", h("span", { class: "led" }), "Board", boards.length ? boards.map(([p, b]) => `${p} ${b.done.length}/${b.total}`).join(" · ") : "no sprint yet", asks ? h("span", { class: "n", title: `${asks} request${asks > 1 ? "s" : ""} waiting` }, asks) : null),
     item("hardware", h("span", { class: "led " + (hot ? "warn" : "") }), "Hardware", `GPUs ${tempText}`));
   $("#nav-agents").replaceChildren(h("span", { class: "label" }, "Agents"),
@@ -539,6 +541,40 @@ function board() {
     if (kind === "task") { const sig = JSON.stringify(openAsks().map(a => a.ch + a.id)); if (sig !== askSig) { askSig = sig; paintAsks(); } }
   });
   return h("div", { class: "page" }, asksHost, boardsHost);
+}
+
+/* ---- lead (Lab v2, docs/lab-v2.md): who leads each project, each agent's job, the lead journal */
+const leadLocks = () => Object.entries((S.lead || {}).locks || {}).filter(([, k]) => k.fresh);
+const leadOn = () => leadLocks().length > 0;
+const leadSub = () => leadOn() ? leadLocks().map(([p, k]) => `${k.holder} leads ${p}`).join(" · ") : "team rules";
+function leadPage() {
+  const host = h("div", { style: "display: flex; flex-direction: column; gap: 26px" });
+  const paint = () => {
+    const L = S.lead || {}, locks = L.locks || {}, jobs = L.jobs || {}, rows = (L.journal || []).slice().reverse();
+    const projects = [...new Set([...Object.keys(locks), ...chNames().map(n => S.channels[n].meta.project)])].filter(Boolean).sort();
+    const proj = p => { const k = locks[p], on = k && k.fresh;
+      return h("div", { class: "lead-proj" },
+        h("div", { class: "row" }, h("b", {}, p), on ? h("span", { class: "chip k-driver live" }, `${k.holder} leads`) : h("span", { class: "chip quiet" }, "team rules"),
+          h("span", { class: "muted" }, on ? `last lab call ${k.age_min} min ago` : "each agent picks its own work")),
+        ...chNames().filter(n => S.channels[n].meta.project === p).map(n => { const m = S.channels[n].meta;
+          return h("div", { class: "row lead-worker", style: chStyle(n) }, h("span", { class: "tag" }, letter(n)),
+            jobs[n] ? h("span", { class: "chip k-write" }, `job ${jobs[n]}`) : h("span", { class: "chip quiet" }, on ? "waiting for a job" : "no job"),
+            h("span", { class: "muted" }, m.activity || m.task || "")); })); };
+    const row = r => h("tr", {}, h("td", { class: "mono" }, (r.time || "").slice(5, 16).replace("T", " ")),
+      h("td", {}, h("span", { class: "chip " + (String(r.who).startsWith("lead") ? "k-driver" : "quiet") }, r.who)),
+      h("td", {}, r.project), h("td", {}, h("span", { class: "chip quiet" }, r.event)),
+      h("td", { class: "mono" }, (r.task || "").split("/").pop().replace(/\.md$/, "")), h("td", {}, r.detail));
+    host.replaceChildren(
+      h("section", {}, h("div", { class: "sec-h" }, h("h2", {}, "Who leads"),
+        h("span", { class: "label" }, "the lead gives each agent a job; with no lab call for 30 minutes the team rules take over")),
+        h("div", { class: "lead-projects" }, projects.length ? projects.map(proj) : h("p", { class: "muted" }, "No project on the console yet."))),
+      h("section", {}, h("div", { class: "sec-h" }, h("h2", {}, "Lead journal"), h("span", { class: "label" }, "every lead action and every job's end, newest first")),
+        rows.length ? h("table", { class: "journal" }, h("tbody", {}, rows.map(row)))
+          : h("p", { class: "muted" }, "Nothing yet: a line appears when the lead runs a lab command or an agent ends a job.")));
+  };
+  paint();
+  SUBS.add((ch, kind) => { if (kind === "lead" || kind === "meta") paint(); });
+  return h("div", { class: "page" }, host);
 }
 
 /* ---- hardware */
@@ -873,12 +909,12 @@ function agentPage(name) {
 
 /* ================================================================ routing, ticking */
 function go(id, keepScroll) {
-  if (!["live", "board", "hardware", "flow"].includes(id) && !S.channels[id] && Object.keys(S.channels).length) id = "live";
+  if (!["live", "lead", "board", "hardware", "flow"].includes(id) && !S.channels[id] && Object.keys(S.channels).length) id = "live";
   route = id; SUBS.clear(); TICKERS.clear();
   const ch = S.channels[id];
   $("#title").textContent = { live: "Live", board: "Board", hardware: "Hardware", flow: "Timeline" }[id] || (ch ? `${label(id)} · ${ch.meta.project || ""}` : id);
-  $("#view").replaceChildren(id === "live" ? live() : id === "board" ? board() : id === "hardware" ? hardware() : id === "flow" ? timeline() : agentPage(id));
-  $("#main").dataset.route = ["live", "flow"].includes(id) ? "live" : ["board", "hardware"].includes(id) ? "page" : "agent";
+  $("#view").replaceChildren(id === "live" ? live() : id === "lead" ? leadPage() : id === "board" ? board() : id === "hardware" ? hardware() : id === "flow" ? timeline() : agentPage(id));
+  $("#main").dataset.route = ["live", "flow"].includes(id) ? "live" : ["lead", "board", "hardware"].includes(id) ? "page" : "agent";
   if (!keepScroll) $("#main").scrollTop = 0;
   renderChrome();
   store.set("lab-console-route", id);

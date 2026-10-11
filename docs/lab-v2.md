@@ -1,6 +1,6 @@
 # Lab v2: one lead, many workers
 
-Status: decided 2026-10-11, not built. Replaces the team layer described in [agent-harness.md](agent-harness.md)
+Status: decided 2026-10-11. Phase 1 built and deployed the same night (Claude leads ancient-works; `lab`, job mode, the console's Lead page). Replaces the team layer described in [agent-harness.md](agent-harness.md)
 (claims, file overlap, prep, carve, takeover, hand-over to a bigger agent, idle split, stall net) once the phases
 below are done.
 
@@ -54,6 +54,19 @@ you ◄──► FRONT DOOR: Claude, in a Claude Code session. One inbox for eve
 The integrity rules stay because each one held where a prompt instruction failed (design principle 2). The
 scheduling rules go because a lead that sees the whole board can handle what each of them was written for.
 
+## Using it (phase 1)
+
+```
+lab board                                         everything at once
+lab lead take ancient-works                       lead it (workers finish their session, then wait for jobs)
+lab run ancient-works a 213 --why "Imola first"   a job: that task only, until done, blocked or stuck
+lab log                                           the journal; also the console's Lead page
+lab lead release ancient-works                    back to the team rules
+```
+
+A job ends by itself: the task is done and merged, it waits on a request to the human, or 3 sessions in a row make
+no commit. The worker writes why in the journal and waits for the next job.
+
 ## The pieces
 
 - **`lab`, a small command on the VM**, the only way the lead acts: `lab board` (all of it, one screen), `lab run
@@ -79,15 +92,19 @@ scheduling rules go because a lead that sees the whole board can handle what eac
   This is a deliberate exception to "never share a card", which is about a second model loaded on a busy card.
   Measure a worker's tokens/s with and without lead calls; if it costs more than a few percent, the lead gets its own
   slot.
-- **A hidden project is led only by the Qwen lead.** Claude never reads inside it, so `lab board` filters it out for
-  Claude by the console's hidden list. Its workers' GPUs move only by the Qwen lead or the owner.
+- **A hidden project is led only by the Qwen lead.** Claude never reads inside it, so `lab` opens only the projects
+  named in `~/.agent-kit/lead-projects` (an allowlist, like the console shipper's `--only`) and never lists the
+  projects folder. Its workers' GPUs move only by the Qwen lead or the owner.
 - **Telegram stays off** (2026-10-11).
 
 ## Phases
 
-1. **Claude leads ancient-works.** `lab` commands, one-task mode in `agent-loop`, the lead journal. Until phase 3 the
-   team layer still runs frontpage, and runs ancient-works whenever no Claude session is open.
-2. **See it.** Console Lead pane and inbox; the session-start hook.
+1. **Claude leads ancient-works.** Built 2026-10-11: `lab` (`harness/tools/lab`), job mode in `agent-loop`, the lead
+   journal (`~/.agent-kit/lead/journal.jsonl`), and the console's Lead page (who leads, each agent's job, the journal).
+   Until phase 3 the team layer still runs frontpage, and runs ancient-works whenever the lead's lock goes stale: no
+   `lab` call for 30 minutes, which happens while Claude is busy with something else, not only when the session ends.
+2. **The inbox.** `lab inbox` exists (open requests, ended jobs, new tasks, stuck and merged work since the last
+   look); the session-start hook that puts it in front of Claude, and the inbox on the console, come next.
 3. **The Qwen lead.** Event-driven, with the lead lock. From here nothing waits for a Claude session.
 4. **frontpage moves over; the team layer is deleted** (`agent-team-lib`, `team-takeover`, `team-carve`,
    `plan-schedule`, the prep and carve extensions' team parts, and their tests).

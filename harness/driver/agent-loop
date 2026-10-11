@@ -466,6 +466,54 @@ answered_first() {
     [ -f "$t" ] && workable "$t" in-progress && { echo "$t"; return; }
   done
 }
+# Lab v2 (docs/lab-v2.md; the owner, 2026-10-11: "I just want this orchestration madness to stop. It is too locked down
+# in rigid code"): a lead decides who builds what. `lab run` writes a job, one task, to .agent/job. The worker builds
+# only that task and the subtasks it splits it into, with no claims of others, file overlap or pick order in the way,
+# until it is done, waits on a request to the human, or makes no progress in JOB_NO_PROGRESS sessions; then it writes
+# why to the lead journal and waits for the next job. While the lead's lock is fresh a worker without a job waits: no
+# prep, no carve, no picking. A stale lock (no `lab` call for LEAD_STALE_MIN) hands the project back to the team rules.
+# A GOAL.md change no longer reopens 000 by itself while a lead leads: the lead runs 000 as a job.
+LEAD_DIR=$HOME/.agent-kit/lead
+LEAD_STALE_MIN=${LEAD_STALE_MIN:-30}
+JOB_NO_PROGRESS=${JOB_NO_PROGRESS:-3}
+lead_project() { basename "${TEAM_DIR:-$P}"; }
+lead_fresh() {  # true while a lead holds this project; prints "<holder> <minutes since its last lab call>"
+  local h t; read -r h t < "$LEAD_DIR/$(lead_project).lock" 2>/dev/null || return 1
+  [[ ${t:-} =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - t )) -lt $((LEAD_STALE_MIN * 60)) ] || return 1
+  echo "$h $(( ($(date +%s) - t) / 60 ))"
+}
+lead_mode() { [ -f .agent/job ] || lead_fresh > /dev/null; }
+journal() {  # journal <event> <task> <detail> : one line in the lead journal (lab board, the console's Lead pane)
+  mkdir -p "$LEAD_DIR"
+  jq -cn --arg t "$(date -Iseconds)" --arg w "${AGENT_ID:-}" --arg p "$(lead_project)" --arg e "$1" --arg k "$2" --arg d "$3" \
+    '{time: $t, who: ("worker " + $w), project: $p, event: $e, task: $k, detail: $d}' >> "$LEAD_DIR/journal.jsonl"
+}
+job_task() { head -1 .agent/job 2>/dev/null; }
+job_pick() {  # sets task to the job's next step, or JOB_END to why the job is over
+  local j f id
+  task="" JOB_END=""
+  j=$(job_task); id=$(task_id "$j")
+  [ -f "$j" ] || { JOB_END="no such task: $j"; return; }
+  case $(status_of "$j") in done|dropped) JOB_END=$(status_of "$j"); return ;; esac
+  WAITING=$(waiting_tasks)
+  f=$(answered_first); case $f in "$j"|tasks/"$id"[a-z]*) task=$f; return ;; esac
+  for f in tasks/"$id"[a-z]*-*.md "$j"; do   # its subtasks first, then the task itself
+    [ -f "$f" ] && TEAM_IGNORE=1 workable "$f" any && { task=$f; return; }
+  done
+  if grep -qE "^tasks/$id([a-z][^/]*)?-" <<<"$WAITING"; then JOB_END="waiting on a request to the human"
+  else JOB_END="nothing workable (status $(status_of "$j"))"; fi
+}
+job_end() {  # job_end <reason> : the job is over; the worker reports it and waits for the next one
+  local j; j=$(job_task)
+  log "job ended: $j - $1"; journal job_ended "$j" "$1"
+  printf '%s\t%s\t%s\n' "$(date -Iseconds)" "$j" "$1" > .agent/job-ended; rm -f .agent/job
+}
+lead_wait() {  # one wait step for the lead's next job
+  [ -n "${LEAD_WAITING:-}" ] || { LEAD_WAITING=1; log "waiting for a job from the lead ($(lead_fresh | cut -d' ' -f1))"; journal waiting "" "no job"; }
+  [ -n "${TEAM_DIR:-}" ] && team_beat
+  [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the lead - stopping"; exit 0; }
+  sleep "${LEAD_POLL_S:-30}"
+}
 # Nothing to work on while requests are open: wait for a new answer, or a message when a task could take it.
 wait_for_human() {
   local t0 last now a0 key rung
@@ -949,12 +997,20 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   wait_for_talk
   wait_for_server
   [ -n "${TEAM_DIR:-}" ] && { team_beat; team_retry_merge; team_sync || true; }
-  goal_changed
+  lead_mode || goal_changed
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
   # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
   PREP="" CARVE="" FORCED_NOTE=""
   while :; do
+    if [ -f .agent/job ]; then   # the lead's job (Lab v2 above)
+      job_pick
+      if [ -n "$task" ] && { [ -z "${TEAM_DIR:-}" ] || claim_task "$task"; }; then LEAD_WAITING=""; break; fi
+      [ -n "$task" ] && JOB_END="agent $(claim_owner "$(claim_key "$task")") holds $(claim_key "$task")"
+      job_end "$JOB_END"; task=""; continue
+    fi
+    if lead_fresh > /dev/null; then lead_wait; continue; fi
+    LEAD_WAITING=""
     [ -n "${TEAM_DIR:-}" ] && team_takeover_sync   # claims asked for by a faster agent go to it; work of claims given to this one arrives
     WAITING=$(waiting_tasks)
     task=$(answered_first)
@@ -1014,6 +1070,7 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   ticked0=$(grep -cE '^[[:space:]]*- \[x\]' "$task" 2>/dev/null || true)
   harness_stamp
   log "iteration $i: $task (harness $HARNESS_ID)"
+  [ -f .agent/job ] && journal session "$task" "iteration $i"
   codemap_sync "before iteration $i"
   # PITFALLS.md's contents block is what the agent reads first: a merge of main (team mode) can bring entries the
   # block does not count yet (frontpage 2026-10-04: "Unsorted 78" after another agent had sorted 21 of them).
@@ -1223,6 +1280,10 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   if [ "$(status_of "$task")" != done ] && [ "$runs" -ge "$STALL_SESSIONS" ] && [ $(( (runs - STALL_SESSIONS) % 4 )) -eq 0 ]; then
     log "STALLED: $task has run $runs sessions without finishing"
     [ -n "${TEAM_DIR:-}" ] && tev stalled "$task" "$runs sessions"
+  fi
+  # A job that makes no progress goes back to the lead, which decides what next (Lab v2 above).
+  if [ -f .agent/job ] && [ "$no_progress" -ge "$JOB_NO_PROGRESS" ]; then
+    job_end "no progress: $no_progress sessions without an agent commit"; no_progress=0; continue
   fi
   if [ "$no_progress" -ge "$NO_PROGRESS_LIMIT" ]; then
     { echo "# STUCK - $(date '+%F %T')"; echo; echo "$NO_PROGRESS_LIMIT iterations in a row without an agent commit on $task."; echo;

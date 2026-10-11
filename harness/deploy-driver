@@ -8,7 +8,7 @@ set -euo pipefail
 VM=${VM:-harnessvm} GU=${AGENT_USER:-agent}
 D=$(cd "$(dirname "$0")/driver" && pwd)
 FILES="agent-loop agent-team agent-team-lib team-takeover team-carve plan-schedule timing-watch user-tests task-audit decisions-archive"
-TD=$(cd "$(dirname "$0")/tools" && pwd) TOOLS="sprint-progress agent-start"   # operator tools that read task files
+TD=$(cd "$(dirname "$0")/tools" && pwd) TOOLS="sprint-progress agent-start lab ring-doorbell"   # operator tools that read task files; the lead's commands; the doorbell
 B=/home/$GU/bin
 PL=/home/$GU/.agent-kit/pylib PYLIB="agent_testlock.py"   # pytest plugins agent-team-lib loads
 X=$(cd "$(dirname "$0")/pi-extensions" && pwd); XB=/home/$GU/.pi/agent/extensions

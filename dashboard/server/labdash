@@ -74,6 +74,7 @@ class Hub:
         self.flow = {}           # name -> the timeline: {since, sessions, nodes, marks, done}; diffs in flow_bodies
         self.flow_bodies = {}    # (name, node id) -> the node's diff or code, fetched when the operator opens it
         self.boards = {}
+        self.lead = None   # Lab v2: who leads, each agent's job, the lead journal (docs/lab-v2.md)
         self.feed = {"connected": False, "since": None, "host": None}
         self.hw = {}
         self.hist = {"temp": {}, "power": {}, "minutes": []}
@@ -95,7 +96,7 @@ class Hub:
         return {"channels": {n: {"meta": c["meta"], "events": c["events"], "snap": c["snap"], "last": c["last"]} for n, c in self.channels.items()},
                 "flow": {n: {"since": f["since"], "done": f["done"], "sessions": list(f["sessions"].values()), "nodes": list(f["nodes"].values()),
                              "marks": list(f["marks"].values())} for n, f in self.flow.items()},
-                "boards": self.boards, "feed": self.feed, "hw": self.hw, "hist": self.hist, "now": time.time()}
+                "boards": self.boards, "lead": self.lead, "feed": self.feed, "hw": self.hw, "hist": self.hist, "now": time.time()}
 
     def drop(self, ch):
         self.flow.pop(ch, None)
@@ -215,6 +216,9 @@ class Hub:
                 if isinstance(p, str) and NAME.match(p):
                     self.boards[p] = tidy(o.get("board"))
                     self.broadcast({"type": "board", "project": p, "board": self.boards[p]})
+            elif op == "lead":
+                self.lead = tidy(o.get("lead"))
+                self.broadcast({"type": "lead", "lead": self.lead})
             elif op == "gone":
                 self.drop(ch)
                 if self.channels.pop(ch, None) is not None:

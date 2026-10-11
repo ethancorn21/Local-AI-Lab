@@ -100,6 +100,14 @@ write(f"{SECRET}/.agent/sessions/iter-0001.jsonl", json.dumps({"type": "message_
                                                                {"type": "text_delta", "delta": "SECRET-MARKER"}}) + "\n")
 write(f"{SECRET}/.agent/loop.log", f"{stamp()} iteration 1: tasks/001-x.md (harness 0)\n")
 write(f"{S}/hidden", "# one per line\nsecret\n")
+# Lab v2: the lead leads demo, agent a has a job; a row about the hidden project must never leave the VM
+write(f"{S}/lead/demo.lock", f"claude {int(time.time())}\n")
+write(f"{S}/lead/secret.lock", f"claude {int(time.time())}\n")
+write(f"{WT}/.agent/job", "tasks/002-feed-rows.md\n")
+write(f"{S}/lead/journal.jsonl", "".join(json.dumps(r) + "\n" for r in [
+    {"time": "2026-10-11T02:00:00-0500", "who": "lead claude", "project": "demo", "event": "run", "task": "tasks/002-feed-rows.md", "detail": "worker a: <b>first</b>"},
+    {"time": "2026-10-11T02:01:00-0500", "who": "lead claude", "project": "secret", "event": "run", "task": "tasks/001-x.md", "detail": "SECRET-LEAD"},
+    {"time": "2026-10-11T02:02:00-0500", "who": "worker a", "project": "demo", "event": "session", "task": "tasks/002-feed-rows.md", "detail": "iteration 1"}]))
 
 sleepers = [subprocess.Popen(["sleep", "3000"]) for _ in range(3)]
 write(f"{WT}/.agent/loop.pid", str(sleepers[0].pid))
@@ -249,7 +257,7 @@ def state():
     return json.loads(http("GET", "/api/state")[2])
 
 
-env = {**os.environ, "LABDASH_CACHE": f"{S}/cache", "LABDASH_PROJECTS": P, "LABDASH_HIDDEN": f"{S}/hidden", "LABDASH_SPRINT": SPRINT, "LABDASH_SOCKET": SOCK}
+env = {**os.environ, "LABDASH_LEAD": f"{S}/lead", "LABDASH_CACHE": f"{S}/cache", "LABDASH_PROJECTS": P, "LABDASH_HIDDEN": f"{S}/hidden", "LABDASH_SPRINT": SPRINT, "LABDASH_SOCKET": SOCK}
 ship = subprocess.Popen([PY, SHIP, "--stdio"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(f"{S}/ship.log", "w"))
 ingest = subprocess.Popen([PY, INGEST], env=env, stdin=ship.stdout, stdout=ship.stdin)
 
@@ -352,6 +360,11 @@ try:
     check("b's state for the chip: waiting, from the driver's last line", "nothing to take now" in (cb2.get("driver") or ""), cb2.get("driver"))
     check("hidden project never shipped", not any(n.startswith("secret") for n in state()["channels"]) and "secret" not in state()["boards"]
           and not any(b"SECRET-MARKER" in r for r in RAW))
+    ld = wait_for(lambda: state().get("lead"))
+    check("lead: lock, job and journal shipped", bool(ld) and ld["locks"].get("demo", {}).get("holder") == "claude" and ld["locks"]["demo"]["fresh"]
+          and ld["jobs"].get("demo.a") == "002-feed-rows" and [r["event"] for r in ld["journal"]] == ["run", "session"], ld)
+    check("lead: the hidden project's lock and journal rows never shipped", bool(ld) and "secret" not in ld["locks"]
+          and not any(r["project"] == "secret" for r in ld["journal"]) and not any(b"SECRET-LEAD" in r for r in RAW))
     write(f"{S}/state.json", json.dumps(state()))
 
     # ---- the next session

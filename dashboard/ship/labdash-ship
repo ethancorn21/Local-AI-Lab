@@ -97,6 +97,45 @@ def task_parts(rel):
     return (m.group(1), m.group(2).replace("-", " ")) if m else ("", rel or "")
 
 
+# ------------------------------------------------------------------------------------------------ the lead
+
+LEAD_DIR = os.environ.get("LABDASH_LEAD", os.path.join(HOME, ".agent-kit", "lead"))
+LEAD_STALE_MIN = int(os.environ.get("LEAD_STALE_MIN", "30"))
+
+
+def lead_snapshot(only, channels):
+    """Lab v2 (docs/lab-v2.md): who leads each shipped project, each agent's job, the lead journal's tail. Rows of
+    projects that are not shipped are dropped by name, like everything else here."""
+    shown = {n for n in visible(only) if "." not in n}
+    locks = {}
+    for p in sorted(shown):
+        parts = (read(os.path.join(LEAD_DIR, f"{p}.lock"), 200) or "").split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            age = (time.time() - int(parts[1])) / 60
+            locks[p] = {"holder": parts[0][:32], "age_min": int(age), "fresh": age < LEAD_STALE_MIN}
+    jobs = {}
+    for n, c in channels.items():
+        j = (read(os.path.join(c.path, ".agent", "job"), 400) or "").strip()
+        if j:
+            jobs[n] = os.path.basename(j.split("\n")[0])[:80].removesuffix(".md")
+    rows = []
+    try:
+        with open(os.path.join(LEAD_DIR, "journal.jsonl"), "rb") as fh:
+            start = max(0, os.fstat(fh.fileno()).st_size - 65536)
+            fh.seek(start)
+            tail = fh.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]   # a cut first line is dropped
+    except OSError:
+        tail = []
+    for l in tail:
+        try:
+            r = json.loads(l)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("project") in shown:
+            rows.append({k: str(r.get(k, ""))[:400] for k in ("time", "who", "project", "event", "task", "detail")})
+    return {"locks": locks, "jobs": jobs, "journal": rows[-40:]}
+
+
 # ------------------------------------------------------------------------------------------------ which projects
 
 def visible(only):
@@ -913,7 +952,7 @@ def main():
     target = args[args.index("--target") + 1] if "--target" in args else "labdash-feed"
     stdio = "--stdio" in args
     link = Link(target, stdio)
-    channels, boards = {}, {}
+    channels, boards, lead_last = {}, {}, [None]
     broken = [False]
     flow_q, hist_threads = queue.Queue(), {}
 
@@ -956,6 +995,7 @@ def main():
         send({"op": "hello", "version": 2, "host": os.uname().nodename})
         channels.clear()
         boards.clear()
+        lead_last[0] = None
         hist_threads.clear()   # a restarted server has no timeline: every agent's history is sent again
         scan()
         send({"op": "synced", "channels": sorted(channels), "projects": [os.path.basename(m) for m in mains()]})
@@ -996,6 +1036,14 @@ def main():
                     if b is not None and b != boards.get(m):
                         boards[m] = b
                         send({"op": "board", "project": os.path.basename(m), "board": b})
+                try:
+                    ld = lead_snapshot(only, channels)
+                except Exception as exc:
+                    fault("the lead pane", exc)
+                    ld = None
+                if ld is not None and ld != lead_last[0]:
+                    lead_last[0] = ld
+                    send({"op": "lead", "lead": ld})
             try:
                 cmd = link.cmds.get(timeout=0.25)
             except queue.Empty:

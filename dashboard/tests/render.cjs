@@ -111,6 +111,13 @@ const text = sel => [...d.querySelectorAll(sel)].map(e => e.textContent);
     cpu: { temp: 55, load: 12, ram_used: 20.1, ram_total: 62.6 }, servers: { "8080": { state: "generating", tok_s: 31.4, kv_pct: 42, ctx_max: 150000 } } } });
   push({ type: "hist", hist: { minutes, temp: { "RTX 3090": minutes.map((_, i) => 60 + i % 7), "RTX 3090 Ti": minutes.map((_, i) => i === 5 ? null : 70 + i % 5) },
                                 power: { "RTX 3090": minutes.map(() => 240), "RTX 3090 Ti": minutes.map(() => 245) } } });
+  navTo("Lead");
+  check("lead: the project shows its lead and agent a's job", text("#view .lead-proj .chip").some(t => t === "claude leads")
+    && text("#view .lead-worker .chip").some(t => t === "job 002-feed-rows"), text("#view .lead-proj .chip"));
+  check("lead: journal newest first, agent text stays text", text("#view table.journal tr td:nth-child(4)").join("|") === "session|run"
+    && !d.querySelector("#view table.journal b"), text("#view table.journal tr td:nth-child(4)"));
+  check("lead: nav says who leads", text("#nav-main button").some(t => t.includes("claude leads demo")), text("#nav-main button"));
+  check("lead: no null or undefined", !/\b(null|undefined|NaN)\b/.test(text("#view").join(" ")));
   navTo("Hardware");
   await tick(80);
   check("hardware: no null or undefined", !/\b(null|undefined|NaN)\b/.test(chrome()), chrome().match(/.{30}\b(null|undefined|NaN)\b.{0,10}/)?.[0]);

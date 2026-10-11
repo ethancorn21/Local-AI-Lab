@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""lab: the lead's commands (Lab v2, docs/lab-v2.md). The lead decides who builds what; this only does it and logs it.
+  lab board                                   every led project: lead, workers, tasks, open requests
+  lab lead [take|release <project>]           who leads what; take a project, or hand it back to the team rules
+  lab run <project> <worker> <task> [--now] --why <text>
+                                              give a worker a job: that task only, until done, blocked or stuck
+                                              (--now: stop its running session first instead of after it)
+  lab cancel <project> <worker> --why <text>  drop a worker's job (its running session ends normally)
+  lab stop <project> <worker> [--now] --why <text>   stop a worker's loop
+  lab msg <project> <worker> [--now] <text>   a message into the worker's session (--now: stop and send)
+  lab answer <project> <request> <text>       answer a request to the human (<worker>/<n> when the number is ambiguous)
+  lab inbox                                   what needs the human, and what happened since the last look
+  lab log [n]                                 the lead journal (the console's Lead pane)
+  --as <holder>  who leads (default claude). Every call by a holder keeps its leads fresh: a lead with no call for
+                 LEAD_STALE_MIN (30) minutes goes stale, and its workers go back to the team rules.
+Projects: only those named in ~/.agent-kit/lead-projects (one per line). Nothing else under ~/projects is opened.
+Runs as the agents' user on the VM.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.environ.get("LAB_PROJECTS", os.path.join(HOME, "projects"))
+LEAD = os.path.join(HOME, ".agent-kit", "lead")
+ALLOW = os.path.join(HOME, ".agent-kit", "lead-projects")
+JOURNAL = os.path.join(LEAD, "journal.jsonl")
+STALE_MIN = int(os.environ.get("LEAD_STALE_MIN", "30"))
+CARDS = {"8080": "3090 Ti", "8081": "3090", "8082": "5060 Ti"}
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def projects():
+    try:
+        return [l.strip() for l in open(ALLOW) if l.strip() and not l.startswith("#")]
+    except OSError:
+        die(f"no {ALLOW}: write the project names the lead may see, one per line")
+
+
+def project(name):
+    if name not in projects():
+        die(f"{name}: not in {ALLOW}")
+    return os.path.join(PROJECTS, name)
+
+
+def read(path, default=""):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return default
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.lab-{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def alive(pidfile):
+    try:
+        os.kill(int(read(pidfile).split()[0]), 0)
+        return True
+    except (ValueError, IndexError, OSError):
+        return False
+
+
+def journal(who, event, proj="", task="", detail=""):
+    os.makedirs(LEAD, exist_ok=True)
+    row = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "who": f"lead {who}", "project": proj, "event": event,
+           "task": task, "detail": detail}
+    with open(JOURNAL, "a") as fh:
+        fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+# ---- leads
+def lock(name):
+    return os.path.join(LEAD, f"{name}.lock")
+
+
+def lead_of(name):
+    """(holder, minutes since its last call, fresh)"""
+    parts = read(lock(name)).split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None, None, False
+    m = (time.time() - int(parts[1])) / 60
+    return parts[0], int(m), m < STALE_MIN
+
+
+def refresh(who):
+    for name in projects():
+        holder, _, _ = lead_of(name)
+        if holder == who:
+            write(lock(name), f"{who} {int(time.time())}\n")
+
+
+# ---- tasks and workers
+def status_of(path):
+    m = re.match(r"\s*Status:\s*([A-Za-z-]+)", read(path).split("\n", 1)[0], re.I)
+    return m.group(1).lower() if m else "?"
+
+
+def field(text, name):
+    m = re.search(rf"^{name}:[ \t]*(.*)$", text, re.M | re.I)
+    return m.group(1).strip() if m else ""
+
+
+def tasks(main):
+    out = []
+    d = os.path.join(main, "tasks")
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        m = re.match(r"(\d+[a-z]*)-.*\.md$", f)
+        if not m:
+            continue
+        text = read(os.path.join(d, f))
+        title = re.search(r"^# (.*)$", text, re.M)
+        out.append({"id": m.group(1), "file": f"tasks/{f}", "status": status_of(os.path.join(d, f)),
+                    "title": title.group(1) if title else f, "deps": re.findall(r"\b\d+[a-z]*\b", field(text, "Depends on"))})
+    return out
+
+
+def claims(main):
+    """task key -> worker id"""
+    held = {}
+    d = os.path.join(main, ".agent", "team", "claims")
+    for k in os.listdir(d) if os.path.isdir(d) else []:
+        owner = read(os.path.join(d, k, "owner")).split()
+        if owner and not k.startswith("."):
+            held[k] = owner[0]
+    return held
+
+
+def workers(name):
+    main = os.path.join(PROJECTS, name)
+    for wid in "abcdefgh":
+        w = f"{main}.{wid}"
+        if os.path.isfile(os.path.join(w, ".agent", "team.env")):
+            yield wid, w
+
+
+def find_task(main, ref):
+    ref = os.path.basename(ref).removesuffix(".md")
+    tid = re.match(r"\d+[a-z]*", ref)
+    if not tid:
+        die(f"{ref}: not a task number")
+    hits = [t for t in tasks(main) if t["id"] == tid.group(0)]
+    if not hits:
+        die(f"no task {tid.group(0)} in {main}/tasks")
+    return hits[0]
+
+
+def worker_line(name, wid, w, held):
+    env = read(os.path.join(w, ".agent", "team.env"))
+    port = re.search(r"LLM_URL=\S*:(\d+)", env)
+    card = CARDS.get(port.group(1), port.group(1)) if port else "?"
+    a = os.path.join(w, ".agent")
+    if not alive(os.path.join(a, "loop.pid")):
+        state = "stopped"
+    else:
+        last = read(os.path.join(a, "loop.log")).rstrip("\n").rsplit("\n", 1)[-1]
+        state = re.sub(r"^\S+ \S+ ", "", last)[:110]
+        state += " [session running]" if alive(os.path.join(a, "pi.pid")) else ""
+    job = read(os.path.join(a, "job")).strip()
+    mine = sorted(k for k, o in held.items() if o == wid)
+    out = f"  {wid}  {card:<8} {'job ' + job.split('/')[-1].removesuffix('.md') if job else 'no job'}  |  {state}"
+    if mine:
+        out += f"  |  holds {' '.join(mine)}"
+    ended = read(os.path.join(a, "job-ended")).strip().split("\t")
+    if not job and len(ended) == 3:
+        out += f"\n      last job: {ended[1].split('/')[-1]} ended {ended[0][11:16]}: {ended[2]}"
+    return out
+
+
+def open_asks(name):
+    main = os.path.join(PROJECTS, name)
+    for wid, w in [("main", main)] + list(workers(name)):
+        d = os.path.join(w, ".agent", "asks")
+        for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            if not re.fullmatch(r"\d+\.md", f):
+                continue
+            body = read(os.path.join(d, f))
+            if re.search(r"^status: open$", body, re.M):
+                req = body.split("## Request", 1)[-1].strip().split("\n", 1)[0]
+                yield wid, f[:-3], os.path.join(d, f), field(body, "task"), req
+
+
+# ---- verbs
+def board(who):
+    for name in projects():
+        main = os.path.join(PROJECTS, name)
+        holder, mins, fresh = lead_of(name)
+        lead = f"lead: {holder} ({mins} min ago)" if fresh else "lead: none - team rules"
+        print(f"{name}   {lead}")
+        held = claims(main)
+        for wid, w in workers(name):
+            print(worker_line(name, wid, w, held))
+        ts = tasks(main)
+        done = {t["id"] for t in ts if t["status"] in ("done", "dropped")}
+        live = [t for t in ts if t["status"] not in ("done", "dropped")]
+        print(f"  tasks: {len(done)} done, {len(live)} not done")
+        for t in live:
+            wait = [d for d in t["deps"] if d not in done and d.lstrip("0") != t["id"].lstrip("0")]
+            note = f"  waits for {','.join(wait)}" if wait else ""
+            h = held.get(re.match(r"\d+", t["id"]).group(0))
+            print(f"    {t['id']:<5} {t['status']:<12} {('(' + h + ')') if h else '':<4} {t['title'][:70]}{note}")
+        asks = list(open_asks(name))
+        for wid, n, _, task, req in asks:
+            print(f"  REQUEST {wid}/{n} on {task}: {req[:120]}")
+        print()
+
+
+def lead_cmd(who, args):
+    if not args:
+        for name in projects():
+            holder, mins, fresh = lead_of(name)
+            print(f"{name}: {holder + ' (' + str(mins) + ' min ago)' if fresh else 'team rules'}")
+        return
+    if len(args) != 2 or args[0] not in ("take", "release"):
+        die("lab lead [take|release <project>]")
+    act, name = args
+    project(name)
+    if act == "take":
+        write(lock(name), f"{who} {int(time.time())}\n")
+        journal(who, "lead", name, "", f"{who} leads {name}: workers without a job wait for one")
+        print(f"{who} leads {name}. Workers finish their current session, then wait for a job (lab run).")
+    else:
+        try:
+            os.remove(lock(name))
+        except OSError:
+            pass
+        journal(who, "release", name, "", f"{name} back to the team rules")
+        print(f"{name} is back on the team rules; jobs already given run to their end.")
+
+
+def flag(args, name, has_value=True):
+    if name not in args:
+        return None
+    i = args.index(name)
+    val = args[i + 1] if has_value and i + 1 < len(args) else True
+    del args[i:i + (2 if has_value else 1)]
+    return val
+
+
+def worker_dir(name, wid):
+    main = project(name)
+    w = f"{main}.{wid}"
+    if not os.path.isfile(os.path.join(w, ".agent", "team.env")):
+        die(f"no worker {wid} in {name}")
+    return main, w
+
+
+def run(who, args):
+    now, why = flag(args, "--now", False), flag(args, "--why")
+    if len(args) != 3 or not why:
+        die("lab run <project> <worker> <task> [--now] --why <text>")
+    name, wid, ref = args
+    main, w = worker_dir(name, wid)
+    t = find_task(main, ref)
+    if t["status"] in ("done", "dropped"):
+        die(f"{t['id']} is {t['status']} in main")
+    held = claims(main)
+    key = re.match(r"\d+", t["id"]).group(0)
+    other = held.get(key)
+    if other and other != wid and alive(os.path.join(f"{main}.{other}", ".agent", "loop.pid")):
+        die(f"{t['id']} is held by worker {other}: give that worker another job, or stop it, first")
+    a = os.path.join(w, ".agent")
+    before = worker_line(name, wid, w, held)
+    if not lead_of(name)[2]:
+        write(lock(name), f"{who} {int(time.time())}\n")
+        print(f"{who} now leads {name}.")
+    write(os.path.join(a, "job"), t["file"] + "\n")
+    journal(who, "run", name, t["file"], f"worker {wid}: {why}")
+    print(f"job for {wid}: {t['id']} {t['title'][:80]}")
+    print(f"was:  {before.strip()}")
+    mine = sorted(k for k, o in held.items() if o == wid and k != key)
+    if mine:
+        print(f"  {wid} still holds {' '.join(mine)}: half-built work there stays on branch agent/{wid} until you give it a job")
+    if not alive(os.path.join(a, "loop.pid")):
+        print(subprocess.run(["agent-start", w], capture_output=True, text=True).stdout.strip().split("\n")[0])
+    elif alive(os.path.join(a, "pi.pid")):
+        if now:
+            subprocess.run(["agent-stop", w, "--now"], capture_output=True, text=True)
+            print(subprocess.run(["agent-start", w], capture_output=True, text=True).stdout.strip().split("\n")[0])
+        else:
+            print(f"  {wid} is in a session; the job starts when it ends (--now to stop it)")
+    else:
+        print(f"  {wid} takes the job at its next look (within a minute)")
+
+
+def cancel(who, args):
+    why = flag(args, "--why")
+    if len(args) != 2 or not why:
+        die("lab cancel <project> <worker> --why <text>")
+    name, wid = args
+    _, w = worker_dir(name, wid)
+    job = read(os.path.join(w, ".agent", "job")).strip()
+    try:
+        os.remove(os.path.join(w, ".agent", "job"))
+    except OSError:
+        die(f"{wid} has no job")
+    journal(who, "cancel", name, job, f"worker {wid}: {why}")
+    print(f"{wid}: job {job} dropped; its running session ends normally")
+
+
+def stop(who, args):
+    now, why = flag(args, "--now", False), flag(args, "--why")
+    if len(args) != 2 or not why:
+        die("lab stop <project> <worker> [--now] --why <text>")
+    name, wid = args
+    _, w = worker_dir(name, wid)
+    out = subprocess.run(["agent-stop", w] + (["--now"] if now else []), capture_output=True, text=True).stdout.strip()
+    journal(who, "stop", name, "", f"worker {wid}{' now' if now else ''}: {why}")
+    print(out)
+
+
+def msg(who, args):
+    now = flag(args, "--now", False)
+    if len(args) < 3:
+        die("lab msg <project> <worker> [--now] <text>")
+    name, wid, text = args[0], args[1], " ".join(args[2:])
+    _, w = worker_dir(name, wid)
+    ms = int(time.time() * 1000)
+    write(os.path.join(w, ".agent", "inbox", f"{ms}{'.now' if now else ''}.md"), text.rstrip() + "\n")
+    journal(who, "msg", name, "", f"to worker {wid}: {text[:300]}")
+    print(f"message for {wid} {'(stops its session) ' if now else ''}delivered at its next turn")
+
+
+def answer(who, args):
+    if len(args) < 3:
+        die("lab answer <project> <request> <text>")
+    name, ref, text = args[0], args[1], " ".join(args[2:])
+    project(name)
+    wid, _, n = ref.rpartition("/")
+    hits = [x for x in open_asks(name) if x[1] == n.zfill(3) and (not wid or x[0] == wid)]
+    if not hits:
+        die(f"no open request {ref} in {name}")
+    if len(hits) > 1:
+        die(f"request {n} is open in several checkouts ({', '.join(h[0] for h in hits)}): say <worker>/{n}")
+    _, num, path, task, _ = hits[0]
+    body = re.sub(r"^status: open$", "status: answered", read(path), count=1, flags=re.M)
+    write(path, body.rstrip("\n") + f"\n\n## Answer ({time.strftime('%Y-%m-%d %H:%M')}, lead {who})\n{text.rstrip()}\n")
+    journal(who, "answer", name, task, f"request {hits[0][0]}/{num}: {text[:300]}")
+    print(f"request {hits[0][0]}/{num} answered; {task} resumes at that worker's next pick")
+
+
+INBOX_LINES = re.compile(r"NEW TASK by agent|no answer from the human after|STUCK|STALLED|verified done|merged into main|job ended")
+
+
+def inbox(who):
+    seen_f = os.path.join(LEAD, f"inbox-seen-{who}")
+    seen = read(seen_f, "1970-01-01 00:00:00").strip()
+    for name in projects():
+        print(f"{name}")
+        for wid, n, _, task, req in open_asks(name):
+            print(f"  REQUEST {wid}/{n} on {task}: {req[:200]}")
+        for wid, w in workers(name):
+            for l in read(os.path.join(w, ".agent", "loop.log")).splitlines():
+                if l[:19] > seen and INBOX_LINES.search(l):
+                    print(f"  {wid} {l[5:16]} {l[20:][:200]}")
+        print()
+    write(seen_f, time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+
+
+def log(n):
+    for l in read(JOURNAL).splitlines()[-n:]:
+        try:
+            r = json.loads(l)
+        except ValueError:
+            continue
+        print(f"{r['time'][5:16].replace('T', ' ')}  {r['who']:<13} {r['project']:<14} {r['event']:<11} "
+              f"{r['task'].split('/')[-1].removesuffix('.md'):<22} {r['detail'][:150]}")
+
+
+def main():
+    args = sys.argv[1:]
+    who = flag(args, "--as") or "claude"
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    verb, rest = args[0], args[1:]
+    refresh(who)
+    if verb == "board":
+        board(who)
+    elif verb == "lead":
+        lead_cmd(who, rest)
+    elif verb == "run":
+        run(who, rest)
+    elif verb == "cancel":
+        cancel(who, rest)
+    elif verb == "stop":
+        stop(who, rest)
+    elif verb == "msg":
+        msg(who, rest)
+    elif verb == "answer":
+        answer(who, rest)
+    elif verb == "inbox":
+        inbox(who)
+    elif verb == "log":
+        log(int(rest[0]) if rest else 30)
+    else:
+        die(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

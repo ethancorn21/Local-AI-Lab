@@ -436,3 +436,13 @@ details.fold[open] > summary::after { content: " ▾"; }
 .tl-list li:hover { background: var(--sunk); }
 .tl-list li > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 760px) { .tl-drawer { position: absolute; right: 0; top: 0; bottom: 0; max-width: 92vw; z-index: 5; box-shadow: -8px 0 24px var(--shadow); } }
+
+/* lead page (Lab v2): who leads, each agent's job, the journal */
+.lead-projects { display: flex; flex-direction: column; gap: 14px; }
+.lead-proj { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; background: var(--raise); border: 1px solid var(--line); border-radius: 8px; }
+.lead-worker { padding: 6px 8px; border-radius: 6px; background: var(--tint); }
+.lead-worker .muted { font: 11.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+table.journal { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.journal td { padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.journal td.mono { font-family: var(--mono); white-space: nowrap; color: var(--muted); }
+table.journal td:last-child { width: 100%; overflow-wrap: anywhere; }
