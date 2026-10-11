@@ -57,8 +57,14 @@ def load():
 
 
 def save(reg):
+    """Written out and synced before it replaces the old one. ancient-works 2026-10-11: with the disk full, the dump
+    sat in the file buffer, the empty temp file replaced the registry, and the failed flush came after; both agents'
+    registries were empty from then on (every later call crashed, and who owns which boxes was gone)."""
     tmp = REG + ".tmp"
-    json.dump(reg, open(tmp, "w"), indent=1, sort_keys=True)
+    with open(tmp, "w") as fh:
+        json.dump(reg, fh, indent=1, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, REG)
 
 
