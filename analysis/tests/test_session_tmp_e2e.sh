@@ -3,7 +3,7 @@
 # 2026-10-11: the VM's disk filled (pytest kept every run's copies of a 549 MB data tree; the agents' smoke-test folders
 # were never removed) and every agent's sessions died at once. One stub agent, a real loop (about 1-2 minutes); each
 # session leaves a 1 MB temp folder behind, the way a test or a smoke run does. Checked: they were made in the loop's
-# own temp folder, and none is left once the loop has stopped. The old driver leaves them all in /tmp. Run on the VM.
+# own temp folder, none is left once the loop has stopped, and pytest keeps one run's temp dirs, not three. The old driver leaves them all in /tmp. Run on the VM.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 DRIVER=${1:-$HERE/../../harness/driver}
@@ -12,7 +12,9 @@ H=$T/home; PR=$H/projects; mkdir -p "$H/bin" "$H/.npm-global/bin" "$H/.agent-kit
 for f in agent-loop agent-team-lib agent-team task-audit codemap-gen decisions-archive plan-schedule pitfalls-sync team-takeover team-carve; do [ -f "$DRIVER/$f" ] && cp "$DRIVER/$f" "$H/bin/"; done
 for f in agent-start agent-stop; do cp "$DRIVER/../tools/$f" "$H/bin/"; done
 cp "$HERE/stubpi-team" "$H/.npm-global/bin/pi-real"
-printf '#!/bin/sh\nd=$(mktemp -d) && head -c 1048576 /dev/zero > "$d/junk" && echo "$d" >> %s/made\nexec "$(dirname "$0")/pi-real" "$@"\n' "$T" > "$H/.npm-global/bin/pi"
+mkdir -p "$T/pyt"; printf 'def test_big(tmp_path):\n    (tmp_path / "junk").write_bytes(bytes(1048576))\n' > "$T/pyt/test_big.py"
+# each session: a temp folder left behind, and the tests run twice; then the count of pytest runs pytest kept
+printf '#!/bin/sh\nd=$(mktemp -d) && head -c 1048576 /dev/zero > "$d/junk" && echo "$d" >> %s/made\nfor r in 1 2; do python3 -m pytest -q -p no:cacheprovider %s/pyt > /dev/null 2>&1; done\nls -d "${TMPDIR:-/tmp}"/pytest-of-*/pytest-[0-9]* 2>/dev/null | wc -l >> %s/kept\nexec "$(dirname "$0")/pi-real" "$@"\n' "$T" "$T" "$T" > "$H/.npm-global/bin/pi"
 printf 'cat > /dev/null; echo sent\n' > "$H/bin/ring-doorbell"
 chmod +x "$H/bin/"* "$H/.npm-global/bin/"*
 sudo cp -r /home/agent/.agent-kit/template "$H/.agent-kit/" && sudo chown -R "$(id -u)" "$H/.agent-kit/template"
@@ -37,4 +39,6 @@ out=$(grep -vc '^/tmp/loop-tp\.a/' "$T/made")
 [ "$out" = 0 ] && ok "every session's temp folder was in the loop's own folder" || bad "$out of $n outside /tmp/loop-tp.a: $(grep -v '^/tmp/loop-tp\.a/' "$T/made" | head -2 | tr '\n' ' ')"
 left=$(while read -r d; do [ -e "$d" ] && echo "$d"; done < "$T/made" | grep -c .)
 [ "$left" = 0 ] && ok "none of them is left after the loop stopped" || bad "$left of $n temp folders left behind"
+kept=$(sort -n "$T/kept" | tail -1)
+[ "${kept:-9}" -le 1 ] && ok "pytest kept at most one run's temp dirs per session" || bad "pytest kept up to $kept runs' temp dirs in a session"
 exit $fail

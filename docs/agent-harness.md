@@ -42,7 +42,7 @@ One session = one fresh agent doing one step of one task:
 | One session | 45 min | Bounds the damage of any session |
 | Thinking per response | 16k tokens, ended with a wrap-up sentence | More bought nothing measurable, less cost correctness ([experiments](experiments.md#thinking-cap)) |
 | Context: hand-over starts / session ends | 120k / 142k on the 24 GB cards; 75k / 100k on the 5060 Ti | A hand-over needs up to ~20k tokens; the small card's window is 114k |
-| Temp files | The loop's own `TMPDIR` (`/tmp/loop-<checkout>`), emptied before every iteration and when the loop ends | ancient-works 2026-10-11: pytest kept every run's copies of a 549 MB data tree and the agents' smoke folders stayed; the VM's disk filled and every agent's sessions died at once |
+| Temp files | The loop's own `TMPDIR` (`/tmp/loop-<checkout>`), emptied before every iteration and when the loop ends; pytest keeps one run's temp dirs, failed tests' only | ancient-works 2026-10-11: pytest kept every run's copies of a 549 MB data tree and the agents' smoke folders stayed; the VM's disk filled and every agent's sessions died at once |
 
 At the hand-over limit the agent is told to write its notes; from then on only notes and git work, with thinking
 capped at 2k per turn, and the session ends a few turns later. Context compaction is always cancelled. Near the
@@ -348,7 +348,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_team_replan_overlap.sh` | The 2026-10-10 starved re-plan: a reopened 000 is free and first for the lead agent while another agent holds a task on the same files; other tasks on those files still wait; while 000 is held, new tasks on its files wait for it |
 | `test_team_blocked_files.sh` | A task blocked on the human holds no files: a task on its files waits while it is built, is free and first for the other agent once it is blocked, and waits again once the answer sets it back in progress; the holder keeps its claim |
 | `test_doorbell_off.sh` | With `~/.agent-kit/doorbell-off`, `ring-doorbell` sends nothing for an ask, a ping or a notice; without it the relay is used |
-| `test_session_tmp_e2e.sh` | A loop's temp files do not outlive it: each stub session leaves a 1 MB temp folder; all were made in the loop's own `TMPDIR` and none is left once the loop stops |
+| `test_session_tmp_e2e.sh` | A loop's temp files do not outlive it: each stub session leaves a 1 MB temp folder; all were made in the loop's own `TMPDIR` and none is left once the loop stops; pytest run twice in a session keeps one run's temp dirs, not three |
 | `test_lead_jobs_e2e.sh` | Lab v2 phase 1 ([lab-v2.md](lab-v2.md)) end to end, two stub agents, real loops, the real `lab`: the plan and then 003 run as a's jobs while b, with no job, waits and takes nothing; 001 and 002 stay open; each job's end is in the lead journal; after `lab lead release` the team rules finish the rest |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |

@@ -60,6 +60,9 @@ cd "$P" || exit 1
 # agents' smoke-test folders were never removed); every agent's sessions then died at once ("Out of diskspace"). A
 # short path on purpose: a unix socket in a test's temp dir must stay under 108 bytes.
 export TMPDIR=/tmp/loop-$(basename "$P")
+# pytest keeps its last 3 runs' temp dirs by default, and one session runs the tests many times: 8.8 GB in 15 minutes
+# on ancient-works the same morning. One run, and only failed tests' dirs (pytest >= 7.3).
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-o tmp_path_retention_count=1 -o tmp_path_retention_policy=failed"
 tmp_reset() { rm -rf "${TMPDIR:?}"; mkdir -p "$TMPDIR"; }
 tmp_reset
 mkdir -p .agent/sessions .agent/harness
