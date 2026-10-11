@@ -126,7 +126,7 @@ export default function (pi: ExtensionAPI) {
 			const r = await ring(n, request.slice(0, MAX_CHARS) + (recommend ? `\n\nRecommended: ${recommend.slice(0, 2000)}` : ""), root);
 			mark(`filed n=${n} blocking=${blocking} human_only=${humanOnly || "-"} chars=${request.length} ring=${r.ok ? "ok" : "failed"}`);
 			const pinged = r.ok
-				? "The human has been pinged."
+				? "It is in the human's inbox."
 				: `The ping did not go out (${r.out}); the request is filed, and the loop pings again while it waits.`;
 			const note = (cut ? ` Your request was cut at ${MAX_CHARS} characters.` : "") + (humanOnly ? "" :
 				` If the human has not answered once the loop has run out of other work for ${AUTO_MIN} minutes, the loop ` +

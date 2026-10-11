@@ -124,7 +124,9 @@ turn. Esc stops the session instead, and the next one starts with the message.
 
 ### Requests to the human
 
-The agent files a request with the `ask_human` tool. It is saved as `.agent/asks/<n>.md` and reaches the human's phone
+The agent files a request with the `ask_human` tool. It is saved as `.agent/asks/<n>.md`, where the console shows it
+and the human answers it. Telegram is off on the lab VM since 2026-10-11 (`~/.agent-kit/doorbell-off`; the owner never
+checks it, and ancient-works request 001 sat 2.5 hours there unseen). Without that file it reaches the human's phone
 over Telegram as plain text; the human answers by replying to it there, or with `agent-talk` on the VM. A project
 marked confidential (`.agent/confidential`, in a team's main checkout) gets encrypted messages instead, answered in the
 telecloak app. Encryption is off by default (the human's choice, 2026-10-06: it is for confidential projects only).
@@ -188,6 +190,9 @@ merged from the others', so tasks the agents created do not become the human's.
   for other agents' files, and while an agent holds it, new tasks on its files wait for it. Why: ancient-works
   2026-10-10, a re-plan after a `GOAL.md` change waited two hours on agent c's 001, then also on 200, which c took
   meanwhile (nearly every task lists a test file, as 000 does), while agent a wrote prep notes under the old plan.
+  A task blocked on the human holds no files either: its holder keeps the claim, and no session edits them until the
+  answer comes. Why: ancient-works 2026-10-10, c's finished 001 (`pipeline/, tools/, tests/`) waited 2.5 hours on a
+  ruling, and agent a wrote prep notes the whole time, since every other open task lists a test file.
 - **Size.** An agent can be limited to tasks that touch at most N files (`TEAM_MAX_TOUCHES`: 8 for agent b). A task too
   big for another running agent gets split first, into new top-level tasks it can take.
 - **Split what the team waits on.** When another running agent has waited for the others `TEAM_IDLE_SPLIT_MIN` (20)
@@ -340,6 +345,8 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
 | `test_session_watchers.sh` | A prep or carve session's background watcher ends with its session (run with the real `prep_iteration`, `carve_iteration` and `run_session` and a stub agent) |
 | `test_team_replan_overlap.sh` | The 2026-10-10 starved re-plan: a reopened 000 is free and first for the lead agent while another agent holds a task on the same files; other tasks on those files still wait; while 000 is held, new tasks on its files wait for it |
+| `test_team_blocked_files.sh` | A task blocked on the human holds no files: a task on its files waits while it is built, is free and first for the other agent once it is blocked, and waits again once the answer sets it back in progress; the holder keeps its claim |
+| `test_doorbell_off.sh` | With `~/.agent-kit/doorbell-off`, `ring-doorbell` sends nothing for an ask, a ping or a notice; without it the relay is used |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
@@ -431,7 +438,7 @@ From hollowdeep, a browser game the agent built over ~40 hours (7,368 lines of c
 | Stop | `agent-stop <project>` (after the current session; `--now` immediately), or `agent-team stop <name>` |
 | Restart a team after a harness change | `agent-team restart <name>` (each agent finishes its session first) |
 | See how it is doing | `agent-report <project>`, `agent-team status <name>`, `sprint-progress <project>` |
-| Answer requests | Reply to the Telegram message (the telecloak app for confidential projects), or `agent-talk` on the VM |
+| Answer requests | On the console, or `agent-talk` on the VM (Telegram is off on the lab VM: `~/.agent-kit/doorbell-off`) |
 | Veto a task the agent added | Set its first line to `Status: dropped` |
 | Where things are | Ledger `.agent/iterations.jsonl`, loop log `.agent/loop.log`, sessions `.agent/sessions/`, template `~/.agent-kit/template` |
 

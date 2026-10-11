@@ -97,6 +97,15 @@ others_tasks() {  # task files (in their worktrees) that other live agents hold
   done
   return 0
 }
+# A task blocked on the human holds no files: no session edits them until the answer comes. ancient-works 2026-10-10:
+# c's 001 (Touches: pipeline/, tools/, tests/) was finished and waiting on a ruling from 22:38; every other open task
+# lists a test file, so agent a wrote prep notes for 2.5 h. Its holder keeps the claim; a clash with work done
+# meanwhile is the merge's to resolve.
+busy_tasks() {  # others_tasks less the ones blocked on the human
+  local t
+  for t in $(others_tasks); do [ "$(status_of "$t")" = blocked ] || echo "$t"; done
+  return 0
+}
 deps_of() { sed -n 's/^Depends on:[[:space:]]*//Ip' "$1" | head -1 | grep -oE '\b[0-9]+[a-z]*\b' || true; }
 unmet_deps() {  # unmet_deps <task file> : its dependencies that are not done (or dropped) in main
   local d f s p o
@@ -179,7 +188,7 @@ team_why_not() {  # team_why_not <task file> : why another agent's presence keep
   # conflict in a shared file is the merge's to resolve; while a holds 000, new tasks on its files wait (this check, run
   # by the others).
   case $1 in tasks/000-*) return 0 ;; esac
-  for t in $(others_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
+  for t in $(busy_tasks); do overlap "$1" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }; done
   return 0
 }
 team_workable() { [ -z "$(team_why_not "$1")" ]; }
@@ -598,7 +607,7 @@ team_takeover_why_not() {  # team_takeover_why_not <holder's checkout> <key> : w
   if [ -n "${TEAM_MAX_TOUCHES:-}" ]; then
     t=$(touches_of "$top" | grep -c .); [ "$t" -gt "$TEAM_MAX_TOUCHES" ] && { echo "too big for this agent ($t files > $TEAM_MAX_TOUCHES)"; return 0; }
   fi
-  for t in $(others_tasks); do
+  for t in $(busy_tasks); do
     [ "$(claim_key "$t")" = "$k" ] && continue
     overlap "$top" "$t" && { echo "touches the same files as $(task_id "$t")"; return 0; }
   done

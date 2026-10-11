@@ -72,6 +72,11 @@ def main():
     else:
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    # Off by the owner's choice, 2026-10-11: "i dont check telegram". Request 001 of ancient-works went out at 22:37 and
+    # sat 2.5 h unseen. Requests stay filed in .agent/asks, where the console and Claude's inbox read them.
+    if os.path.exists(os.path.join(os.path.expanduser("~"), ".agent-kit", "doorbell-off")):
+        print("Telegram off: the request is in the human's inbox")
+        return 0
     if not confidential(root):
         body["plain"] = True
     rc, line = send(body)
