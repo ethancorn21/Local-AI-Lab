@@ -55,6 +55,13 @@ AGENT_CMD=${AGENT_CMD:-pi}
 export PI_SKIP_VERSION_CHECK=1
 export PATH="$HOME/.npm-global/bin:$HOME/bin:$PATH"
 cd "$P" || exit 1
+# Each loop's temp files go to its own folder, emptied before every iteration and when the loop ends. ancient-works
+# 2026-10-11: the VM's 48 GB disk filled (13 GB in /tmp: pytest kept each run's copies of a 549 MB data tree, and the
+# agents' smoke-test folders were never removed); every agent's sessions then died at once ("Out of diskspace"). A
+# short path on purpose: a unix socket in a test's temp dir must stay under 108 bytes.
+export TMPDIR=/tmp/loop-$(basename "$P")
+tmp_reset() { rm -rf "${TMPDIR:?}"; mkdir -p "$TMPDIR"; }
+tmp_reset
 mkdir -p .agent/sessions .agent/harness
 LOG=.agent/loop.log
 LEDGER=.agent/iterations.jsonl
@@ -993,6 +1000,7 @@ no_progress=0
 start=$(( $(ls .agent/sessions/iter-*.jsonl 2>/dev/null | wc -l) + 1 ))
 stop_reason="reached MAX_ITERS ($MAX_ITERS sessions this run)"
 for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
+  tmp_reset
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
   wait_for_talk
   wait_for_server
@@ -1292,5 +1300,6 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
     log "STUCK - wrote STUCK.md and stopped"; exit 2
   fi
 done
+tmp_reset
 [ -n "$stop_reason" ] && log "$stop_reason - stopping (restart the loop to continue)"
 log "loop finished (live view: tmux window $AGENT_TMUX; headless runs: agent-watch $P)"; git --no-pager log --oneline -10

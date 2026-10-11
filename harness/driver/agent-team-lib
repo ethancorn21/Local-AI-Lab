@@ -317,7 +317,8 @@ team_merge() {  # team_merge <task file>
 # the background: nobody waits for them. timing-watch opens task 998 when they fail; see that file.
 timing_kick() {
   command -v timing-watch > /dev/null || return 0
-  TEST_CMD=$TEST_CMD setsid timing-watch "$TEAM_DIR" "$P" > /dev/null 2>&1 < /dev/null 8>&- 9>&- &
+  mkdir -p "$TMPDIR-timing"   # its own temp folder: the loop empties its TMPDIR every iteration (agent-loop)
+  TMPDIR=$TMPDIR-timing TEST_CMD=$TEST_CMD setsid timing-watch "$TEAM_DIR" "$P" > /dev/null 2>&1 < /dev/null 8>&- 9>&- &
 }
 team_retry_merge() {  # a fast-forward that main refused earlier, retried before the next pick
   [ -f .agent/merge-pending ] || return 0
