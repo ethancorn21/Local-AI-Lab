@@ -42,6 +42,7 @@ them while they work.
 | [docs/experiments.md](docs/experiments.md) | What was measured and what it decided; long write-ups: [effort-ab.md](docs/effort-ab.md), [model-choice.md](docs/model-choice.md), [type1.md](docs/type1.md) |
 | [docs/ai-lab.md](docs/ai-lab.md) | Hardware, power and heat, model serving, network and security, changelog |
 | [docs/history/](docs/history/) | The first build, team mode's first run, the detailed changelog |
+| [docs/lab-v2.md](docs/lab-v2.md) | Decided 2026-10-11, being built: one lead dispatches the workers, in place of the team rules |
 | [server/](server/) | The GPU box: power limits, the thermal guard, vLLM and llama.cpp configs, the encrypted doorbell relay, benchmarks |
 | [harness/](harness/) | The agents' VM: the driver, Pi extensions, the project template, operator tools, config examples |
 | [dashboard/](dashboard/README.md) | The lab console: every agent live, requests, the sprint board and the hardware on one web page |

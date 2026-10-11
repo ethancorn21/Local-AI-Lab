@@ -450,6 +450,7 @@ net off), `TEAM_STALL_FORCES` 2.
 - [ai-lab.md](ai-lab.md): hardware, model serving, network and security, changelog.
 - [dashboard/](../dashboard/README.md): the lab console, how its data gets from the agents to the page, and its security.
 - [history/](history/): the first build, team mode's first run, the detailed changelog.
+- [lab-v2.md](lab-v2.md): decided 2026-10-11, being built: one lead that dispatches the workers, in place of the team rules.
 - Code: [harness/driver/](../harness/driver/) (driver), [harness/pi-extensions/](../harness/pi-extensions/) (agent-side
   extensions), [harness/template/AGENTS.md](../harness/template/AGENTS.md) (the rules every agent reads),
   [analysis/tests/](../analysis/tests/) (stub-agent tests for the driver).
