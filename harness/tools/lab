@@ -147,15 +147,18 @@ def workers(name):
             yield wid, w
 
 
-def find_task(main, ref):
+def find_task(main, ref, worker=None):
+    """The task in main, else in the worker's own checkout: a task the worker wrote on its branch reaches main only
+    with its next merge (ancient-works 2026-10-11: c wrote 802 and 803, fixes its own blocked 203a needed)."""
     ref = os.path.basename(ref).removesuffix(".md")
     tid = re.match(r"\d+[a-z]*", ref)
     if not tid:
         die(f"{ref}: not a task number")
-    hits = [t for t in tasks(main) if t["id"] == tid.group(0)]
-    if not hits:
-        die(f"no task {tid.group(0)} in {main}/tasks")
-    return hits[0]
+    for where in [main] + ([worker] if worker else []):
+        hits = [t for t in tasks(where) if t["id"] == tid.group(0)]
+        if hits:
+            return hits[0]
+    die(f"no task {tid.group(0)} in main or the worker's checkout")
 
 
 def worker_line(name, wid, w, held):
@@ -264,7 +267,7 @@ def run(who, args):
         die("lab run <project> <worker> <task> [--now] --why <text>")
     name, wid, ref = args
     main, w = worker_dir(name, wid)
-    t = find_task(main, ref)
+    t = find_task(main, ref, w)
     if t["status"] in ("done", "dropped"):
         die(f"{t['id']} is {t['status']} in main")
     held = claims(main)
