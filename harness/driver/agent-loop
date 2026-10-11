@@ -503,7 +503,10 @@ job_pick() {  # sets task to the job's next step, or JOB_END to why the job is o
   local j f id
   task="" JOB_END=""
   j=$(job_task); id=$(task_id "$j")
-  [ -f "$j" ] || { JOB_END="no such task: $j"; return; }
+  # by number, not by name: an agent may rename its task file (ancient-works 2026-10-11: a's session turned
+  # 204-van-deventer.md into 204-van_deventer.md, and the job ended as "no such task")
+  [ -f "$j" ] || j=$(compgen -G "tasks/$id-*.md" | head -1)
+  [ -f "$j" ] || { JOB_END="no such task: $(job_task)"; return; }
   case $(status_of "$j") in done|dropped) JOB_END=$(status_of "$j"); return ;; esac
   WAITING=$(waiting_tasks)
   f=$(answered_first); case $f in "$j"|tasks/"$id"[a-z]*) task=$f; return ;; esac

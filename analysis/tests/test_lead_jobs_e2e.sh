@@ -33,6 +33,7 @@ export LLM_URL=http://127.0.0.1:$MS
 fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 J=$H/.agent-kit/lead/journal.jsonl
 ended() { jq -r 'select(.event == "job_ended") | "\(.task) \(.detail)"' "$J" 2>/dev/null | grep -q "^tasks/$1[^ ]* done$"; }
+ended_any() { jq -r 'select(.event == "job_ended") | "\(.task) \(.detail)"' "$J" 2>/dev/null | grep "^tasks/$1" | tail -1; }
 until_() { local i; for i in $(seq 1 "$1"); do sleep 3; eval "$2" && return 0; done; return 1; }
 claims_by() { grep '"event":"claim"' "$PR/lj/.agent/team/events.jsonl" 2>/dev/null | grep "\"agent\":\"$1\"" | jq -r .task | sort -u | tr '\n' ' '; }
 st() { head -1 "$PR/lj/$1" 2>/dev/null; }
@@ -49,12 +50,15 @@ jq -r 'select(.event == "waiting") | .who' "$J" 2>/dev/null | grep -qx "worker b
 
 # B: 003 as a's next job; 001 and 002 stay open
 until_ 20 '[ -f "$PR/lj/tasks/003-third.md" ]' || bad "B: the plan did not put the tasks in main"
+# the agent renamed its task file on its branch (ancient-works 2026-10-11: 204-van-deventer.md -> 204-van_deventer.md):
+# the job follows the task by number
+git -C "$PR/lj.a" mv tasks/003-third.md tasks/003-third-renamed.md && git -C "$PR/lj.a" commit -qm "rename 003"
 lab run lj a 003 --why "the third one first" > /dev/null
-until_ 60 'ended 003' && ok "B: a's job 003 ended done (journal)" || bad "B: no 'done' end for a's job 003: $(tail -3 "$J" 2>/dev/null)"
-[ "$(st tasks/003-third.md)" = "Status: done" ] && [ -e "$PR/lj/src/third" ] && ok "B: 003 done and merged into main" || bad "B: 003 in main: '$(st tasks/003-third.md)'"
+until_ 60 'ended 003' && ok "B: a's job 003 ended done, its file renamed on a's branch (journal)" || bad "B: a's job 003: $(ended_any 003)"
+[ "$(st tasks/003-third-renamed.md)" = "Status: done" ] && [ -e "$PR/lj/src/third" ] && ok "B: 003 done and merged into main" || bad "B: 003 in main: '$(st tasks/003-third-renamed.md)'"
 sleep 8
 [ "$(st tasks/001-first.md)" = "Status: open" ] && [ "$(st tasks/002-second.md)" = "Status: open" ] && ok "B: 001 and 002 untouched while the lead leads" || bad "B: 001 '$(st tasks/001-first.md)', 002 '$(st tasks/002-second.md)'"
-[ "$(claims_by a)" = "tasks/000-plan.md tasks/003-third.md " ] && ok "B: a claimed only its jobs" || bad "B: a claimed: $(claims_by a)"
+[ "$(claims_by a | sed 's/003-third-renamed/003-third/')" = "tasks/000-plan.md tasks/003-third.md " ] && ok "B: a claimed only its jobs" || bad "B: a claimed: $(claims_by a)"
 lab log 50 | grep -q "lead claude .* run .* 003-third" && ok "B: lab log shows the lead's run of 003" || bad "B: lab log: $(lab log 5)"
 
 # C: release - the team rules finish the rest
