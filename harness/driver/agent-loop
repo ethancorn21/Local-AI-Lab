@@ -804,6 +804,9 @@ verify_done() {
 commit_leftovers "uncommitted work found at loop start"
 # One agent session: iteration $i on $task with $PROMPT, in the viewer's tmux window or headless. Sets rc (124 = timeout).
 run_session() {
+  # its own pids: a caller's `wpid` is that caller's watcher (ancient-works 2026-10-10: this function set it to the
+  # stall watcher's, so prep and carve sessions never stopped their watchers; test_session_watchers.sh)
+  local spid wpid
   [ -n "${TEAM_DIR:-}" ] && { team_state work; echo "$([ -n "${PREP:-}${CARVE:-}" ] && printf 'prep ')$task" > "$TEAM/loops/$AGENT_ID.task"; }   # claim_parked
   if [ "$VIEWER" = tui ]; then
     # Pi's own TUI in tmux window $AGENT_TMUX is the live view (context usage in its footer, loop-status.ts adds

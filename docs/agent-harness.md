@@ -305,7 +305,10 @@ branch, or inferred), the plan per acceptance box, the tests, the risks.
 - **Only the notes survive.** Afterwards the driver resets the branch to where it started plus one commit with the
   notes, which go into `main` at once.
 - **Real work beats prep.** Every 20 s the driver checks whether the task can now be built or other work is free. If
-  so, it signals the session to write its notes, and the session ends a few turns later.
+  so, it signals the session to write its notes, and the session ends a few turns later. That watcher (and a carve
+  session's) ends with its session. Why: until 2026-10-10 the session runner overwrote its pid, so on ancient-works
+  agent a's watchers from nine prep sessions kept running, each keeping the agent's heartbeat and ready to answer takeover
+  requests, and all fired at once when the re-plan became free for it.
 - **The notes belong to the task.** Whoever claims the task starts from them, after checking every assumption against
   `main`.
 - **Write early.** At 60% of the hand-over limit without notes, the session is told to write what it has.
@@ -335,6 +338,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_task_format.sh` | `Status: Done (verified)` read as done by the loop, the archive and the sprint count; a `## Depends on` heading named in the log and the next prompt, with the line to write; the note gone once fixed |
 | `test_user_tests.sh` | `USER_TESTS`: a new non-browser test file and a test added to an old one rejected, the browser and timing tests accepted, editing and deleting old tests allowed, nothing checked without the setting |
 | `test_team.sh` | Team mode end to end: planning, parallel work, dependencies, a merge conflict, restart, prep and hand-off |
+| `test_session_watchers.sh` | A prep or carve session's background watcher ends with its session (run with the real `prep_iteration`, `carve_iteration` and `run_session` and a stub agent) |
 | `test_team_replan_overlap.sh` | The 2026-10-10 starved re-plan: a reopened 000 is free and first for the lead agent while another agent holds a task on the same files; other tasks on those files still wait; while 000 is held, new tasks on its files wait for it |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
