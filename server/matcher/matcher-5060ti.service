@@ -1,0 +1,20 @@
+[Unit]
+Description=Image matcher on the RTX 5060 Ti (127.0.0.1:8091) - MatchAnything-ELoFTR (Apache-2.0), drawing/map/aerial matching for ancient-works
+# Takes the 5060 Ti while llama-5060ti (frontpage agent b's model) is stopped; the two never run together.
+# Port plan: 8080 3090 Ti vLLM, 8081 3090, 8082 5060 Ti llama-server, 8090 reserved (type-1 scorer), 8091 this.
+After=network-online.target power-limits.service
+Wants=network-online.target
+Conflicts=llama-5060ti.service
+
+[Service]
+User=llm
+Group=llm
+WorkingDirectory=/opt/llm/matcher
+Environment=CUDA_VISIBLE_DEVICES=GPU-ccdfa1bc-3062-ad1c-36ad-77e6bcdb7f3a
+Environment=HF_HOME=/opt/llm/matcher/hf
+ExecStart=/opt/llm/matcher/.venv/bin/python server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

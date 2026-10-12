@@ -98,6 +98,13 @@ layer); two separate copies give twice the work. So the lab runs one model copy,
   mixture-of-experts model only its ~3B active parameters.
 - Server: `llama-5060ti.service` ([config](../server/llama.cpp/llama-5060ti.service)), pinned to the card and the
   P-cores. The 5060 Ti cannot share a model with the 24 GB cards (the model splits across 2 or 4 identical cards only).
+- Image matcher (2026-10-11): while frontpage is stopped the card runs `matcher-5060ti.service`
+  ([server](../server/matcher/server.py), [unit](../server/matcher/matcher-5060ti.service)) on port 8091:
+  MatchAnything-ELoFTR (Hugging Face `zju-community/matchanything_eloftr`, Apache-2.0), a pretrained matcher across
+  image kinds, for ancient-works' automatic plan fitting after two failed methods (a vision model's invented points;
+  ink against relief, 231-2204 m off). The unit conflicts with `llama-5060ti`: starting one stops the other.
+  First check: an old plan of Maiden Castle against the OS six-inch sheet, 633 matches in 0.9 s, 20-53 m from the
+  owner's hand fit.
 
 ### Ports and tunnels
 
