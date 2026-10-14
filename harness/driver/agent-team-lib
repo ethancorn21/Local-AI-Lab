@@ -345,6 +345,7 @@ team_idle_decision() {
 TEAM_WAIT_T0="" TEAM_WAIT_REASON=""
 team_wait() {  # one wait step (60 s) while another agent works
   team_beat
+  bgv_collect
   local r; r=$(team_idle_reason)
   if [ -z "$TEAM_WAIT_T0" ]; then
     TEAM_WAIT_T0=$(date +%s); TEAM_WAIT_REASON=$r
@@ -1353,5 +1354,150 @@ team_plan_check() {  # extra checks of the planning task's done claim in team mo
        fi ;;
     *) log "WARNING: plan-schedule failed (rc $rc) - the plan was not checked for shared files" > /dev/null ;;
   esac
+  return 0
+}
+
+# --- Background verify (BG_VERIFY=1) ------------------------------------------------------------------------------
+# Ethan 2026-10-13: "the goal is to not necessarily cut testing ... but to move them to a background task so that we
+# can get more work done asynchronously". Measured that day: the driver's gate (merge main, the full suite, fast-forward
+# main) took 5-6% of each card's day, 6-8 minutes per task on ancient-works (up to 18), with the GPU idle throughout.
+# With BG_VERIFY=1 a done claim whose boxes check out is queued instead (.agent/bgv/queue: "<seq> <task> <commit>") and
+# the agent's next session starts at once. A worker per agent tests the queue in order, exactly as team_merge did and
+# under the same merge lock, so only a tested tree reaches main: in a worktree of its own ($TEAM/verify/<agent>/wt;
+# the checkout's ignored files, .venv and data, are linked in, as the tests saw them there), main merged into the
+# queued commit, the suite, then main fast-forwarded to that tested merge. The result waits in .agent/bgv/results until
+# the loop's next session boundary (bgv_collect): passed = merged, claim released; failed = the task reopened with the
+# reasons, as a foreground rejection would. The agent finishes the task it is on, then builds the failed one again
+# before any new work (bgv_fix_pick), the flow Ethan described. Until that fix passes the worker holds this agent's
+# later entries: their commits contain the failed work, and the test-failure ratchet (failures known before the task)
+# would otherwise let them carry it into main. The fix's own run covers them; afterwards they are in main already.
+# A task's known failures are main's, as recorded by main's last gate run (not the tree at its first hand-out, which
+# in this mode may be an untested commit whose suite is still running: task_baseline runs nothing here).
+BGV=$P/.agent/bgv
+bgv_on() { [ -n "${BG_VERIFY:-}" ] && [ "$BG_VERIFY" != 0 ] && [ -n "${TEAM_DIR:-}" ]; }
+code_key_of() { git ls-tree -r "$1" | grep -vE $'\t''([^/]+\.md|tasks/.*|codemap/.*)$' | sha256sum | cut -c1-16; }   # = code_key, for any commit
+bgv_enqueue() {  # bgv_enqueue <task file> : queue the accepted done claim's commit for the background gate
+  local f=$1 seq sha
+  mkdir -p "$BGV/results"
+  seq=$(( $(cat "$BGV/seq" 2>/dev/null || echo 0) + 1 )); echo "$seq" > "$BGV/seq"
+  sha=$(git rev-parse HEAD)
+  printf '%s\t%s\t%s\n' "$seq" "$f" "$sha" >> "$BGV/queue"
+  [ "$(cat "$BGV/fix" 2>/dev/null)" = "$f" ] && rm -f "$BGV/fix"
+  log "team: $f queued for its test run in the background ($(git rev-parse --short HEAD)) - next session starts now"
+  tev verify_queued "$f" "$(git rev-parse --short HEAD)"; [ -f .agent/job ] && journal verify_queued "$f" "tests run in the background"
+  bgv_kick
+}
+bgv_kick() {  # start this agent's worker unless one runs (it holds worker.lock while alive)
+  bgv_on || return 0
+  [ -s "$BGV/queue" ] || return 0
+  mkdir -p "$BGV/tmp"
+  ( exec 8>&- 9>&- 6>&-; flock -n 7 || exit 0; TMPDIR=$BGV/tmp bgv_worker ) 7> "$BGV/worker.lock" >> "$BGV/worker.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+}
+bgv_next() {  # prints the queue line the worker tests next, if any: in order, except that a held failure lets only its fix through
+  local h; h=$(cat "$BGV/hold" 2>/dev/null)
+  if [ -n "$h" ]; then awk -F'\t' -v t="$h" '$2 == t' "$BGV/queue" | tail -1
+  else head -1 "$BGV/queue"; fi
+}
+bgv_unqueue() { awk -F'\t' -v s="$1" '$1 != s' "$BGV/queue" > "$BGV/queue.new" && mv "$BGV/queue.new" "$BGV/queue"; }
+bgv_result() {  # bgv_result <seq> <status> <task> <commit> [detail] ; reasons come on stdin for failed / conflict
+  local r=$BGV/results/$1
+  cat > "$r.reasons"
+  printf '%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "${5:-}" > "$r.tmp" && mv "$r.tmp" "$r.result"
+}
+bgv_link() {  # the checkout's ignored files (.venv, downloaded data, node_modules) into the worktree, linked
+  local p
+  git ls-files --others --ignored --exclude-standard --directory | sed 's:/$::' | grep -vE '^\.agent($|/)|__pycache__|\.pyc$' |
+    while IFS= read -r p; do
+      [ -e "$WT/$p" ] || [ -L "$WT/$p" ] && continue
+      mkdir -p "$WT/$(dirname "$p")"; ln -s "$P/$p" "$WT/$p"
+    done
+}
+bgv_worker() {
+  local line seq f sha id m mkey files merged rc st
+  WT=$TEAM/verify/$AGENT_ID/wt LOG=$P/.agent/loop.log   # the worker runs its tests inside the worktree: absolute paths
+  while line=$(bgv_next) && [ -n "$line" ]; do
+    IFS=$'\t' read -r seq f sha <<<"$line"; id=$(task_id "$f")
+    if git merge-base --is-ancestor "$sha" main 2>/dev/null; then   # went into main with a later run (the fix's, above)
+      bgv_result "$seq" passed "$f" "$sha" "already in main" < /dev/null; bgv_unqueue "$seq"; continue
+    fi
+    exec 6> "$TEAM/merge.lock"; flock 6
+    if [ -d "$WT" ]; then git -C "$WT" merge --abort 2>/dev/null; git -C "$WT" checkout -q -f --detach "$sha" && git -C "$WT" clean -fdq
+    else mkdir -p "$(dirname "$WT")"; git worktree prune; git worktree add -q --detach "$WT" "$sha"; fi
+    bgv_link
+    ( cd "$WT" || exit 1
+      # the linked ignored directories (data/raw/ in ancient-works' .gitignore matches a directory, not a link) show up
+      # as untracked, and code_key refuses an unclean checkout: here the tested code is exactly the commit
+      code_key() { code_key_of HEAD; }
+      mkdir -p .agent/baselines .agent/reports; rm -f .agent/reports/*
+      # known failures = main's, from the run that put main where it is; a main nobody tested yet is tested here first
+      mkey=$(code_key_of main)
+      if [ -f "$TESTED_DIR/$mkey" ]; then cp "$TESTED_DIR/$mkey" ".agent/baselines/$id.txt"
+      else git checkout -q -f --detach main && { run_tests; true; } && cp "$TESTED_DIR/$mkey" ".agent/baselines/$id.txt" 2>/dev/null
+           log "team: main had no test record - tested it first (background, for $id's known failures)"; git checkout -q -f --detach "$sha"; fi
+      [ -f ".agent/baselines/$id.txt" ] || : > ".agent/baselines/$id.txt"
+      merged=""
+      if ! git merge-base --is-ancestor main HEAD; then
+        if ! git merge -q --no-edit -m "[driver] merge main into $BRANCH before merging $id" main > /dev/null 2>&1; then
+          files=$(git diff --name-only --diff-filter=U | tr '\n' ' '); git merge --abort 2>/dev/null
+          printf '%s\n' "- Accepted, but it cannot go into main yet: your branch conflicts with main (the other agent's finished work) in: $files" \
+            "    Run \`git merge main\`, resolve each conflict keeping both sides' intent, run the tests, commit, then set the task done again." |
+            bgv_result "$seq" conflict "$f" "$sha" "$files"; exit 0
+        fi
+        merged=yes
+      fi
+      test_gate "$f"
+      git diff -U0 DECISIONS.md 2>/dev/null | grep -v '^+++' | sed -n 's/^+//p' > "$BGV/results/$seq.flaky"
+      cp -f .agent/reports/* "$P/.agent/reports/" 2>/dev/null
+      m=$(git rev-parse HEAD); git checkout -q -f "$m" 2>/dev/null   # drop the run's DECISIONS.md note (the loop writes it)
+      if [ -n "$TEST_REASONS" ]; then
+        if [ -n "$merged" ]; then printf '%s    (run after merging main, the other agents'"'"' finished work, into your branch: fix the combination)\n' "$TEST_REASONS" | bgv_result "$seq" post_merge_fail "$f" "$sha" "$(failing_set "$TEST_OUT" | tr '\n' ' ' | cut -c1-200)"
+        else printf '%s' "$TEST_REASONS" | bgv_result "$seq" test_fail "$f" "$sha" "$(failing_set "$TEST_OUT" | tr '\n' ' ' | cut -c1-200)"; fi
+        exit 0
+      fi
+      if git -C "$TEAM_DIR" merge --ff-only -q "$m" > /dev/null 2>&1; then bgv_result "$seq" passed "$f" "$sha" "$m" < /dev/null; timing_kick
+      else bgv_result "$seq" retry "$f" "$sha" "main refused a fast-forward (uncommitted changes in $TEAM_DIR?)" < /dev/null; fi
+    ); rc=$?
+    flock -u 6; exec 6>&-
+    st=$(cut -f1 "$BGV/results/$seq.result" 2>/dev/null)
+    [ $rc -ne 0 ] || [ -z "$st" ] && { log "team: background test of $f could not run (worktree $WT) - left queued"; return 1; }
+    case $st in
+      retry) return 0 ;;   # stays queued; the loop kicks the worker again at its next boundary
+      passed) [ "$(cat "$BGV/hold" 2>/dev/null)" = "$f" ] && rm -f "$BGV/hold" ;;
+      *) echo "$f" > "$BGV/hold" ;;
+    esac
+    bgv_unqueue "$seq"
+  done
+}
+bgv_collect() {  # at a session boundary: act on the worker's results, oldest first
+  bgv_on || return 0
+  local r st f sha d seq k
+  for r in $(ls "$BGV/results/"*.result 2>/dev/null | sort -t/ -k3 -n); do
+    seq=$(basename "$r" .result); IFS=$'\t' read -r st f sha d < "$r"
+    if [ -s "$BGV/results/$seq.flaky" ]; then cat "$BGV/results/$seq.flaky" >> DECISIONS.md; git add DECISIONS.md && git commit -q -m "[driver] flaky test logged (background test run)"; log "flaky test detected in the background run (logged in DECISIONS.md), not blocking"; fi
+    case $st in
+      passed)
+        tev merge "$f" "${d:0:7}"; log "team: $f merged into main (${d:0:7}) - tested in the background"
+        [ -f .agent/job ] || [ -n "$(lead_fresh)" ] && journal verify_passed "$f" "in main"
+        k=$(claim_key "$f"); [ "$(task_id "$f")" = "$k" ] && release_claim "$f"
+        [ "$(cat "$BGV/fix" 2>/dev/null)" = "$f" ] && rm -f "$BGV/fix" ;;
+      retry) log "WARNING team: $d - $f stays queued for the background gate" ;;
+      *)
+        tev "${st/#conflict/merge_conflict}" "$f" "$d"; log "team: the background test run rejected $f ($st) - reopened; it is built again after the current task"
+        { [ -f .agent/job ] || [ -n "$(lead_fresh)" ]; } && journal verify_failed "$f" "$st: $d"
+        [ -f "$f" ] && reopen "$f" "$(cat "$BGV/results/$seq.reasons")"$'\n'
+        echo "$f" > "$BGV/fix" ;;
+    esac
+    rm -f "$BGV/results/$seq".*
+  done
+  bgv_kick
+}
+bgv_fix_pick() {  # bgv_fix_pick <the previous session's task> : the failed task next, once the one before is finished
+  bgv_on || return 1
+  local f; f=$(cat "$BGV/fix" 2>/dev/null); [ -n "$f" ] && [ -f "$f" ] || return 1
+  case $(status_of "$f") in done|dropped) return 1 ;; esac
+  if [ -n "${1:-}" ] && [ "$1" != "$f" ] && [ -f "$1" ]; then case $(status_of "$1") in done|dropped|blocked) ;; *) return 1 ;; esac; fi
+  TEAM_IGNORE=1 workable "$f" any || return 1
+  task=$f; log "team: $f failed its background test run - building it again before new work"
   return 0
 }

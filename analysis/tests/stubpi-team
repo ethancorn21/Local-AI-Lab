@@ -14,6 +14,7 @@
 #   a carve session (team mode): carves what `Stub-carve: <box> <path>` in the holder's task file names, as one part with
 #        that Touches path and the lowest free number of its range, plus the carve list; "none" without that line.
 #   CREATE THE PARTS FIRST in the prompt: writes each named part (Touches src/part<n>/), commits, ends the session.
+#   `Stub-breaks: <path>`: a build that breaks the suite until the driver rejects it (test_bg_verify_e2e.sh).
 #   STUB_ON_998: a command the stub runs in its step on task 998 (the driver's timing-check task), e.g. a fix.
 #   A driver message in .agent/inbox ("[driver] carve ...", delivered by the human-messages extension in a real
 #        session): the stub leaves the boxes and files it names alone, as the message says.
@@ -87,6 +88,13 @@ case $TASK in
       echo "$(basename "$TASK" .md) by agent ${AGENT_ID:-?}" >> "$p"
     done
     case $TASK in tasks/998-*) [ -n "${STUB_ON_998:-}" ] && eval "$STUB_ON_998" ;; esac
+    # `Stub-breaks: <path>`: the task's first build writes <path> with BROKEN in it (the test command of
+    # test_bg_verify_e2e.sh fails on that); once the driver has rejected the task, the next build removes it (the fix)
+    br=$(sed -n 's/^Stub-breaks:[[:space:]]*//p' "$TASK")
+    if [ -n "$br" ]; then
+      if grep -q "$(basename "$TASK" .md | cut -d- -f1) DRIVER: done claim rejected" DECISIONS.md 2>/dev/null; then rm -f "$br"
+      else mkdir -p "$(dirname "$br")"; echo BROKEN > "$br"; fi
+    fi
     w=$(sed -n 's/^Stub-writes:[[:space:]]*//p' "$TASK")
     [ -n "$w" ] && echo "written by $(basename "$TASK" .md)" > "$w" ;;
 esac

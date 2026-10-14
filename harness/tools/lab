@@ -177,6 +177,13 @@ def worker_line(name, wid, w, held):
     out = f"  {wid}  {card:<8} {'job ' + job.split('/')[-1].removesuffix('.md') if job else 'no job'}  |  {state}"
     if mine:
         out += f"  |  holds {' '.join(mine)}"
+    # background verify (agent-team-lib): done claims whose test run is queued or going, and a rejected one to rebuild
+    queued = [l.split("\t")[1].split("/")[-1].split("-")[0] for l in read(os.path.join(a, "bgv", "queue")).splitlines() if l.count("\t") == 2]
+    if queued:
+        out += f"\n      testing in the background: {' '.join(queued)}"
+    fix = read(os.path.join(a, "bgv", "fix")).strip()
+    if fix:
+        out += f"\n      failed its background test, rebuilt next: {fix.split('/')[-1].removesuffix('.md')}"
     ended = read(os.path.join(a, "job-ended")).strip().split("\t")
     if not job and len(ended) == 3:
         out += f"\n      last job: {ended[1].split('/')[-1]} ended {ended[0][11:16]}: {ended[2]}"

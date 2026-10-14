@@ -294,6 +294,21 @@ merged from the others', so tasks the agents created do not become the human's.
   `.agent/team/timing/runs.jsonl`, events `timing_*` (agent `timing`; `agent-team status` shows the last one). Why: the six timing tests of frontpage were 75% of its suite's
   time and every run that included them locked the other checkouts out; Ethan: "I would rather the agent commit, move
   to next task, the test fails, a new task is created to fix it, the agent circles back around after the task."
+- **Background verify (per project: `BG_VERIFY=1` in the project's env file under `~/.agent-kit`).** A done claim
+  whose boxes check out is queued, and the agent's next session starts at once. A worker per agent runs the gate on
+  the queue in order, exactly as above and under the same merge lock, in a worktree of its own
+  (`$TEAM/verify/<agent>/wt`, the checkout's ignored files linked in): `main` merged into the queued commit, the suite,
+  then `main` fast-forwarded to that tested merge. The loop acts on the result at its next session boundary (also while
+  it waits): passed = merged, claim released; failed = the task reopened with the reasons. The agent finishes the task
+  it is on, then builds the failed one again before any new work, and the lead journal records `verify_queued`,
+  `verify_failed`, `verify_passed`. Until the fix passes, the worker holds the agent's later entries: their commits
+  contain the failed work, and the known-failures ratchet would otherwise carry it into `main`; the fix's run covers
+  them. Known failures are `main`'s (its last gate run's record), and a task's first hand-out runs no baseline: it may
+  be an untested commit whose suite is still running. Caveat: the worker's tests share the checkout's ignored files
+  (data, caches) with the agent's own test runs at the same time. Why: measured 2026-10-13
+  ([experiments.md](experiments.md#re-measure-after-the-test-gate-change)), the gate took 5-6% of each card's day,
+  6-8 minutes per task on ancient-works, with the GPU idle; Ethan: "the goal is to not necessarily cut testing ... but
+  to move them to a background task so that we can get more work done asynchronously".
 - **Shared memory files merge cleanly.** Journals keep both sides' entries, generated files are regenerated, hand-over
   notes live in task files only the claiming agent edits, and each agent numbers new tasks from its own range.
 - **Planning for a team.** The planning task must give every task `Depends on:` and `Touches:`. `plan-schedule`
@@ -351,6 +366,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_session_tmp_e2e.sh` | A loop's temp files do not outlive it: each stub session leaves a 1 MB temp folder; all were made in the loop's own `TMPDIR` and none is left once the loop stops; pytest run twice in a session keeps one run's temp dirs, not three |
 | `test_task_audit_full_disk.sh` | A registry write that fails (a write limit stands in for a full disk) leaves task-audit's registry as it was; the human still owns their task, and the next scan with room records the new one |
 | `test_lead_jobs_e2e.sh` | Lab v2 phase 1 ([lab-v2.md](lab-v2.md)) end to end, two stub agents, real loops, the real `lab`: the plan and then 003 run as a's jobs while b, with no job, waits and takes nothing; 001 and 002 stay open; each job's end is in the lead journal; after `lab lead release` the team rules finish the rest |
+| `test_bg_verify_e2e.sh` | Background verify, one stub agent in job mode, the real `lab`, a 20 s suite that needs an ignored data file: 002's session starts while 001 is tested; 001's run fails, a finishes 002, then builds 001 again on its own (journal `verify_failed`); the fix's run puts both into `main`, claims released, `main`'s code tested; no baseline run before 002's first session |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |
@@ -395,6 +411,7 @@ All in [analysis/tests/](../analysis/tests/).
 | 10-08 | One test run per task, after `main` is merged in; results kept by code; timing tests on `main` in the background, a failure opens task 998 | Three full runs per task caught no product bug in 458 runs; timing tests were 75% of the suite's time and locked the other checkouts out |
 | 10-08 | One task-status rule for every reader; a format check after each session; the format guide shows the lines the driver reads; a front-door `CLAUDE.md` | Readers disagreed on `Done (verified)`; the guide's `## Depends on` example gave tasks no dependencies; the lab's own rules sat deep in long docs (refactor map, cards 2 and 8) |
 | 10-08 | Tests use the product the way the human does, only (frontpage: in a browser); enforced at verify (`USER_TESTS`) | "A user is never going to call an internal function"; 1.3 MB of tests for 0.56 MB of code under a GOAL that already said no unit tests |
+| 10-13 | Background verify (`BG_VERIFY=1`, per project): the gate runs while the agent starts its next task; a failure brings the task back after the current one | The gate held each GPU idle 5-6% of its day (6-8 min per task on ancient-works); Ethan wanted the same tests, run asynchronously |
 
 **Decided against (do not re-propose):** a same-model reviewer agent as a done gate (done claims are already honest);
 RAG over the code; Codex as the harness (20k+ tokens of built-in prompt); a higher-precision quant or bigger context for

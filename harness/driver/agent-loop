@@ -529,7 +529,7 @@ job_end() {  # job_end <reason> : the job is over; the worker reports it and wai
 }
 lead_wait() {  # one wait step for the lead's next job
   [ -n "${LEAD_WAITING:-}" ] || { LEAD_WAITING=1; log "waiting for a job from the lead ($(lead_fresh | cut -d' ' -f1))"; journal waiting "" "no job"; }
-  [ -n "${TEAM_DIR:-}" ] && team_beat
+  [ -n "${TEAM_DIR:-}" ] && { team_beat; bgv_collect; }
   [ -f .agent/PAUSE ] && { log "PAUSE file found while waiting for the lead - stopping"; exit 0; }
   sleep "${LEAD_POLL_S:-30}"
 }
@@ -639,6 +639,7 @@ task_baseline() {  # task_baseline <task file> : record the failing tests at the
   local b=.agent/baselines/$(task_id "$1").txt k
   [ -f "$b" ] && return
   git rev-parse HEAD > "${b%.txt}.head"   # where the task started (user-tests, single mode)
+  [ -n "${TEAM_DIR:-}" ] && bgv_on && return   # background verify: known failures are main's, read by the worker at verify time (agent-team-lib)
   if k=$(code_key) && [ -f "$TESTED_DIR/$k" ]; then
     cp "$TESTED_DIR/$k" "$b"; log "baseline for $(task_id "$1"): $(grep -c . "$b") failing test(s), recorded for this code (not run again)"; return
   fi
@@ -1005,6 +1006,7 @@ if [ "$start_ok" = false ]; then
 else : > "$BASELINE"; rm -f .agent/reports/start-failing-last.txt; log "start-up audit: test suite green"; fi
 archive_sync "start-up"
 codemap_sync "start-up"
+[ -n "${TEAM_DIR:-}" ] && bgv_kick   # a queue left by a stopped loop is tested now
 
 no_progress=0
 # MAX_ITERS limits the sessions of THIS run (iteration numbers continue from the project's history): a cap on the
@@ -1016,13 +1018,15 @@ for i in $(seq "$start" "$(( start + MAX_ITERS - 1 ))"); do
   if [ -f .agent/PAUSE ]; then log "PAUSE file found - stopping before iteration $i (remove .agent/PAUSE to continue)"; exit 0; fi
   wait_for_talk
   wait_for_server
-  [ -n "${TEAM_DIR:-}" ] && { team_beat; team_retry_merge; team_sync || true; }
+  [ -n "${TEAM_DIR:-}" ] && { team_beat; team_retry_merge; bgv_collect; team_sync || true; }
   lead_mode || goal_changed
   # Pick: a task whose request was just answered, else the next workable one (tasks waiting on a request are skipped).
   # With nothing workable: a message from the human (or an answer no task took) goes to a waiting task; open requests
   # mean wait; otherwise the goal check, then stop. A team agent with nothing to take prepares a task that starts soon.
-  PREP="" CARVE="" FORCED_NOTE=""
+  PREP="" CARVE="" FORCED_NOTE="" prev_task=${task:-}
   while :; do
+    # a task the background gate rejected comes back once the task before it is finished (agent-team-lib, Background verify)
+    [ -n "${TEAM_DIR:-}" ] && bgv_fix_pick "$prev_task" && claim_task "$task" && { LEAD_WAITING=""; break; }
     if [ -f .agent/job ]; then   # the lead's job (Lab v2 above)
       job_pick
       [ "$(job_task)" = "${job_of:-}" ] || { job_of=$(job_task); job_still=0; }   # a new job starts its count afresh
@@ -1243,7 +1247,8 @@ The human sent you $nmsg message(s) while no session could take them. Read them 
   [ "$status_after" = done ] && verify_done "$task"
   [ "$VERIFY" = accepted ] && withdraw_asks_of "$task"
   if [ -n "${TEAM_DIR:-}" ]; then   # accepted work goes into main; a finished or dropped top-level task frees its claim
-    if [ "$VERIFY" = accepted ] && team_merge "$task" && [ "$(task_id "$task")" = "$(claim_key "$task")" ]; then release_claim "$task"; fi
+    if [ "$VERIFY" = accepted ] && bgv_on; then bgv_enqueue "$task"   # tested and merged in the background (agent-team-lib)
+    elif [ "$VERIFY" = accepted ] && team_merge "$task" && [ "$(task_id "$task")" = "$(claim_key "$task")" ]; then release_claim "$task"; fi
     [ "$status_after" = dropped ] && [ "$(task_id "$task")" = "$(claim_key "$task")" ] && release_claim "$task"
     # a faster agent asked for this task: it goes to that agent before the next pick, with its work (not a hand-over)
     case $status_after in done|dropped) ;; *) [ -f "$task" ] && [ ! -f "$TEAM/takeover/$(claim_key "$task")/asker" ] && team_handover_check "$task" "${ticked0:-0}" ;; esac

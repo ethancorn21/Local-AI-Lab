@@ -80,7 +80,9 @@ electricity.
    criteria untouched, the test suite passing when the driver runs it (rerun once on a failure, to tell a flaky test
    from a broken one). In a team that one run happens after the branch is merged with everyone else's finished work,
    on exactly what goes into `main`. Timing tests are not part of it: they run on `main` in the background after every
-   merge, and a failure becomes a task (998) that the next free agent takes. A project can also require that every
+   merge, and a failure becomes a task (998) that the next free agent takes. With background verify on (`BG_VERIFY=1`, per project),
+   even that run happens behind the agent: it starts its next task at once, and if the run fails, it finishes that
+   task and then fixes the failed one, before anything new. A project can also require that every
    test uses the product the way its human does (frontpage: in a browser); a task that adds any other test is sent back.
 5. **Goal check (task 999).** When the queue is empty, one agent checks the whole project against `GOAL.md` point by
    point, with evidence, and adds tasks for anything missing. The loop stops after a check that adds nothing.
