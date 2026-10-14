@@ -304,7 +304,10 @@ merged from the others', so tasks the agents created do not become the human's.
   `verify_failed`, `verify_passed`. Until the fix passes, the worker holds the agent's later entries: their commits
   contain the failed work, and the known-failures ratchet would otherwise carry it into `main`; the fix's run covers
   them. Known failures are `main`'s (its last gate run's record), and a task's first hand-out runs no baseline: it may
-  be an untested commit whose suite is still running. Caveat: the worker's tests share the checkout's ignored files
+  be an untested commit whose suite is still running; for the same reason the start-up audit runs no suite in this
+  mode. A `main` with no test record is tested first, in the background (ancient-works: ~6 minutes more, under the
+  merge lock). If `main` refuses the fast-forward, only the fast-forward is retried, not the run. Caveat: the worker's
+  tests share the checkout's ignored files
   (data, caches) with the agent's own test runs at the same time. Why: measured 2026-10-13
   ([experiments.md](experiments.md#re-measure-after-the-test-gate-change)), the gate took 5-6% of each card's day,
   6-8 minutes per task on ancient-works, with the GPU idle; Ethan: "the goal is to not necessarily cut testing ... but
@@ -366,7 +369,7 @@ Every driver change comes with a test that fails on the code before it. They run
 | `test_session_tmp_e2e.sh` | A loop's temp files do not outlive it: each stub session leaves a 1 MB temp folder; all were made in the loop's own `TMPDIR` and none is left once the loop stops; pytest run twice in a session keeps one run's temp dirs, not three |
 | `test_task_audit_full_disk.sh` | A registry write that fails (a write limit stands in for a full disk) leaves task-audit's registry as it was; the human still owns their task, and the next scan with room records the new one |
 | `test_lead_jobs_e2e.sh` | Lab v2 phase 1 ([lab-v2.md](lab-v2.md)) end to end, two stub agents, real loops, the real `lab`: the plan and then 003 run as a's jobs while b, with no job, waits and takes nothing; 001 and 002 stay open; each job's end is in the lead journal; after `lab lead release` the team rules finish the rest |
-| `test_bg_verify_e2e.sh` | Background verify, one stub agent in job mode, the real `lab`, a 20 s suite that needs an ignored data file: 002's session starts while 001 is tested; 001's run fails, a finishes 002, then builds 001 again on its own (journal `verify_failed`); the fix's run puts both into `main`, claims released, `main`'s code tested; no baseline run before 002's first session |
+| `test_bg_verify_e2e.sh` | Background verify, one stub agent in job mode, the real `lab`, a 20 s suite that needs an ignored data file: 002's session starts while 001 is tested; 001's run fails, a finishes 002, then builds 001 again on its own (journal `verify_failed`); the fix's run puts both into `main`, claims released, `main`'s code tested; no baseline run before 002's first session; after a restart with 003 still queued, no start-up suite and 003 reaches `main` |
 | `test_team_sync_stale.sh` | The 2026-10-10 stale branch: a finished task's stale copy takes main's version (open or in-progress, attributed or not), not for the agent's own claim or alongside another conflict; one event per conflict; an idle agent with no claim reset to main with a backup |
 | `test_team_prep.sh` | Pick order, prep targets, the prep lock, the cut and the hand-off |
 | `test_team_takeover.sh` | Own claims by rank, the takeover ask and answer (parked or mid-session), what moves with a task, hand-overs that keep other claims' work |

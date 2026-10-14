@@ -993,8 +993,11 @@ if [ -n "$k" ] && [ -f "$TESTED_DIR/$k" ]; then   # this code was tested already
   TEST_OUT=$(sed 's/^/FAILED /' "$TESTED_DIR/$k"); TEST_REPORT=$(sed 's/^/    /' "$TESTED_DIR/$k")
   start_ok=$([ -s "$TESTED_DIR/$k" ] && echo false || echo true)
   log "start-up audit: the test results recorded for this code are used, the suite is not run again"
+elif [ -n "${TEAM_DIR:-}" ] && bgv_on; then   # background verify: the tip may be work still queued for its run; the
+  start_ok=skip; log "start-up audit: suite not run (background verify tests every done claim before main)"   # worker tests it
 elif run_tests; then start_ok=true; else start_ok=false; fi
-if [ "$start_ok" = false ]; then
+if [ "$start_ok" = skip ]; then :
+elif [ "$start_ok" = false ]; then
   failing_set "$TEST_OUT" > "$BASELINE"
   if cmp -s "$BASELINE" .agent/reports/start-failing-last.txt 2>/dev/null; then
     log "test suite failing at loop start: the same $(grep -c . "$BASELINE") test(s) as at the last start (not re-logged)"

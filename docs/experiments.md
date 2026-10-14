@@ -171,7 +171,9 @@ boxes are not comparable work.
 gap is waiting on other agents' tasks (13%), which the lead (lab v2) replaces.
 
 **Decision.** Ethan, 2026-10-13: keep every test, but move the driver's gate to the background so the agent starts its
-next task while its last one is tested. Expected: the ~5-6% of each card's day the gate takes now.
+next task while its last one is tested. Expected: the ~5-6% of each card's day the gate takes now. Not touched: the
+tests agents run inside their own sessions (2% on frontpage, 6% on ancient-works). A `main` with no test record (a
+lead's or the human's commit that changed code) costs one extra suite run, in the background, before the next task's.
 
 ## Test quality: what the tests catch
 

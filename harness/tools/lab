@@ -294,6 +294,9 @@ def run(who, args):
     mine = sorted(k for k, o in held.items() if o == wid and k != key)
     if mine:
         print(f"  {wid} still holds {' '.join(mine)}: half-built work there stays on branch agent/{wid} until you give it a job")
+    fix = read(os.path.join(a, "bgv", "fix")).strip()
+    if fix and fix != t["file"]:   # background verify (agent-team-lib): a rejected task goes before new work
+        print(f"  {wid} first rebuilds {fix.split('/')[-1].removesuffix('.md')}, which failed its background test run; this job comes after")
     if not alive(os.path.join(a, "loop.pid")):
         print(subprocess.run(["agent-start", w], capture_output=True, text=True).stdout.strip().split("\n")[0])
     elif alive(os.path.join(a, "pi.pid")):

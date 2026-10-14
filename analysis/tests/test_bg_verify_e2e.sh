@@ -9,6 +9,8 @@
 #   C: the fix passes: main gets 001 and 002 (002 went in with the fix's run, which tested its commits too), both
 #      done in main, both claims released, every merge in main tested
 #   D: 002 started on an untested commit, and no test run held its first session (no foreground baseline run)
+#   E: a restart while 003's run is going (agent-stop --now kills the worker with the loop): the new loop runs no
+#      start-up suite, and its worker tests the queue left behind; 003 reaches main
 # The suite also needs a file in data/raw/, which git ignores and only the agent's checkout has (as ancient-works' tests
 # need its data): the background run sees it through the worktree's links.
 # The old driver tests in the foreground: 002's session starts only after 001's gate, and nothing is queued.
@@ -34,7 +36,7 @@ printf '#!/bin/bash\nsleep %s\n[ -f data/raw/needed.txt ] || { echo "FAILED test
 chmod +x "$T/gate.sh"
 FX=$T/fixtures; mkdir -p "$FX"
 task() { printf 'Status: open\n# %s\n\nDepends on: none\nTouches: %s\n%s\n## Acceptance criteria\n- [ ] done\n' "${1%.md}" "$2" "${3:-}" > "$FX/$1"; }
-task 001-first.md "src/one/" "Stub-breaks: src/one/BROKEN"; task 002-second.md "src/two/"
+task 001-first.md "src/one/" "Stub-breaks: src/one/BROKEN"; task 002-second.md "src/two/"; task 003-third.md "src/three/"
 export HOME=$H STUB_FIXTURES=$FX STUB_SLEEP=2 TEAM_WAIT_S=3 LEAD_POLL_S=2 TEST_CMD=$T/gate.sh NO_PROGRESS_LIMIT=20
 export PATH="$H/.npm-global/bin:$H/bin:/usr/local/bin:/usr/bin:/bin"
 MS=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
@@ -89,4 +91,14 @@ until_ 20 '[ ! -d "$PR/bv/.agent/team/claims/001" ] && [ ! -d "$PR/bv/.agent/tea
 
 # D: no foreground baseline run
 grep -q "baseline for 002.*first hand-out" "$L" && bad "D: a ran the suite before 002's first session: $(grep 'baseline for 002' "$L")" || ok "D: no baseline run held 002's first session"
+# E: restart while a run is queued
+lab run bv a 003 --why "stopped while tested" > /dev/null
+until_ 60 'ended 003' || bad "E: a's job 003 did not end"
+agent-stop bv.a --now > /dev/null
+grep -q "003-third.md" "$PR/bv.a/.agent/bgv/queue" && ok "E: 003 still queued after the stop" || bad "E: queue after the stop: $(cat "$PR/bv.a/.agent/bgv/queue" 2>/dev/null)"
+n0=$(grep -c "start-up audit" "$L")
+agent-start bv.a > /dev/null
+until_ 60 '[ "$(st tasks/003-third.md)" = "Status: done" ]' && ok "E: after the restart 003's queued run put it into main" || bad "E: main's 003: '$(st tasks/003-third.md)'"
+tail -n +1 "$L" | grep "start-up audit" | tail -1 | grep -q "suite not run" && [ "$(grep -c "start-up audit" "$L")" -gt "$n0" ] \
+  && ok "E: the restarted loop ran no start-up suite" || bad "E: start-up audit: $(grep "start-up audit" "$L" | tail -1)"
 exit $fail

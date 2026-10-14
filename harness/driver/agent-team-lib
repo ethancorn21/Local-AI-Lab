@@ -1418,6 +1418,7 @@ bgv_worker() {
   WT=$TEAM/verify/$AGENT_ID/wt LOG=$P/.agent/loop.log   # the worker runs its tests inside the worktree: absolute paths
   while line=$(bgv_next) && [ -n "$line" ]; do
     IFS=$'\t' read -r seq f sha <<<"$line"; id=$(task_id "$f")
+    [ -f "$BGV/results/$seq.result" ] && return 0   # tested; its fast-forward waits for the collector
     if git merge-base --is-ancestor "$sha" main 2>/dev/null; then   # went into main with a later run (the fix's, above)
       bgv_result "$seq" passed "$f" "$sha" "already in main" < /dev/null; bgv_unqueue "$seq"; continue
     fi
@@ -1456,7 +1457,7 @@ bgv_worker() {
         exit 0
       fi
       if git -C "$TEAM_DIR" merge --ff-only -q "$m" > /dev/null 2>&1; then bgv_result "$seq" passed "$f" "$sha" "$m" < /dev/null; timing_kick
-      else bgv_result "$seq" retry "$f" "$sha" "main refused a fast-forward (uncommitted changes in $TEAM_DIR?)" < /dev/null; fi
+      else bgv_result "$seq" retry "$f" "$sha" "$m" < /dev/null; fi   # tested; the collector retries the fast-forward only
     ); rc=$?
     flock -u 6; exec 6>&-
     st=$(cut -f1 "$BGV/results/$seq.result" 2>/dev/null)
@@ -1481,7 +1482,16 @@ bgv_collect() {  # at a session boundary: act on the worker's results, oldest fi
         [ -f .agent/job ] || [ -n "$(lead_fresh)" ] && journal verify_passed "$f" "in main"
         k=$(claim_key "$f"); [ "$(task_id "$f")" = "$k" ] && release_claim "$f"
         [ "$(cat "$BGV/fix" 2>/dev/null)" = "$f" ] && rm -f "$BGV/fix" ;;
-      retry) log "WARNING team: $d - $f stays queued for the background gate" ;;
+      retry)   # main refused the fast-forward to the tested merge $d: retry that, not the run (team_retry_merge's case)
+        exec 6> "$TEAM/merge.lock"; flock 6
+        if git -C "$TEAM_DIR" merge --ff-only -q "$d" > /dev/null 2>&1; then
+          flock -u 6; bgv_unqueue "$seq"; [ "$(cat "$BGV/hold" 2>/dev/null)" = "$f" ] && rm -f "$BGV/hold"; tev merge "$f" "retry ${d:0:7}"; log "team: $f merged into main (${d:0:7}) - tested in the background, fast-forward retried"
+          k=$(claim_key "$f"); [ "$(task_id "$f")" = "$k" ] && release_claim "$f"; timing_kick
+          rm -f "$BGV/results/$seq".*; continue
+        fi
+        flock -u 6
+        log "WARNING team: main ($TEAM_DIR) refused the fast-forward to $f's tested merge ${d:0:7} - retried at the next boundary"
+        continue ;;   # result kept for the next try; the worker leaves the entry queued
       *)
         tev "${st/#conflict/merge_conflict}" "$f" "$d"; log "team: the background test run rejected $f ($st) - reopened; it is built again after the current task"
         { [ -f .agent/job ] || [ -n "$(lead_fresh)" ]; } && journal verify_failed "$f" "$st: $d"
