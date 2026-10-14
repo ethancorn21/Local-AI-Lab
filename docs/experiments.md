@@ -13,6 +13,7 @@ the result and the decision for each experiment. Long write-ups have their own p
 | [Model choice: 27B vs Flash-Next vs Swift](#model-choice) | 2026-10-05 | Keep the 27B; end capped thinking with a wrap-up sentence |
 | [Thinking cap: 8k, 16k, 32k](#thinking-cap) | 2026-10-06 | 16k |
 | [Baseline: where a card's day goes](#baseline-where-a-cards-day-goes) | 2026-10-08 | The baseline to beat: 42% of the day generating, 31.5% on tests |
+| [Re-measure after the test-gate change](#re-measure-after-the-test-gate-change) | 2026-10-13 | Tests are 8-12% of a card's day, not 31.5%; the driver's gate (~6%) moves to the background next |
 | [Test quality: what the tests catch](#test-quality-what-the-tests-catch) | 2026-10-08 | One test run per task instead of three; timing tests out of the per-task run; no direct-call tests |
 | [Type-1 log triage model](type1.md) | 2026-09-29 on | A small fine-tuned model leads; paused |
 
@@ -137,6 +138,40 @@ raise it. Candidate changes, by time at stake: reuse the test result of a tree t
 baseline run (~7.5%), verify in the background while the agent starts its next task (~11.5%), a parallel suite with
 the timing tests outside the shared run, targeted tests inside sessions, a streamed plan (~7% waiting), and a re-run
 of the two-agents-per-card test now that the cards sit idle half the day.
+
+## Re-measure after the test-gate change
+
+**Question.** The test-gate change (one run per task, timing tests out of every ordinary run, deployed 2026-10-08
+21:46) came after the baseline window. Where does a card's day go now, and how much would verifying in the background
+still recover?
+
+**How.** The same scripts on two windows: frontpage, three agents under the team rules, 2026-10-08 21:46 to 10-09 21:26
+(24 h, ending when agent b stopped STUCK); and ancient-works, agents a and c in job mode under the lead, 2026-10-11 19:00
+to 10-13 19:00 (48 h). Time between sessions now comes from the loop logs (`analysis/baseline/between.py`): day.py had
+put a 174-minute wait of all three agents under "other driver work", because the event log had no end for it.
+Ancient-works' model time comes from the servers' counters; its split of the rest of a session by tool is approximate
+(the per-turn token estimate undercounts its image-heavy turns).
+
+| Share of the day | Baseline (frontpage, 10-08) | frontpage, 10-09 | ancient-works, 10-12 and 10-13 |
+|---|---|---|---|
+| Model working (generating and reading the prompt) | 49.3% | **73.6%** (a 74.2, c 67.8, b 78.8) | **70.9%** (a 66.9, c 74.8) |
+| Tests the agent runs in its session | 12.5% | 1.9% | 5.9% |
+| Tests the driver runs (verify and merge; baseline) | 19.0% | 6.3% (5.7; 0.6) | 6.0% (5.0; 1.0) |
+| Other tools in the session (shell, builds, file edits) | 7.8% | 3.3% | 8.2% |
+| Waiting (nothing to take / no job from the lead) | 7.2% | 13.2% | 5.5% |
+| Other driver work | 4.2% | ~2% | ~3.6% |
+
+The driver's gate per task: median 3.3 to 5.3 minutes on frontpage, 6.3 to 8.3 on ancient-works (longest 18).
+frontpage merged 47.6 tasks and 160 acceptance boxes per day (baseline window, counted the same way: 41 and 203), at
+~64k generated tokens per box against ~34k: that day's tasks were the rewrite of the test suite, so the two windows'
+boxes are not comparable work.
+
+**Result.** The test-gate change did most of the cutting: tests fell from 31.5% of the day to 8% (frontpage) and 12%
+(ancient-works), and the model now works about 70-75% of each card's day. Under the team rules the largest remaining
+gap is waiting on other agents' tasks (13%), which the lead (lab v2) replaces.
+
+**Decision.** Ethan, 2026-10-13: keep every test, but move the driver's gate to the background so the agent starts its
+next task while its last one is tested. Expected: the ~5-6% of each card's day the gate takes now.
 
 ## Test quality: what the tests catch
 

@@ -20,9 +20,10 @@ for ch in ("a", "b", "c"):
     root = f"/home/agent/projects/frontpage.{ch}/.agent"
     dec, pre = SPEED[ch]
     for l in open(f"{root}/iterations.jsonl"):
-        if not l.strip():
+        try:   # a line cut short (the VM's disk filled on 2026-10-11) is skipped
+            r = json.loads(l)
+        except ValueError:
             continue
-        r = json.loads(l)
         s, e = datetime.fromisoformat(r["start"]), datetime.fromisoformat(r["end"])
         if e <= SINCE or s >= UNTIL:
             continue

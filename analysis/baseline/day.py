@@ -9,6 +9,16 @@ tool each turn waited on, from turns.py output in <data>/turns.jsonl (run turns.
 First run 2026-10-08 (frontpage, Oct 7 21:43 to Oct 8 19:44): see docs/experiments.md#baseline-where-a-cards-day-goes.
 """
 import json, re, sys, collections
+
+
+def jl(path):  # JSON lines, skipping a line cut short (the VM's disk filled on 2026-10-11)
+    out = []
+    for l in open(path):
+        try:
+            out.append(json.loads(l))
+        except ValueError:
+            pass
+    return out
 from datetime import datetime, timedelta, timezone
 
 D = sys.argv[1]
@@ -33,7 +43,7 @@ def counter_at(port, t, k):
     best = min(xs, key=lambda x: abs((x[0] - t).total_seconds()))
     return best[1][k], best[0]
 
-ev = [json.loads(l) for l in open(f"{D}/fp/main/.agent/team/events.jsonl") if l.strip()]
+ev = jl(f"{D}/fp/main/.agent/team/events.jsonl")
 turns = collections.defaultdict(list)
 for l in open(f"{D}/turns.jsonl"):
     r = json.loads(l)
@@ -52,7 +62,7 @@ for a, port in CARD.items():
     prefill = (p1 - p0) * LIFE[port][1] * WS / span
     gen_day = gen_tok * 86400 / span
     # sessions
-    led = [json.loads(l) for l in open(f"{D}/fp/{a}/.agent/iterations.jsonl") if l.strip()]
+    led = jl(f"{D}/fp/{a}/.agent/iterations.jsonl")
     sess = 0.0
     kinds = collections.Counter()
     for r in led:
