@@ -7,7 +7,7 @@ session headers in order, loop lines shown, activity row states, footer removed 
 
 Usage: python test_pi_live.py <session.jsonl>   any real .agent/sessions/iter-*.jsonl (a few MB); needs pyte
 (pip install pyte pygments). Work files go to a temporary directory."""
-import fcntl, json, os, pty, re, signal, struct, subprocess, sys, termios, threading, time
+import fcntl, json, os, pty, re, struct, subprocess, sys, termios, threading, time
 import pyte
 
 import tempfile

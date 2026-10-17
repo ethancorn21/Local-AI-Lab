@@ -11,7 +11,7 @@ usage: [LCB_DATA=heldout.jsonl LCB_TIMEOUT=20] lcb-quick.py gen --url http://127
        lcb-quick.py grade --label strata-iq2xs
        lcb-quick.py report
 """
-import argparse, base64, json, os, pickle, random, re, subprocess, sys, tempfile, time, urllib.request, zlib
+import argparse, base64, json, os, pickle, random, re, subprocess, tempfile, time, urllib.request, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # LCB_DATA: a file in LiveCodeBench's row format; default LiveCodeBench v6 (huggingface.co/datasets/livecodebench/

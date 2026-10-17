@@ -16,7 +16,7 @@ only shortlists (frontpage 2026-10-04: real duplicates scored 0.14-0.24, two dif
 pair is judged by reading it. Baseline judged: 3 real duplicates in the 215 work sessions before the change (the
 Playwright single-value matcher pair, the read-tool re-wrapping pair, the acceptance-boxes-verbatim pair).
 """
-import collections, glob, json, os, re, statistics, subprocess, sys
+import collections, json, os, re, statistics, subprocess, sys
 
 MEM = re.compile(r"(AGENTS|PROGRESS|PLAN|DECISIONS|CODEMAP|PITFALLS)\.md|tasks/|git log")
 FILES = ("DECISIONS.md", "PLAN.md", "PITFALLS.md", "PROGRESS.md", "CODEMAP.md", "AGENTS.md")

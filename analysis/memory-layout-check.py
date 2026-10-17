@@ -10,7 +10,7 @@ whole reads that the rules replace with searches (DECISIONS.md, PITFALLS.md, PLA
 PITFALLS.md entries with their Where:/Symptom: keys; PITFALLs still written to DECISIONS.md.
 Prints PASS/WARN/FAIL lines; exit 1 if any FAIL.
 """
-import glob, json, os, re, shutil, subprocess, sys, tempfile
+import json, os, re, shutil, subprocess, sys, tempfile
 
 HOME = os.path.expanduser("~")
 SYNC = os.environ.get("PITFALLS_SYNC", os.path.join(HOME, "bin/pitfalls-sync"))
@@ -146,7 +146,7 @@ def logs(proj):
     diff = git(proj, "log", f"--since={cut}", "-p", "--format=@@C %H", "--", "PITFALLS.md", "DECISIONS.md")
     new, keyed, old_habit, cur = 0, 0, 0, None
     for line in diff.split("\n") + ["@@C end"]:
-        if cur is not None and (not line.startswith("+") or line.startswith("+#### ") or line.startswith("+## ")):
+        if cur is not None and (not line.startswith("+") or line.startswith(("+#### ", "+## "))):
             new += 1
             keyed += bool(re.search(r"(?m)^\s*Where:", cur) and re.search(r"(?m)^\s*Symptom:", cur))
             cur = None

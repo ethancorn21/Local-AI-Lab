@@ -4,7 +4,7 @@ For each iteration session: tokens of context when the first code edit happens (
 files were read and how much of them (chars returned, whether the read reached the end), archive/codemap/git-log use,
 what was written to memory files and how (tool, chars), and how many turns went to reading vs doing.
 """
-import json, os, re, sys, glob, statistics as st
+import json, os, re, sys, statistics as st
 
 proj, first, last = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 MEM = re.compile(r"(^|/)(PROGRESS|DECISIONS|CODEMAP|AGENTS)\.md$|(^|/)codemap/.+\.md$|DECISIONS-archive\.md$")
