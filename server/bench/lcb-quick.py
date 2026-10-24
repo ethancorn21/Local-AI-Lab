@@ -4,22 +4,37 @@
 Same request settings as production (thinking on at effort xhigh, temperature 1.0 / top_p 0.95 / top_k 20, 16k
 thinking cap) and the same problems for every model: AtCoder (stdin/stdout) problems from LiveCodeBench release v6
 (2025-01..04), N_HARD hard + N_MED medium, picked with a fixed seed. The prompt is LiveCodeBench's own for stdin
-problems. Solutions run as the `agent` account (the account that runs model-written code every day), each test with a
-time limit; output compared token by token (floats with a 1e-6 tolerance).
+problems. Solutions run as the `agent` account (the account that runs model-written code every day; `nobody` where there
+is none, as on the AI box; LCB_RUN_AS overrides), each test with a time limit; output compared token by token (floats with a 1e-6 tolerance).
 
-usage: [LCB_DATA=heldout.jsonl LCB_TIMEOUT=20] lcb-quick.py gen --url http://127.0.0.1:8082/v1 --label strata-iq2xs [--model NAME] [--budget-field thinking_token_budget | --wrap-up]
+usage: [LCB_DATA=heldout.jsonl LCB_TIMEOUT=20 LCB_N_HARD=12 LCB_N_MED=8] lcb-quick.py gen --url http://127.0.0.1:8082/v1 --label strata-iq2xs [--model NAME] [--budget-field thinking_token_budget | --wrap-up] [--attempts 3 --parallel 3]
        lcb-quick.py grade --label strata-iq2xs
        lcb-quick.py report
 """
-import argparse, base64, json, os, pickle, random, re, subprocess, tempfile, time, urllib.request, zlib
+import argparse, math, base64, json, os, pickle, pwd, random, re, subprocess, tempfile, threading, time, urllib.request, zlib
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # LCB_DATA: a file in LiveCodeBench's row format; default LiveCodeBench v6 (huggingface.co/datasets/livecodebench/
 # code_generation_lite test6.jsonl). A private held-out set (platform "heldout") is used whole, not sampled.
 DATA = os.environ.get("LCB_DATA", os.path.join(HERE, "test6.jsonl"))
 OUT = os.path.join(HERE, "results")
-N_HARD, N_MED, SEED = 12, 8, 20261005
+# LCB_N_HARD / LCB_N_MED: how many hard and medium problems (24 hard, 0 medium on 2026-10-18: the held-out set could
+# not tell the 8-bit 27B from Flash-Next IQ3_S, 34 vs 32 of 42, both passing 9 of its 14 tasks every time)
+N_HARD, N_MED, SEED = int(os.environ.get("LCB_N_HARD", "12")), int(os.environ.get("LCB_N_MED", "8")), 20261005
 TEST_TIMEOUT = int(os.environ.get("LCB_TIMEOUT", "10"))   # seconds per test
+
+
+def _run_as():   # the AI box has no `agent` account: every test failed "sudo: user 'agent' not found" (2026-10-18)
+    if os.environ.get("LCB_RUN_AS"):
+        return os.environ["LCB_RUN_AS"]
+    try:
+        return pwd.getpwnam("agent").pw_name
+    except KeyError:
+        return "nobody"
+
+
+RUN_AS = _run_as()
 PROMPT = ("You will be given a question (problem specification) and will generate a correct Python program that matches "
           "the specification and passes all tests.\n\nQuestion: {q}\n\nRead the inputs from stdin solve the problem and write "
           "the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
@@ -142,12 +157,14 @@ def run_tests(code, cases):
         os.chmod(src, 0o644)
         for i, c in enumerate(cases):
             try:
-                p = subprocess.run(["sudo", "-u", "agent", "timeout", str(TEST_TIMEOUT), "python3", src], input=c["input"],
+                p = subprocess.run(["sudo", "-n", "-u", RUN_AS, "timeout", str(TEST_TIMEOUT), "python3", src], input=c["input"],
                                    capture_output=True, text=True, timeout=TEST_TIMEOUT + 5, cwd="/tmp")
             except subprocess.TimeoutExpired:
                 return {"passed": False, "failed_at": i, "why": "timeout"}
             if p.returncode == 124:
                 return {"passed": False, "failed_at": i, "why": "timeout"}
+            if p.returncode and p.stderr.startswith("sudo:"):   # the grader's fault, not the answer's
+                raise SystemExit(f"cannot run tests as {RUN_AS}: {p.stderr.strip()}")
             if p.returncode:
                 return {"passed": False, "failed_at": i, "why": "error: " + p.stderr.strip()[-200:]}
             if not same(p.stdout, c["output"]):
@@ -157,38 +174,52 @@ def run_tests(code, cases):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["gen", "grade", "report"])
+    ap.add_argument("cmd", choices=["gen", "grade", "report", "compare"])
+    ap.add_argument("labels", nargs="*", help="compare: two labels, paired by problem")
     ap.add_argument("--url"); ap.add_argument("--label"); ap.add_argument("--budget-field")
     ap.add_argument("--model", default="x")   # vLLM checks the name; Strata serves any
     ap.add_argument("--max-tokens", type=int, default=24000)
     ap.add_argument("--redo-length", action="store_true", help="re-ask only the answers that hit max_tokens (old file kept)")
     ap.add_argument("--wrap-up", action="store_true", help="vLLM: end capped thinking with Strata's wrap-up, not a bare </think>")
+    ap.add_argument("--attempts", type=int, default=1); ap.add_argument("--parallel", type=int, default=1)
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     if a.cmd == "gen" and a.redo_length:
         path = f"{OUT}/{a.label}.gen.jsonl"
         old = [json.loads(l) for l in open(path)]
-        os.replace(path, f"{path}.max{old[0].get('max_tokens', 24000)}")
+        bak = f"{path}.before-redo"   # never overwritten: a second redo keeps the first run's answers
+        bak = bak if not os.path.exists(bak) else f"{bak}.{int(time.time())}"
+        os.replace(path, bak)
+        # each attempt's own seed, as gen asked it (10-18: the redo used attempt 0's seed for every attempt)
         seeds = {r["question_id"]: SEED + k for k, r in enumerate(problems())}
         by_id = {r["question_id"]: r for r in problems()}
         with open(path, "w") as f:
             for g in old:
-                if g["finish"] == "length":
-                    res = ask(a.url, a.model, PROMPT.format(q=by_id[g["qid"]]["question_content"]), seeds[g["qid"]], a.budget_field, a.max_tokens, a.wrap_up)
+                if g["finish"] == "length" and g.get("max_tokens", 24000) < a.max_tokens:
+                    seed = seeds[g["qid"]] + 1000 * g.get("attempt", 0)
+                    res = ask(a.url, a.model, PROMPT.format(q=by_id[g["qid"]]["question_content"]), seed, a.budget_field, a.max_tokens, a.wrap_up)
                     g = {**g, **res, "max_tokens": a.max_tokens}
                     print(f"{a.label} redo {g['qid']:10s} tokens {res['completion_tokens']:6d} {res['wall_s']:6.1f}s finish={res['finish']}", flush=True)
                 f.write(json.dumps(g) + "\n"); f.flush()
     elif a.cmd == "gen":
+        # --attempts: one task asked N times with different seeds (one attempt left 2-3 tasks of noise per run,
+        # docs/model-choice.md); --parallel: that many requests at once (the 2026-10-17 bench's servers batch them).
         path = f"{OUT}/{a.label}.gen.jsonl"
-        done = {json.loads(l)["qid"] for l in open(path)} if os.path.exists(path) else set()
-        for k, r in enumerate(problems()):
-            if r["question_id"] in done:
-                continue
-            res = ask(a.url, a.model, PROMPT.format(q=r["question_content"]), SEED + k, a.budget_field, a.max_tokens, a.wrap_up)
-            rec = {"qid": r["question_id"], "difficulty": r["difficulty"], "title": r["question_title"], **res}
-            open(path, "a").write(json.dumps(rec) + "\n")
-            print(f"{a.label} {k + 1:2d} {r['difficulty']:6s} {r['question_id']:10s} tokens {res['completion_tokens']:6d} "
-                  f"{res['wall_s']:6.1f}s {res['decode_tps']} tok/s finish={res['finish']}", flush=True)
+        done = {(g["qid"], g.get("attempt", 0)) for g in map(json.loads, open(path))} if os.path.exists(path) else set()
+        jobs = [(k, r, t) for t in range(a.attempts) for k, r in enumerate(problems()) if (r["question_id"], t) not in done]
+        lock = threading.Lock()
+
+        def one(job):
+            k, r, t = job
+            res = ask(a.url, a.model, PROMPT.format(q=r["question_content"]), SEED + k + 1000 * t, a.budget_field, a.max_tokens, a.wrap_up)
+            rec = {"qid": r["question_id"], "attempt": t, "difficulty": r["difficulty"], "title": r["question_title"], **res}
+            with lock:
+                open(path, "a").write(json.dumps(rec) + "\n")
+                print(f"{a.label} {k + 1:2d}.{t} {r['difficulty']:6s} {r['question_id']:10s} tokens {res['completion_tokens']:6d} "
+                      f"{res['wall_s']:6.1f}s {res['decode_tps']} tok/s finish={res['finish']}", flush=True)
+
+        with ThreadPoolExecutor(a.parallel) as pool:
+            list(pool.map(one, jobs))
     elif a.cmd == "grade":
         by_id = {r["question_id"]: r for r in problems()}
         out = []
@@ -196,9 +227,26 @@ def main():
             g = json.loads(l)
             code = code_of(g["text"])
             res = run_tests(code, tests(by_id[g["qid"]])) if code else {"passed": False, "why": "no code block"}
-            out.append({"qid": g["qid"], "difficulty": g["difficulty"], **res})
+            out.append({"qid": g["qid"], "attempt": g.get("attempt", 0), "difficulty": g["difficulty"], **res})
             print(a.label, g["qid"], g["difficulty"], json.dumps(res)[:150], flush=True)
         json.dump(out, open(f"{OUT}/{a.label}.grade.json", "w"), indent=1)
+    elif a.cmd == "compare":
+        # Two arms on the same problems, paired by problem (10-20, "is Q4 even worth it"): the tries each passed per
+        # problem, the problems where one did better, and the exact two-sided sign test over those
+        x, y = ({} for _ in range(2))
+        for label, d in zip(a.labels, (x, y)):
+            for g in json.load(open(f"{OUT}/{label}.grade.json")):
+                d.setdefault(g["qid"], []).append((g.get("attempt", 0), bool(g["passed"])))
+        for d in (x, y):   # first tries first, so with unequal tries both sides keep their earliest
+            for q in d: d[q] = [ok for _, ok in sorted(d[q])]
+        both = sorted(set(x) & set(y))
+        n = min(min(len(x[q]), len(y[q])) for q in both)   # the same number of tries on both sides
+        px = {q: sum(x[q][:n]) for q in both}; py = {q: sum(y[q][:n]) for q in both}
+        wx = sum(px[q] > py[q] for q in both); wy = sum(py[q] > px[q] for q in both)
+        k, m = min(wx, wy), wx + wy
+        p = min(1.0, 2 * sum(math.comb(m, i) for i in range(k + 1)) / 2 ** m) if m else 1.0
+        print(f"{a.labels[0]} {sum(px.values())}/{n * len(both)} against {a.labels[1]} {sum(py.values())}/{n * len(both)} "
+              f"({len(both)} problems x {n} tries); better on {wx} problems against {wy}, sign test p = {p:.2f}")
     else:
         for f in sorted(os.listdir(OUT)):
             if not f.endswith(".grade.json"):

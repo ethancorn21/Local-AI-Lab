@@ -1,0 +1,11 @@
+[Unit]
+Description=Bench watchdog: phone pings when the unattended bench stalls, stops or runs low on disk; stops a stalled arm
+After=docker.service
+
+[Service]
+ExecStart=/usr/local/sbin/bench-watchdog
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

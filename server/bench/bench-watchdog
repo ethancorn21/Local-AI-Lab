@@ -1,0 +1,205 @@
+#!/usr/bin/python3 -I
+"""bench-watchdog: phone pings, and one automatic step, for the unattended serving bench (docs/serving-bench.md) while
+nobody is watching (2026-10-18). Checks every minute; runs as root (bench-watchdog.service).
+
+  - no progress: a bench chain or a bench-* container is up and no file under results/ has changed for PING_MIN (45)
+    minutes: ping. At STOP_MIN (90), with a bench container up, the arm is stopped (bench-arms.sh stop, as the chains
+    run it, which saves its engine log first): its requests fail at once and its phase goes on to the next arm. Pinged.
+    The longest quiet stretch a healthy arm has is one coding answer on the slowest Strata arm, about 30 min, and a
+    first Strata start (its pack) up to the 60 min bench-arms.sh waits. A hung engine otherwise holds every client
+    request to its 1 h socket timeout, one request after another.
+  - idle: no chain-*.sh, no bench-phase.sh and no bench container for 3 checks in a row (the queue finished, a chain
+    died, or the box rebooted): ping once, again only after the bench has run in between.
+  - disk: / or /opt under DISK_GB (8) free: ping once, again after it was back above.
+Every ping and stop is a line in results/watchdog.log, which does not count as progress. Pings go through the
+doorbell relay, as hwtemps-log's do. The arm is stopped as the owner of results/ (the account the chains run as).
+For a test against stubs: BENCH_SWEEP (the sweep folder), BENCH_WD_TIMES ("ping_min,stop_min,interval_s"),
+BENCH_WD_DOORBELL (the relay command); not as root, nothing goes through runuser.
+
+  bench-watchdog              run (the service)
+  bench-watchdog --status     print what it sees now and what it would do; sends and stops nothing
+  bench-watchdog --test-ping  send one test ping, then exit
+"""
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import syslog
+import time
+
+SWEEP = os.environ.get("BENCH_SWEEP", "/opt/llm/sweep")
+RESULTS = f"{SWEEP}/results"
+LOG = f"{RESULTS}/watchdog.log"
+PING_MIN, STOP_MIN, INTERVAL = map(float, os.environ.get("BENCH_WD_TIMES", "45,90,60").split(","))
+DISK_GB, IDLE_N = 8, 3
+DOORBELL = os.environ.get("BENCH_WD_DOORBELL", "/usr/local/bin/doorbell")
+DRIVER = re.compile(r"chain-[\w.-]+\.sh|bench-phase\.sh")
+ENV = {"PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")}
+
+
+def as_user(user, cmd):
+    return ["/usr/sbin/runuser", "-u", user, "--", *cmd] if os.geteuid() == 0 else cmd
+
+
+def drivers():
+    """-> the bench's driver scripts running now (chain-*.sh, bench-phase.sh), by their script argument"""
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        for a in argv[1:3]:   # bash ./chain-next4.sh <pid>: a whole `bash -c "..."` string never matches
+            name = os.path.basename(a.decode(errors="replace"))
+            if DRIVER.fullmatch(name):
+                found.append(name)
+                break
+    return found
+
+
+def containers():
+    """-> names of the running bench-* containers, or None when docker does not answer"""
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}", "--filter", "name=^bench-"],
+                           capture_output=True, text=True, timeout=60, env=ENV)
+    except subprocess.TimeoutExpired:
+        return None
+    return r.stdout.split() if r.returncode == 0 else None
+
+
+def last_change():
+    """-> (mtime, path) of the newest file under results/, watchdog.log aside"""
+    best = (0.0, "")
+    for root, _, files in os.walk(RESULTS):
+        for f in files:
+            p = os.path.join(root, f)
+            if p == LOG:
+                continue
+            try:
+                m = os.stat(p).st_mtime
+            except OSError:
+                continue
+            if m > best[0]:
+                best = (m, p)
+    return best
+
+
+def last_chain_line():
+    try:
+        lines = [l.strip() for l in open(f"{RESULTS}/chain.log", errors="replace") if l.startswith("===")]
+        return lines[-1][4:] if lines else "chain.log has no === line"
+    except OSError:
+        return "no chain.log"
+
+
+def free_gb(path):
+    return shutil.disk_usage(path).free / 2**30
+
+
+def log(text):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n"
+    try:
+        with open(LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    syslog.syslog(syslog.LOG_WARNING, f"bench-watchdog: {text}")
+
+
+def ping(text):
+    msg = json.dumps({"kind": "info", "text": text})
+    try:
+        r = subprocess.run(as_user("doorbell", [DOORBELL]), input=msg, text=True,
+                           capture_output=True, timeout=60, env={"SSH_ORIGINAL_COMMAND": "send", **ENV})
+        ok = r.returncode == 0
+    except Exception:
+        ok = False
+    log(f"ping{'' if ok else ' (doorbell send failed)'}: {text}")
+    return ok
+
+
+def stop_arm():
+    """bench-arms.sh stop as the chains' account: saves each engine log to results/, then stops and removes every bench
+    container"""
+    owner = pwd.getpwuid(os.stat(RESULTS).st_uid)
+    try:
+        r = subprocess.run(as_user(owner.pw_name, ["timeout", "600", "./bench-arms.sh", "stop"]),
+                           cwd=SWEEP, capture_output=True, text=True, timeout=660, env={"HOME": owner.pw_dir, **ENV})
+        return r.returncode == 0, (r.stdout + r.stderr).strip()[-300:]
+    except subprocess.TimeoutExpired:
+        return False, "bench-arms.sh stop did not return in 11 min"
+
+
+class Watch:
+    def __init__(self):
+        self.pinged = self.stopped = None   # the last_change mtime each was done for: once per quiet stretch
+        self.idle_n, self.idle_sent, self.disk_low = 0, False, set()
+
+    def step(self, now, running, names, change, disks):
+        """-> list of (action, text); action is "ping" or "stop" (stop pings after it runs)"""
+        out = []
+        m, path = change
+        quiet = (now - m) / 60
+        where = f"last write {time.strftime('%H:%M', time.localtime(m))} {os.path.basename(path)}" if m else "no results yet"
+        if running or names:
+            self.idle_n, self.idle_sent = 0, False
+            arm = ", ".join(names) or "no arm up, chain still running"
+            if quiet >= PING_MIN and self.pinged != m:
+                self.pinged = m
+                out.append(("ping", f"AI box bench: no new result for {quiet:.0f} min ({arm}; {where}). "
+                                    + (f"The arm is stopped at {STOP_MIN:g} min so the chain moves on." if names else
+                                       "Nothing to stop: check the chain.")))
+            if names and quiet >= STOP_MIN and self.stopped != m:
+                self.stopped = m
+                out.append(("stop", f"AI box bench: stopped {arm} after {quiet:.0f} min without a new result ({where}); "
+                                    "the chain goes on to the next arm. Engine log saved in results/, rerun the arm later."))
+        else:
+            self.idle_n += 1
+            if self.idle_n >= IDLE_N and not self.idle_sent:
+                self.idle_sent = True
+                out.append(("ping", "AI box bench: nothing running (no chain, no arm): the queue finished, a chain died "
+                                    f"or the box rebooted. Last chain step: {last_chain_line()}"))
+        for mount, gb in disks.items():
+            if gb < DISK_GB and mount not in self.disk_low:
+                self.disk_low.add(mount)
+                out.append(("ping", f"AI box: {mount} has {gb:.1f} GB free (bench results and docker need room)"))
+            elif gb > DISK_GB + 2:
+                self.disk_low.discard(mount)
+        return out
+
+
+def look():
+    return time.time(), drivers(), containers(), last_change(), {d: free_gb(d) for d in ("/", "/opt")}
+
+
+def main():
+    if "--test-ping" in sys.argv:
+        sys.exit(0 if ping("AI box: test - bench watchdog pings are on (stall, idle, low disk)") else 1)
+    if "--status" in sys.argv:
+        now, running, names, change, disks = look()
+        print(f"drivers: {running or 'none'}\ncontainers: {names}\nlast change: "
+              f"{time.strftime('%H:%M:%S', time.localtime(change[0]))} {change[1]} ({(now - change[0]) / 60:.1f} min ago)\n"
+              f"free: " + ", ".join(f"{d} {gb:.1f} GB" for d, gb in disks.items()) + f"\nlast chain step: {last_chain_line()}")
+        w = Watch()
+        w.idle_n = IDLE_N - 1
+        for action, text in w.step(now, running, names or [], change, disks):
+            print(f"would {action}: {text}")
+        return
+    log(f"started (ping at {PING_MIN:g} min without a new result, stop the arm at {STOP_MIN:g}, disk under {DISK_GB} GB)")
+    w = Watch()
+    while True:
+        now, running, names, change, disks = look()
+        if names is not None:   # docker not answering: decide nothing this round
+            for action, text in w.step(now, running, names, change, disks):
+                if action == "stop":
+                    ok, said = stop_arm()
+                    text += "" if ok else f" STOP FAILED: {said}"
+                ping(text)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
