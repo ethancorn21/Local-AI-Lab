@@ -15,7 +15,8 @@ here.
 | `harness/deploy-driver` | Installs the driver, plugins and extensions on the VM (with backups) and restarts teams |
 | `analysis/tests/` | The harness's tests: stub agents, no model (list in `docs/agent-harness.md`, Tests of the harness) |
 | `analysis/` | The session-log analysers behind every number in the docs |
-| `server/`, `dashboard/` | The GPU box (serving, power, heat, the relay) and the lab console |
+| `server/localcompute/` | The local-compute service on the GPU box: `lcd.py` (queue, setups, jobs, the OpenAI door), `lc-setup`, the `lc` CLI, `lc-mcp` (Claude's MCP tools); `docs/local-compute.md` |
+| `server/`, `dashboard/` | The GPU box (serving, power, heat, the relay, the bench) and the lab console |
 | `docs/` | `how-it-works.md` (the guide), `agent-harness.md` (every rule with its reason, decisions, decided against), `experiments.md`, `ai-lab.md` (hardware, network, changelog) |
 
 ## House rules

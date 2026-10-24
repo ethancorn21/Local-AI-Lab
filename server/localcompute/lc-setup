@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# lc-setup: start and stop the local-compute service's setups on the two RTX 3090s (docs/local-compute.md). lcd.py
+# calls it; by hand it is the way to see what the service would run.
+#
+#   lc-setup start <main|swarm|big> <port>   stop any other lc- container, start this setup on 127.0.0.1:<port>, and
+#                                            return once it has answered a first request (exit 1 if it never does)
+#   lc-setup stop                            stop every lc- container
+#   lc-setup running                         the running setup's name, if any
+#   lc-setup gpu-busy                        exit 0 when something else holds the 3090s: a bench-* container (the
+#                                            serving bench) or the old production servers
+#
+# Each setup is the serving bench's decision (docs/serving-bench.md, Decision), started with the same settings as
+# its bench arm (server/bench/bench-arms.sh) under its own container name, so the bench and the service never stop
+# each other's servers by accident:
+#   main   w4-27b-tp2m1r4080: production's 4-bit Qwen3.8-27B, one copy across both 3090s, MTP with 1 draft token
+#          (3 drafts fell past 8 agents), a Mamba checkpoint every 4,080 tokens (vLLM's dense default stalled at 6
+#          agents of 128k), 262k context
+#   swarm  a3b-awq: Qwen3.6-35B-A3B 4-bit, both 3090s, 64k a conversation, text only (its 1.66M-token pool holds 35
+#          scouts of 40k at once)
+#   big    fn-iq3s-2s: Flash-Next IQ3_S on Strata, split by hand at layer 27, each card loading only its own layers
+#          (20% faster decode than Strata's own split), 262k context, one request at a time
+# The cards are found by name, not UUID: their bus numbers change when cards move.
+set -euo pipefail
+M=/opt/llm/engines/models/bench
+HQ=ghcr.io/syv-ai/hyperqwen:latest
+STRATA=strata:477ac13-built
+LOG=${LC_LOG:-/var/lib/localcompute/setup}
+# The servers' own wrap-up at the thinking cap, as in production; HyperQwen's launcher splits EXTRA_ARGS on spaces
+WRAP='{"reasoning_end_str":"\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"}'
+WRAP_HQ='{"reasoning_end_str":"\n\nI\u0020have\u0020thought\u0020about\u0020this\u0020long\u0020enough;\u0020time\u0020to\u0020give\u0020my\u0020answer.\n</think>\n\n"}'
+
+# The service's unit gives it the docker group (no sudo, so no auth-log lines for its checks every 30 s); by hand,
+# without the group, sudo
+D=docker; docker ps -q >/dev/null 2>&1 || D="sudo docker"
+
+uuid() { nvidia-smi --query-gpu=name,uuid --format=csv,noheader | awk -F', ' -v n="$1" '$1 == n {print $2}'; }
+
+stop_all() {
+  local c; c=$($D ps -aq --filter "name=^lc-")
+  [ -n "$c" ] || return 0
+  mkdir -p "$LOG"
+  for n in $($D ps --format '{{.Names}}' --filter "name=^lc-"); do   # the engine's own log, for a later look
+    $D logs "$n" > "$LOG/$n.engine.log" 2>&1 || true
+  done
+  $D stop -t 60 $c >/dev/null; $D rm $c >/dev/null
+}
+
+start() {
+  local setup=$1 port=$2 g3090 g3090ti
+  g3090=$(uuid "NVIDIA GeForce RTX 3090"); g3090ti=$(uuid "NVIDIA GeForce RTX 3090 Ti")
+  [ -n "$g3090" ] && [ -n "$g3090ti" ] || { echo "lc-setup: the two 3090s were not found by name" >&2; return 1; }
+  stop_all
+  case $setup in
+    main)
+      $D volume inspect bench-hq-cache-a >/dev/null 2>&1 || $D run --rm --entrypoint bash \
+        -v hyperqwen_qwen-cache:/src:ro -v bench-hq-cache-a:/dst "$HQ" -c 'cp -a /src/. /dst/'
+      $D run -d --name lc-main --gpus "\"device=$g3090,$g3090ti\"" --ipc host --shm-size 16g \
+        -p "127.0.0.1:$port:8080" -v /opt/llm/engines/models/hyperqwen:/app/models -v bench-hq-cache-a:/cache \
+        -e PORT=8080 -e CTX=long -e SPEC=mtp -e PREFIX_CACHE=1 -e VISION=0 -e PREPARE=0 \
+        -e MAX_LEN=262144 -e MAX_SEQS=16 -e DRAFT_TOKENS=1 \
+        -e EXTRA_ARGS="--served-model-name main --reasoning-config $WRAP_HQ --tensor-parallel-size 2 --prefix-cache-retention-interval 4080" \
+        "$HQ" single >/dev/null ;;
+    swarm)
+      $D run -d --name lc-swarm --gpus "\"device=$g3090,$g3090ti\"" --ipc host --shm-size 16g \
+        -p "127.0.0.1:$port:8000" -v "$M:/models:ro" -v bench-vllm-cache:/cache -e HOME=/cache \
+        -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+        -e PATH=/app/venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        --entrypoint /app/venv/bin/vllm "$HQ" serve /models/swarm/Qwen3.6-35B-A3B-AWQ --served-model-name swarm \
+        --host 0.0.0.0 --port 8000 --max-model-len 65536 --gpu-memory-utilization 0.90 \
+        --kv-cache-dtype fp8 --enable-prefix-caching --reasoning-parser qwen3 --reasoning-config "$WRAP" \
+        --enable-auto-tool-choice --tool-call-parser qwen3_coder --tensor-parallel-size 2 --max-num-seqs 128 \
+        --language-model-only >/dev/null ;;
+    big)
+      # Strata's saved config for IQ3_S plus the hand split, on the bench's volume (its first start prepared the pack)
+      $D run --rm --entrypoint python3 -v bench-strata-data:/data "$STRATA" -c "import json, os
+p = '/data/config/strata-iq3_s-s.json'
+if not os.path.exists(p):
+    c = json.load(open('/data/config/strata-iq3_s.json'))
+    c['args'] += ['--layer-split', '27', '--trim-stage-weights']
+    json.dump(c, open(p, 'w'), indent=1)"
+      $D run -d --name lc-big --gpus "\"device=$g3090,$g3090ti\"" --ulimit memlock=-1 --stop-timeout 60 \
+        -p "127.0.0.1:$port:8080" -v "$M/flash/IQ3_S/IQ3_S:/gguf" -v bench-strata-data:/data \
+        -e FAMILY=qwen -e MODEL=IQ3_S -e GGUF_DIR=/gguf -e CONTEXT=262144 -e VISION=no \
+        -e CONFIG=/data/config/strata-iq3_s-s.json -e GPUS=0,1 "$STRATA" >/dev/null ;;
+    *) echo "lc-setup: unknown setup $setup (main, swarm, big)" >&2; return 1 ;;
+  esac
+  local url="http://127.0.0.1:$port"
+  for _ in $(seq 1 180); do   # up to 30 min (a first start compiles kernels)
+    curl -sf -m 5 "$url/health" >/dev/null 2>&1 && break
+    if ! $D ps -q --filter "name=^lc-$setup$" | grep -q .; then
+      mkdir -p "$LOG"; $D logs "lc-$setup" > "$LOG/lc-$setup.start.log" 2>&1 || true
+      echo "lc-setup: lc-$setup exited while starting ($LOG/lc-$setup.start.log)" >&2
+      grep -iE "error|out of memory|not supported" "$LOG/lc-$setup.start.log" | grep -v '^\s*File ' | tail -5 >&2 || true
+      return 1
+    fi
+    sleep 10
+  done
+  curl -sf -m 600 "$url/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$setup\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"max_tokens\":8,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
+    >/dev/null || { echo "lc-setup: lc-$setup never answered" >&2; return 1; }
+}
+
+case ${1:-} in
+  start) start "${2:?setup}" "${3:?port}" ;;
+  stop) stop_all ;;
+  running) n=$($D ps --format '{{.Names}}' --filter "name=^lc-" | head -1); echo "${n#lc-}" ;;
+  gpu-busy) $D ps --format '{{.Names}}' | grep -qE '^(bench-|hyperqwen-single-1$|hyperqwen-c-single-1$)' ;;
+  *) sed -n 2,13p "$0"; exit 1 ;;
+esac

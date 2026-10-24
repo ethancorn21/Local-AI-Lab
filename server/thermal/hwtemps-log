@@ -33,13 +33,19 @@ INTERVAL = 15
 WARN_C, STOP_C, FAN_PCT, CPU_LIMIT = 83, 88, 95, 95
 WARN_N, STOP_N, THROTTLE_N, FAN_N, CPU_N = 8, 4, 4, 20, 4      # samples: 2 min, 1 min, 1 min, 5 min, 1 min
 COOLDOWN = 1800
+# The 3090s' servers since 2026-10-24: the local-compute service's lc-* containers span both cards (one setup at a
+# time), and the serving bench's bench-* containers did too, unguarded, 10-17 to 10-24. A hot 3090 stops whichever
+# of those runs, and the old production container of that card if it ever runs again; the service holds until resumed.
+_STOP_3090S = "docker ps -q --filter name=^lc- --filter name=^bench- | xargs -r docker stop -t 30"
 STOPS = {   # GPU UUID -> (what runs on it, command that stops it, command that starts it again)
-    "GPU-56122485-2e24-e358-a731-574234bbc100": ("the vLLM container (agent a)", ["docker", "stop", "hyperqwen-single-1"],
-                                                 "sudo docker start hyperqwen-single-1"),
+    "GPU-56122485-2e24-e358-a731-574234bbc100": ("the 3090s' model server (lc-*, bench-*, hyperqwen-single-1)",
+                                                 ["sh", "-c", f"docker stop hyperqwen-single-1 2>/dev/null; {_STOP_3090S}"],
+                                                 "lc resume (local-compute)"),
     "GPU-ccdfa1bc-3062-ad1c-36ad-77e6bcdb7f3a": ("llama-5060ti (agent b)", ["systemctl", "stop", "llama-5060ti"],
                                                  "sudo systemctl start llama-5060ti"),
-    "GPU-0f9757bb-934e-8f17-6839-ccc72e99f1cb": ("the vLLM container (agent c)", ["docker", "stop", "hyperqwen-c-single-1"],
-                                                 "sudo docker start hyperqwen-c-single-1"),
+    "GPU-0f9757bb-934e-8f17-6839-ccc72e99f1cb": ("the 3090s' model server (lc-*, bench-*, hyperqwen-c-single-1)",
+                                                 ["sh", "-c", f"docker stop hyperqwen-c-single-1 2>/dev/null; {_STOP_3090S}"],
+                                                 "lc resume (local-compute)"),
 }
 QUERY = ("index,uuid,name,temperature.gpu,power.draw,fan.speed,utilization.gpu,"
          "clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown")

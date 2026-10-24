@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""lc-mcp: the local-compute service (lcd.py on the AI box) as MCP tools for Claude Code, over stdio.
+
+Register it once (user scope, every project):
+  claude mcp add --scope user localcompute -- python3 <repo>/server/localcompute/lc-mcp
+It reads the service's address and Claude's token like the `lc` CLI does (lc_client.py). No SDK: the few JSON-RPC
+messages an MCP tool server needs (initialize, tools/list, tools/call, ping), one JSON object per line.
+"""
+import json, os, sys, threading, traceback
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lc_client as lc   # noqa: E402
+
+INSTRUCTIONS = (
+    "The owner's AI box at home: local models on two RTX 3090s, free to use (no API cost), private, and slower than "
+    "you. Use it when work can be handed off: a well-specified change with tests (implement), a wide read of a "
+    "codebase for bugs or for something specific (swarm), or reading large files you would rather not spend your "
+    "context on (ask with files). Jobs queue; the box switches models as needed (1-3.5 min a switch). Check the "
+    "results: the local models are weaker than you, a patch is a proposal, swarm findings are leads.")
+
+TOOLS = [
+    {"name": "ask", "description": (
+        "Ask a local model a question, with local files inlined if given (they are read on this machine and sent "
+        "whole). setup main: Qwen3.8-27B 4-bit (passed 30 of 42 held-out coding attempts in the lab's bench), 262k "
+        "context, reads ~1,100 tokens/s and writes ~80 tokens/s. setup big: Flash-Next 125B (32 of 42), reads long prompts "
+        "four times faster (175k tokens in 46 s) and holds up better past 150k, one request at a time. Use it to "
+        "summarize or search large logs, files or dumps, for a second opinion, or for bulk text work. Waits up to "
+        "wait_seconds for the answer, else returns a job id for the job tool."),
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"},
+         "files": {"type": "array", "items": {"type": "string"}, "description": "paths on this machine to inline"},
+         "setup": {"type": "string", "enum": ["main", "big"], "default": "main"},
+         "thinking": {"type": "boolean", "default": True},
+         "max_tokens": {"type": "integer", "default": 8192, "description": "for the answer, after thinking"},
+         "wait_seconds": {"type": "integer", "default": 300}}, "required": ["prompt"]}},
+    {"name": "swarm", "description": (
+        "Point a swarm of local scouts (Qwen3.6-35B-A3B, one per ~440-line area, as many at once as the GPUs hold) "
+        "at a folder: a bug hunt by default, or a brief saying what to look for. Measured on a 44k-line codebase "
+        "with 60 planted bugs: about 42 found in 30 minutes, with about as many other reports, a third of those real "
+        "bugs. Smaller folders take minutes. verify: the 27B then checks each finding against its code (drops "
+        "noise, adds a switch and some minutes). Returns a job id; get results with the job tool."),
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "a folder on this machine (git-tracked files, or all but build/cache folders)"},
+         "brief": {"type": "string", "description": "what to look for; leave out for a bug hunt"},
+         "glob": {"type": "string", "default": "*.py", "description": "file name patterns, comma separated, e.g. *.py,*.ts"},
+         "areas": {"type": "integer", "description": "how many areas (default: one per ~440 lines, at most 100)"},
+         "verify": {"type": "boolean", "default": False}}, "required": ["path"]}},
+    {"name": "implement", "description": (
+        "Hand a well-specified change to the local implementation agent (Qwen3.8-27B, thinking on): it edits a "
+        "sandboxed copy of the folder until test_command passes, then returns a patch for you to review and apply. "
+        "Write the spec and the tests first; test files are protected from its edits (protect: globs, default the "
+        "usual test names). The test command runs with no network and only the box's system Python 3.14 with pytest "
+        "(no project packages). Best for tight, test-checked tasks of one or a few files; measured with retries "
+        "against tests: 12 of 14 held-out tasks. attempts: independent tries in parallel, the first to pass wins. "
+        "Returns a job id; get the patch with the job tool."),
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string"}, "spec": {"type": "string"},
+         "test_command": {"type": "string", "description": "run from the folder's root, e.g. python3 -m pytest -q tests/test_x.py"},
+         "protect": {"type": "array", "items": {"type": "string"}},
+         "attempts": {"type": "integer", "default": 1, "minimum": 1, "maximum": 4},
+         "max_turns": {"type": "integer", "default": 60},
+         "test_timeout": {"type": "integer", "default": 600}}, "required": ["path", "spec", "test_command"]}},
+    {"name": "job", "description": "A local-compute job's state and, once done, its result (waits up to wait_seconds).",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"},
+                                                       "wait_seconds": {"type": "integer", "default": 60}}, "required": ["id"]}},
+    {"name": "status", "description": "What the AI box has loaded, what waits, and your recent jobs.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "cancel", "description": "Cancel one of your local-compute jobs.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+]
+
+
+def submit_folder(c, path, spec):
+    data, n, skipped = lc.pack(path)
+    up = c.call("POST", "/uploads", raw=data)
+    j = c.call("POST", "/jobs", {**spec, "upload": up["upload"]})
+    lc.remember(j["id"], folder=os.path.realpath(os.path.expanduser(path)), kind=spec["kind"])
+    note = f" ({len(skipped)} files over 2 MB left out)" if skipped else ""
+    return j, f"{n} files sent{note}"
+
+
+def call(name, a):
+    c = lc.Client()
+    if name == "ask":
+        parts, chars = [], 0
+        for p in a.get("files") or []:
+            text = open(os.path.expanduser(p), encoding="utf-8", errors="replace").read()
+            chars += len(text)
+            parts.append(f"=== {p} ===\n{text}")
+        content = ("\n\n".join(parts) + "\n\n" if parts else "") + a["prompt"]
+        j = c.call("POST", "/jobs", {"kind": "chat", "setup": a.get("setup", "main"),
+                                     "messages": [{"role": "user", "content": content}],
+                                     "thinking": a.get("thinking", True), "max_tokens": a.get("max_tokens", 8192)})
+        j = c.wait(j["id"], a.get("wait_seconds", 300))
+        if j["state"] != "done":
+            return lc.describe(j) + "\n(still going: ask the job tool later)" * (j["state"] not in ("failed", "cancelled"))
+        return lc.describe(j)
+    if name == "swarm":
+        j, note = submit_folder(c, a["path"], {"kind": "swarm", **{k: a[k] for k in ("brief", "glob", "areas", "verify") if k in a}})
+        return f"swarm job {j['id']} {j['state']}: {note}. Results with the job tool (a 44k-line folder takes ~30 min)."
+    if name == "implement":
+        j, note = submit_folder(c, a["path"], {"kind": "implement", **{k: a[k] for k in (
+            "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout") if k in a}})
+        return f"implement job {j['id']} {j['state']}: {note}. The patch comes with the job tool."
+    if name == "job":
+        j = c.wait(a["id"], a.get("wait_seconds", 60))
+        return lc.describe(j, lc.recall(a["id"]).get("folder"))
+    if name == "status":
+        st = c.call("GET", "/status")
+        mine = c.call("GET", "/jobs")["jobs"][:10]
+        return json.dumps({**st, "your_recent_jobs": [{k: x[k] for k in ("id", "kind", "state", "summary", "progress")}
+                                                      for x in mine]}, indent=1)
+    if name == "cancel":
+        return lc.describe(c.call("POST", f"/jobs/{a['id']}/cancel"))
+    raise ValueError(f"no tool {name}")
+
+
+OUT = threading.Lock()
+
+
+def send(obj):
+    with OUT:
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+
+def tool_call(mid, params):   # in its own thread: a long ask must not hold up the next call
+    try:
+        res = {"content": [{"type": "text", "text": call(params["name"], params.get("arguments") or {})}]}
+    except (RuntimeError, OSError, ValueError, KeyError, SystemExit) as e:
+        res = {"content": [{"type": "text", "text": f"local-compute: {e}"}], "isError": True}
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        res = {"content": [{"type": "text", "text": f"local-compute: {e}"}], "isError": True}
+    send({"jsonrpc": "2.0", "id": mid, "result": res})
+
+
+def main():
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if mid is None:   # a notification: nothing to answer
+            continue
+        try:
+            if method == "initialize":
+                res = {"protocolVersion": params.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
+                       "serverInfo": {"name": "localcompute", "version": "1"}, "instructions": INSTRUCTIONS}
+            elif method == "tools/list":
+                res = {"tools": TOOLS}
+            elif method == "tools/call":
+                threading.Thread(target=tool_call, args=(mid, params), daemon=True).start()
+                continue
+            elif method == "ping":
+                res = {}
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"no method {method}"}})
+                continue
+            out = {"jsonrpc": "2.0", "id": mid, "result": res}
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            out = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": str(e)}}
+        send(out)
+
+
+if __name__ == "__main__":
+    main()

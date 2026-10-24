@@ -54,7 +54,9 @@ Related notes:
 
 ## Model serving
 
-**Production:** Qwen3.8-27B, 4-bit (W4A16 AutoRound), on vLLM with the HyperQwen patches, in Docker: one copy on the
+**Since 2026-10-24:** the [local-compute service](local-compute.md) serves the two 3090s: one setup at a time (main: the 4-bit 27B across both cards; swarm: Qwen3.6-35B-A3B; big: Flash-Next IQ3_S), chosen by the [serving bench](serving-bench.md), called by Claude (MCP), GrokBot and scripts (HTTP). The production servers described next are stopped (restart policy `no`); this is how they ran until 2026-10-17.
+
+**Production (until 10-17):** Qwen3.8-27B, 4-bit (W4A16 AutoRound), on vLLM with the HyperQwen patches, in Docker: one copy on the
 3090 Ti (port 8080) and one on the 3090 (8081). The second copy is its own compose project (`hyperqwen-c`,
 [override](../server/vllm-hyperqwen/docker-compose.c.yml)) with its own env file and compile cache. The model is a
 hybrid: most layers use linear attention with a fixed-size state and only 16 use full attention, so context memory
@@ -120,8 +122,8 @@ on the AI box plus one tunnel unit on the VM, with no firewall change.
 
 | Port | Service |
 |---|---|
-| 8080 | vLLM on the 3090 Ti (production) |
-| 8081 | vLLM on the 3090 (agent c) |
+| 8080, 8081 | lcd, the local-compute service (since 2026-10-24; before: vLLM on the 3090 Ti and on the 3090). `tailscale serve` forwards both to the tailnet, where the policy lets GrokBot reach these two ports only |
+| 8101-8103 | the service's setups (main, swarm, big), one at a time, localhost only |
 | 8082 | llama.cpp on the 5060 Ti (stopped 2026-10-10 for the Clef-flash test below) |
 | 8083 | Clef-flash 9B decision model, 8-bit, on the 5060 Ti: temporary, for the Ancient Works Finder re-ranker test (`/opt/llm/clef`) |
 | 8090 | Reserved: the type-1 log triage model |
@@ -206,3 +208,5 @@ The full day-by-day record: [history/changelog-detailed.md](history/changelog-de
 | 10-11 | Telegram off on the lab VM by the owner's choice (`~/.agent-kit/doorbell-off`): requests are answered on the console; ancient-works request 001 had sat 2.5 hours on Telegram unseen. A task blocked on the human no longer holds its files, so the other agent can build on them meanwhile ([agent-harness.md](agent-harness.md#the-rules-enforced-by-the-driver)). Decided the same night: the per-agent team layer gives way to a lead model that dispatches the workers for every project and GPU ([lab-v2.md](lab-v2.md)). Phase 1 built and deployed by morning: `lab` (the lead's commands: board, run a job, cancel, stop, message, answer, inbox, journal), job mode in the loop (a worker builds only its job's task until done, blocked or 3 sessions without a commit, then reports and waits; while a lead's lock is fresh, workers without a job wait instead of picking), and a Lead page on the console. Claude leads ancient-works. At 05:20 the VM's disk filled (pytest's kept runs and the agents' temp folders, 13 GB in /tmp) and both jobs stopped; now each loop's temp files live in a folder the loop empties every iteration. |
 | 10-11 | RoMa matcher unit on the 5060 Ti (port 8092, vismatch) next to ELoFTR: 11 of 21 hand fits placed, none wrong. |
 | 10-13 | Re-measure of where a card's day goes ([experiments.md](experiments.md#re-measure-after-the-test-gate-change)): after the 10-08 test-gate change, tests are 8% (frontpage) and 12% (ancient-works) of the day, not 31.5%; the model works 70-75% of it. Background verify, per project (`BG_VERIFY=1`): the driver's test gate runs in a worktree of its own while the agent starts its next task; a failed run brings the task back after the current one ([agent-harness.md](agent-harness.md#the-rules-enforced-by-the-driver)). |
+| 10-17 | The agent harness scrapped ("a piece of junk") for one local-compute service with three setups (big, main, swarm); the production servers stopped for the serving bench that picks them ([serving-bench.md](serving-bench.md)). |
+| 10-24 | The serving bench decided (main: the 4-bit 27B across both 3090s with 1 MTP draft and sparse Mamba checkpoints; swarm: the 4-bit A3B with scouts capped to the KV pool; big: Flash-Next IQ3_S on a hand split). The local-compute service runs in place of the production servers on ports 8080/8081 ([local-compute.md](local-compute.md)): a queue that loads one setup at a time, the OpenAI-compatible door for GrokBot (its agent jobs wait for the owner's approval), MCP tools for Claude (ask, swarm, implement), an implementation agent that edits a sandboxed copy until the caller's tests pass, and the thermal guard now stopping the service's and the bench's containers on a hot 3090. |

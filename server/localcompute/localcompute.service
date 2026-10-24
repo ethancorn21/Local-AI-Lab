@@ -1,0 +1,21 @@
+# The local-compute service (docs/local-compute.md): /etc/systemd/system/localcompute.service on the AI box.
+# Runs as the admin account that owns the model files and may run docker through sudo; listens on 127.0.0.1:8080 and
+# :8081, which tailscale serve forwards to the tailnet (members, and tag:grokbot by the tailnet policy).
+[Unit]
+Description=local-compute service (lcd)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=claude
+Group=claude
+SupplementaryGroups=docker
+ExecStart=/usr/bin/python3 /opt/llm/localcompute/lcd.py serve
+Environment=LC_STATE=/var/lib/localcompute LC_TOKENS=/etc/localcompute/tokens.json
+Restart=on-failure
+RestartSec=10
+# a model server keeps running when lcd restarts; the next lcd adopts it
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""lc: the local-compute service from a terminal (lc_client.py says where it is and which token).
+
+  lc status                     what is loaded, what waits
+  lc jobs [--all]               your jobs (--all: everyone's, admin)
+  lc job <id> [--wait N]        one job, with its result once done
+  lc ask "<prompt>" [--setup main|big] [--file F]...   a quick question
+  lc cancel <id>
+  admin (~/.config/localcompute/admin-token):
+  lc approve <id>               start a job held for approval (GrokBot's swarm and implement jobs)
+  lc pause [--stop]             take no new work (--stop: also stop the setup, freeing the GPUs)
+  lc resume                     after a pause or a hold (a setup that stopped on its own, e.g. the thermal guard)
+  lc load <main|swarm|big>      switch now (after what runs)
+"""
+import argparse, json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import lc_client as lc   # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    p = sub.add_parser("jobs"); p.add_argument("--all", action="store_true")
+    p = sub.add_parser("job"); p.add_argument("id"); p.add_argument("--wait", type=int, default=0)
+    p = sub.add_parser("ask"); p.add_argument("prompt"); p.add_argument("--setup", default="main")
+    p.add_argument("--file", action="append", default=[]); p.add_argument("--no-thinking", action="store_true")
+    p = sub.add_parser("cancel"); p.add_argument("id")
+    p = sub.add_parser("approve"); p.add_argument("id")
+    p = sub.add_parser("pause"); p.add_argument("--stop", action="store_true")
+    sub.add_parser("resume")
+    p = sub.add_parser("load"); p.add_argument("setup", choices=["main", "swarm", "big"])
+    a = ap.parse_args()
+    admin = a.cmd in ("approve", "pause", "resume", "load") or (a.cmd == "jobs" and a.all)
+    c = lc.Client(admin=admin)
+    try:
+        if a.cmd == "status":
+            print(json.dumps(c.call("GET", "/status"), indent=1))
+        elif a.cmd == "jobs":
+            for j in c.call("GET", "/jobs" + ("?all=1" if a.all else ""))["jobs"]:
+                print(f"{j['id']}  {j['kind']:9s} {j['state']:17s} {j['summary'] or ''}"[:160])
+        elif a.cmd == "job":
+            print(lc.describe(c.wait(a.id, a.wait), lc.recall(a.id).get("folder")))
+        elif a.cmd == "ask":
+            parts = [f"=== {f} ===\n{open(f, encoding='utf-8', errors='replace').read()}" for f in a.file]
+            j = c.call("POST", "/jobs", {"kind": "chat", "setup": a.setup, "thinking": not a.no_thinking,
+                                         "messages": [{"role": "user", "content": "\n\n".join(parts + [a.prompt])}]})
+            print(lc.describe(c.wait(j["id"], 3600)))
+        elif a.cmd == "cancel":
+            print(lc.describe(c.call("POST", f"/jobs/{a.id}/cancel")))
+        elif a.cmd == "approve":
+            print(lc.describe(c.call("POST", f"/jobs/{a.id}/approve")))
+        elif a.cmd == "pause":
+            print(json.dumps(c.call("POST", "/admin/pause", {"stop": a.stop}), indent=1))
+        elif a.cmd == "resume":
+            print(json.dumps(c.call("POST", "/admin/resume", {}), indent=1))
+        elif a.cmd == "load":
+            print(json.dumps(c.call("POST", "/admin/load", {"setup": a.setup}), indent=1))
+    except RuntimeError as e:
+        sys.exit(f"lc: {e}")
+
+
+if __name__ == "__main__":
+    main()
