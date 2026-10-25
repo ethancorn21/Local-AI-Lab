@@ -873,8 +873,8 @@ class Service:
             VIEW.ev(j["id"], me, "check", role="check", path=f["path"], line=f["line"], verdict=f["verdict"],
                     why=f["why"].split("\n", 1)[-1])
             done[0] += 1
-            if done[0] % 10 == 0:
-                self.progress(j["id"], f"{done[0]}/{len(res['findings'])} checked")
+            if done[0] % max(1, len(res["findings"]) // 10) == 0:   # about ten updates whatever the count: the expected end
+                self.progress(j["id"], f"{done[0]}/{len(res['findings'])} checked")   # (a check of 6 never had one, 10-25)
 
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(one, res["findings"]))
