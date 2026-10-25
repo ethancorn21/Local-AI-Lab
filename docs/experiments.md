@@ -16,6 +16,7 @@ the result and the decision for each experiment. Long write-ups have their own p
 | [Re-measure after the test-gate change](#re-measure-after-the-test-gate-change) | 2026-10-13 | Tests are 8-12% of a card's day, not 31.5%; the driver's gate (~6%) moves to the background next |
 | [Test quality: what the tests catch](#test-quality-what-the-tests-catch) | 2026-10-08 | One test run per task instead of three; timing tests out of the per-task run; no direct-call tests |
 | [Type-1 log triage model](type1.md) | 2026-09-29 on | A small fine-tuned model leads; paused |
+| [Serving bench: what the box serves once the harness is gone](serving-bench.md) | 2026-10-17 to 10-24 | main: the 4-bit 27B across both 3090s; swarm: the 4-bit A3B at the pool's fit; big: Flash-Next IQ3_S for one long read; the [local-compute service](local-compute.md) serves them |
 
 ## Hand-over notes in the task file
 

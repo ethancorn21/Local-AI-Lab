@@ -9,20 +9,28 @@ settings are the serving bench's decision (docs/serving-bench.md).
   setups  main   production's 4-bit Qwen3.8-27B across both 3090s: 8 agents at 128k. chat, implement, verify jobs
           swarm  Qwen3.6-35B-A3B 4-bit across both 3090s, 64k a scout: swarm jobs (and chat)
           big    Flash-Next IQ3_S on Strata: one request at a time, 262k, reads long prompts 4x faster than main
-  HTTP    POST /v1/chat/completions   OpenAI-compatible; "model" names the setup (anything else means main)
+  HTTP    POST /v1/chat/completions   OpenAI-compatible; "model" names the setup (anything else means main);
+                                      high priority: header "X-Priority: high" or "priority": "high"
           GET  /v1/models
           POST /uploads               body: a .tar.gz of the files a swarm or implement job works on -> {"upload"}
-          POST /jobs                  {"kind": "chat"|"swarm"|"implement", ...} -> the job
+          POST /jobs                  {"kind": "chat"|"swarm"|"implement", "priority": "high"|"normal", ...} -> the job
           GET  /jobs                  your jobs, newest first
-          GET  /jobs/<id>[?wait=N]    one of your jobs, with its result once done; wait: up to N s for its end
+          GET  /jobs/<id>[?wait=N]    one of your jobs, with its result once done; wait: up to N s for its end;
+                                      queued: its place in line and expected start
           POST /jobs/<id>/cancel
           POST /jobs/<id>/approve     admin: start a job that waits for the owner's approval
-          GET  /status                what is loaded, what waits
+          GET  /status                what is loaded, what runs and waits, in expected order with expected starts
           POST /admin/pause [{"stop": true}] | /admin/resume | /admin/load {"setup": ...}
           GET  /health                no token
   CLI     lcd.py serve
-          lcd.py token add <name> [--admin] [--approve swarm,implement] [--scopes chat,swarm,implement]
+          lcd.py token add <name> [--admin] [--high] [--approve swarm,implement] [--scopes chat,swarm,implement]
+          lcd.py token set <name> --high|--no-high
           lcd.py token list | token remove <name>
+
+Scheduling: the loaded setup keeps taking its own work, so work for one setup is batched between switches; another
+setup's work waits at most MAX_WAIT, or none if it is high priority, before the loaded setup drains (finishes what
+runs, starting only work that ends sooner: backfill) and the service switches. High work goes first in its line.
+Running work is never stopped.
 
 Every request but /health carries "Authorization: Bearer <token>"; the tokens are stored hashed. A caller sees only
 its own jobs, and a caller whose token lists a kind under "approve" (GrokBot's agent jobs, the owner's rule of
@@ -45,6 +53,13 @@ IDLE_SETUP = os.environ.get("LC_IDLE_SETUP", "main")   # loaded when nothing ask
 MAX_WAIT = int(os.environ.get("LC_MAX_WAIT", "600"))   # s: another setup's work waits this long, then the loaded
 # setup stops taking new work, finishes what it runs, and the service switches (a switch costs 1-3.5 min)
 IDLE_RETURN = int(os.environ.get("LC_IDLE_RETURN", "900"))   # s idle on swarm or big before main comes back
+# How long work is expected to take, for backfill and the queue's expected starts (10-24, the owner: "don't put me
+# in the back of the queue", and a live view of the lab's work). A kind's median over its last 20 done jobs once it
+# has 5, before that these: the bench's chat of a few thousand tokens, implement task, 100-area swarm, check of about
+# 100 findings, and its switch times (docs/serving-bench.md, Switch time).
+TYPICAL_S = {"chat": 90, "implement": 900, "swarm": 1800, "verify": 600}
+SWITCH_S = {"main": 90, "swarm": 210, "big": 90}
+BACKFILL_MARGIN = 30   # s: work started during a drain must be expected to end this long before the running work
 CHECK_EVERY = int(os.environ.get("LC_CHECK_EVERY", "30"))   # s between looks at the containers and the bench
 PING_CMD = os.environ.get("LC_PING")   # tests: a command that takes the phone message on stdin
 SANDBOX_SCOPE = os.environ.get("LC_SANDBOX_SCOPE", "1") == "1"   # tests on a laptop: no systemd scope
@@ -109,10 +124,8 @@ IMPL_TOOLS = scout.TOOLS[:3] + [
 PROTECT = ["tests/*", "*/tests/*", "test/*", "*/test/*", "test_*.py", "*/test_*.py", "*_test.py", "conftest.py",
            "*/conftest.py", "*.test.*", "*.spec.*"]
 IMPL_CAP, IMPL_RESERVE, IMPL_THINK, IMPL_ANSWER = 131072, 14000, 4096, 8192
-VERIFY_BUG = ("A scout reviewing this code for bugs reported the finding below. Decide whether it is a real bug: code "
-              "that does the wrong thing when it runs. Style, naming, missing features, missing error handling and "
-              "guesses about intent are not bugs.\n\n{path}, lines {x}-{y}, the reported line marked >>:\n\n{code}\n\n"
-              "The report, at line {line}: {finding}\n\nAnswer with BUG or NOT A BUG on the first line, then one sentence why.")
+# The 27B's check of a bug report: scout.py's VERIFY (the same words; why it reads this way is there)
+VERIFY_BUG = scout.VERIFY.replace("this Python code", "this code")
 VERIFY_CUSTOM = ("A scout was asked to find this in a codebase: {brief}\nIt reported the finding below. Decide whether "
                  "the report is right about this code.\n\n{path}, lines {x}-{y}, the reported line marked >>:\n\n{code}\n\n"
                  "The report, at line {line}: {finding}\n\nAnswer with YES or NO on the first line, then one sentence why.")
@@ -148,6 +161,19 @@ def token_hash(t):
     return hashlib.sha256(t.encode()).hexdigest()
 
 
+def priority_of(who, value):
+    """a job's or chat's priority: 1 for "high", which tokens marked high and admins may ask for, else 0. Why
+    (10-24, the owner): work Claude and the owner wait on goes next, not behind GrokBot's queue; GrokBot's token is
+    not marked, or everything it sends would be high"""
+    if value in (None, "", "normal"):
+        return 0
+    if value != "high":
+        raise JobError('priority must be "high" or "normal"')
+    if not (who.get("high") or who.get("admin")):
+        raise PermissionError("this token may not mark work high (an admin grants it: lcd.py token set <name> --high)")
+    return 1
+
+
 def load_tokens():
     try:
         return json.load(open(TOKENS))["tokens"]
@@ -167,18 +193,23 @@ def save_tokens(toks):
 class Jobs:
     """The queue: one row per job in sqlite; a job's files (params, result, log, workspace) under STATE/jobs/<id>."""
     COLS = ("id", "caller", "kind", "setup", "state", "created", "started", "finished", "summary", "error", "parent",
-            "progress", "seats")
+            "progress", "seats", "priority")
 
     def __init__(self, path):
         self.c = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.c.execute("pragma journal_mode=wal")
         self.c.execute(f"create table if not exists jobs ({', '.join(self.COLS)})")
+        have = {r[1] for r in self.c.execute("pragma table_info(jobs)")}
+        for col in self.COLS:   # columns added since the table was made (priority, 10-24)
+            if col not in have:
+                self.c.execute(f"alter table jobs add column {col}")
         self.lock = threading.Lock()
 
     def add(self, **kw):
         row = {k: kw.get(k) for k in self.COLS}
         with self.lock:
-            self.c.execute(f"insert into jobs values ({', '.join('?' * len(self.COLS))})", [row[k] for k in self.COLS])
+            self.c.execute(f"insert into jobs ({', '.join(self.COLS)}) values ({', '.join('?' * len(self.COLS))})",
+                           [row[k] for k in self.COLS])
         return row
 
     def set(self, jid, **kw):
@@ -341,8 +372,13 @@ class Service:
         self.switching = None       # the setup being loaded
         self.held = None            # why nothing loads until an admin resumes
         self.paused = False
-        self.draining = False       # the loaded setup takes no new work: another setup's work waited MAX_WAIT
+        self.draining = False       # the loaded setup takes no new work: another setup's work waited MAX_WAIT, or is high
+        self.drain_high = False     # ... and the drain is for high work (the loaded setup's own high work waits too)
         self.want = None            # an admin's load
+        self.door = {}              # chat requests through the door now running: {key: {"setup", "t", "high"}}
+        self.switch_t0 = None       # when the switch under way began
+        self.since = None           # when the switch to the loaded setup began: work it waited for is committed
+        self._typ = (0.0, dict(TYPICAL_S))
         self.gpu_busy = False       # the bench or the old production servers hold the 3090s
         self.inflight = {s: 0 for s in SETUPS}   # running jobs and open chat requests
         self.seats = {s: 0 for s in SETUPS}      # seats the running jobs take
@@ -375,18 +411,81 @@ class Service:
 
     # the scheduler
 
-    def admissible(self, setup):
-        return (self.loaded == setup and not self.switching and not self.draining and not self.paused
-                and not self.held)
+    def typical(self):
+        """{kind: seconds} a job of each kind is expected to run (TYPICAL_S until a kind has 5 done jobs)"""
+        now = time.time()
+        if now - self._typ[0] > 60:
+            out, done = dict(TYPICAL_S), self.jobs.find(states=("done",), limit=1000)
+            for k in TYPICAL_S:
+                ds = [j["finished"] - j["started"] for j in done if j["kind"] == k and j["started"] and j["finished"]][:20]
+                if len(ds) >= 5:
+                    out[k] = sorted(ds)[len(ds) // 2]
+            self._typ = (now, out)
+        return self._typ[1]
+
+    def switch_s(self, target):
+        ok = sorted(s["s"] for s in self.switches if s["ok"] and s["to"] == target)
+        return ok[len(ok) // 2] if ok else SWITCH_S[target]
+
+    def left(self, j, now):
+        """seconds a running job is expected to go on: from its own progress once it has some (k of N areas or
+        findings done in the time so far: a 5-area swarm is not a 100-area one), else its kind's typical length
+        less the time it has run"""
+        ran = now - (j["started"] or now)
+        m = re.match(r"(\d+)/(\d+) (areas|checked)", j["progress"] or "")
+        if m and int(m[1]) > 0:
+            return ran * (int(m[2]) - int(m[1])) / int(m[1])
+        return max(0.0, self.typical().get(j["kind"], 600) - ran)
+
+    def remaining(self, setup, now):
+        """[seconds] each piece of work running on setup (jobs, door chats) is expected to go on"""
+        out = [self.left(j, now) for j in self.jobs.find(states=("running",)) if j["setup"] == setup and j["started"]]
+        return out + [max(0.0, self.typical()["chat"] - (now - c["t"])) for c in self.door.values() if c["setup"] == setup]
+
+    def backfill(self, setup, est, now):
+        """during a drain, work of the loaded setup still starts when it should end before the longest running
+        piece: the switch waits for that one anyway, so the short work costs the waiting setup nothing"""
+        rem = self.remaining(setup, now)
+        return bool(rem) and est + BACKFILL_MARGIN <= max(rem)
+
+    def committed(self, created):
+        """work queued before the switch to the loaded setup began is what the switch was for: it starts even when
+        high work for another setup arrived meanwhile. Why (10-24): a high chat for main during a switch to swarm
+        would otherwise load swarm, start nothing and switch back, 5 minutes of switching for no work"""
+        return self.since is not None and created <= self.since
+
+    def admit(self, setup, high, since):
+        """a door chat for setup, waiting since then, may go now"""
+        if self.loaded != setup or self.switching or self.paused or self.held:
+            return False
+        return (not self.draining or (high and not self.drain_high) or self.committed(since)
+                or self.backfill(setup, self.typical()["chat"], time.time()))
+
+    def line(self, setup):
+        """setup's queued jobs in the order they start: high first, then by arrival"""
+        return sorted((j for j in self.jobs.find(states=("queued",), limit=1000) if j["setup"] == setup),
+                      key=lambda j: (-(j["priority"] or 0), j["created"]))
 
     def demand(self):
-        """{setup: when its oldest waiting work arrived}"""
+        """{setup: {"t": when its oldest waiting work arrived, "high": when its oldest high work did, or None}}"""
         d = {}
+
+        def add(s, t, high):
+            e = d.setdefault(s, {"t": t, "high": None})
+            e["t"] = min(e["t"], t)
+            if high:
+                e["high"] = t if e["high"] is None else min(e["high"], t)
+
         for j in self.jobs.find(states=("queued",), limit=1000):
-            d[j["setup"]] = min(d.get(j["setup"], j["created"]), j["created"])
+            add(j["setup"], j["created"], j["priority"])
         for w in self.waiting:
-            d[w["setup"]] = min(d.get(w["setup"], w["t"]), w["t"])
+            add(w["setup"], w["t"], w["high"])
         return d
+
+    @staticmethod
+    def next_setup(others):
+        """of the other setups with work waiting, the one to serve next: high work first, the oldest of it"""
+        return min(others, key=lambda s: (others[s]["high"] is None, others[s]["high"] or others[s]["t"]))
 
     def loop(self):
         while True:
@@ -414,12 +513,17 @@ class Service:
             if lost:
                 log(self.held); ping(f"local-compute: {self.held}. Resume: lc resume")
         with self.cv:
-            self.start_jobs()
             target = self.decide(now)
+            self.start_jobs()
+            self.cv.notify_all()   # door chats waiting re-check: a drain began or ended, backfill room shrank
         if target:
             self.switch(target)
 
     def decide(self, now):
+        """the setup to switch to now, or None. The loaded setup keeps taking its own work (batching: no switch
+        between two jobs for it) until another setup's work has waited MAX_WAIT or is high; then it drains: it starts
+        only its own high work (unless the drain is for older high work) and backfill, and the switch comes when
+        nothing of it runs. Running work is never stopped."""
         if self.held or self.paused or self.switching or self.gpu_busy:
             return None
         own, dem = self.loaded, self.demand()
@@ -427,24 +531,32 @@ class Service:
             self.want = None
         if self.want and (own is None or self.inflight[own] == 0):
             return self.want
-        others = {s: t for s, t in dem.items() if s != own}
-        if own is None:
-            return min(others, key=others.get) if others else (IDLE_SETUP or None)
-        if others:
-            oldest = min(others, key=others.get)
-            self.draining = now - others[oldest] > MAX_WAIT
-            if self.inflight[own] == 0 and (own not in dem or self.draining):
-                return oldest
+        others = {s: d for s, d in dem.items() if s != own}
+        if not others:
+            self.draining = self.drain_high = False
+            if own is None:
+                return IDLE_SETUP or None
+            if (IDLE_SETUP and own != IDLE_SETUP and self.inflight[own] == 0 and own not in dem
+                    and now - self.last_busy > IDLE_RETURN):
+                return IDLE_SETUP
             return None
-        self.draining = False
-        if (IDLE_SETUP and own != IDLE_SETUP and self.inflight[own] == 0 and own not in dem
-                and now - self.last_busy > IDLE_RETURN):
-            return IDLE_SETUP
+        tgt = self.next_setup(others)
+        if own is None:
+            return tgt
+        o, mine = others[tgt], dem.get(own)
+        mine_high = mine["high"] if mine else None
+        self.drain_high = o["high"] is not None and (mine_high is None or o["high"] < mine_high)
+        self.draining = self.drain_high or now - o["t"] > MAX_WAIT
+        keeps = mine is not None and (not self.draining or (mine_high is not None and not self.drain_high)
+                                      or self.committed(mine["t"]))
+        if self.inflight[own] == 0 and not keeps:
+            return tgt
         return None
 
     def switch(self, target):
         with self.cv:
             prev, self.switching, self.loaded, self.draining = self.loaded, target, None, False
+            self.drain_high, self.switch_t0 = False, time.time()
             self.cv.notify_all()
         log(f"switching {prev or 'nothing'} -> {target}")
         t0 = time.time()
@@ -458,7 +570,7 @@ class Service:
             self.switches = (self.switches + [{"at": round(t0), "from": prev, "to": target, "s": round(time.time() - t0),
                                                "ok": ok}])[-20:]
             if ok:
-                self.loaded, self.last_busy = target, time.time()
+                self.loaded, self.last_busy, self.since = target, time.time(), t0
             else:
                 self.held = f"{target} did not start: {why}"
             self.cv.notify_all()
@@ -468,37 +580,43 @@ class Service:
 
     def start_jobs(self):
         s = self.loaded
-        if not s or not self.admissible(s):
+        if not s or self.switching or self.paused or self.held:
             return
-        for j in sorted(self.jobs.find(states=("queued",), limit=1000), key=lambda j: j["created"]):
-            if j["setup"] != s:
-                continue
+        now, typ = time.time(), self.typical()
+        for j in self.line(s):
             need = j["seats"] or 1
             if self.seats[s] and self.seats[s] + need > SETUPS[s]["seats"]:
                 break   # in order: a large job is not passed by the small ones behind it
+            if self.draining and not ((j["priority"] and not self.drain_high) or self.committed(j["created"])
+                                      or self.backfill(s, typ.get(j["kind"], 600), now)):
+                continue   # another setup's turn; only work that ends before the running work goes now
             self.seats[s] += need; self.inflight[s] += 1; self.last_busy = time.time()
             self.jobs.set(j["id"], state="running", started=time.time())
             threading.Thread(target=self.run_job, args=(j, s, need), daemon=True).start()
 
     # chat requests (the OpenAI-compatible door)
 
-    def acquire(self, setup):
-        w = {"setup": setup, "t": time.time()}
+    def acquire(self, setup, high=False):
+        """wait until a door chat for setup may go; -> (the setup's URL, a key for release)"""
+        w = {"setup": setup, "t": time.time(), "high": high}
         with self.cv:
             self.waiting.append(w); self.cv.notify_all()
             try:
-                ok = self.cv.wait_for(lambda: self.admissible(setup) or self.held, REQUEST_WAIT)
+                ok = self.cv.wait_for(lambda: self.admit(setup, high, w["t"]) or self.held, REQUEST_WAIT)
                 if self.held:
                     raise JobError(self.held)
                 if not ok:
                     raise JobError(f"{setup} was not loaded within {REQUEST_WAIT} s")
                 self.inflight[setup] += 1; self.last_busy = time.time()
+                key = secrets.token_hex(8)
+                self.door[key] = {"setup": setup, "t": time.time(), "high": high}
             finally:
                 self.waiting.remove(w)
-        return self.url(setup)
+        return self.url(setup), key
 
-    def release(self, setup):
+    def release(self, setup, key):
         with self.cv:
+            self.door.pop(key, None)
             self.inflight[setup] -= 1; self.last_busy = time.time(); self.cv.notify_all()
 
     # jobs
@@ -511,6 +629,7 @@ class Service:
             raise PermissionError(f"this token may not start {kind} jobs")
         if len(self.jobs.find(caller=who["name"], states=("queued", "awaiting_approval"))) >= JOBS_PER_CALLER:
             raise JobError(f"{JOBS_PER_CALLER} of your jobs already wait")
+        priority = priority_of(who, spec.get("priority"))
         p, seats = {}, 1
         if kind == "chat":
             setup = spec.get("setup") or "main"
@@ -542,7 +661,7 @@ class Service:
         json.dump(p, open(os.path.join(jdir(jid), "params.json"), "w"))
         held = kind in who.get("approve", [])
         row = self.jobs.add(id=jid, caller=who["name"], kind=kind, setup=setup, created=time.time(), summary=summary,
-                            state="awaiting_approval" if held else "queued", seats=seats)
+                            state="awaiting_approval" if held else "queued", seats=seats, priority=priority)
         if held:
             ping(f"local-compute: {who['name']} asks for a {kind} job ({summary[:200]}). Approve: lc approve {jid}  "
                  f"Refuse: lc cancel {jid}")
@@ -654,7 +773,8 @@ class Service:
             os.makedirs(jdir(vid))
             json.dump({"parent": jid}, open(os.path.join(jdir(vid), "params.json"), "w"))
             self.jobs.add(id=vid, caller=j["caller"], kind="verify", setup="main", created=time.time(), state="queued",
-                          summary=f"verify {len(result['findings'])} findings of {jid}", parent=jid, seats=1)
+                          summary=f"verify {len(result['findings'])} findings of {jid}", parent=jid, seats=1,
+                          priority=j["priority"] or 0)   # a high swarm's check is high too
             self.progress(jid, f"swarm done; main checks {len(result['findings'])} findings (job {vid})")
             return "waiting"
         shutil.rmtree(tgt, ignore_errors=True)
@@ -859,21 +979,97 @@ class Service:
                 log("prune: " + traceback.format_exc())
             time.sleep(3600)
 
+    def plan(self, now):
+        """{job id: {"position", "starts_in_s"} or {"ends_in_s"}}: the scheduler's rules played forward from the
+        expected lengths and switch times. Each setup in turn (the loaded one first, then high work, then the oldest),
+        its queued jobs in line order on its seats; a draining setup's normal work after the others. An estimate:
+        backfill can start work sooner, and a job's real length varies. Empty while paused, held or under the bench."""
+        if self.paused or self.held or self.gpu_busy:
+            return {}
+        typ, out = self.typical(), {}
+        est = lambda j: typ.get(j["kind"], 600)
+        lines = {s: self.line(s) for s in SETUPS}
+        for s in SETUPS:
+            for i, j in enumerate(lines[s]):
+                out[j["id"]] = {"position": i + 1}
+        cur, t = self.switching or self.loaded, now
+        if self.switching:
+            t += max(0.0, self.switch_s(cur) - (now - (self.switch_t0 or now)))
+        busy = []   # (free at, seats) of the work running on cur
+        for j in self.jobs.find(states=("running",)):
+            left = self.left(j, now)
+            out[j["id"]] = {"ends_in_s": round(left)}
+            if j["setup"] == cur:
+                busy.append((now + left, j["seats"] or 1))
+        door_end = max([now] + [now + r for r in (self.remaining(cur, now) if cur else [])])
+
+        def phase(s, jobs, t0, busy):
+            cap = SETUPS[s]["seats"]
+            slots = sorted([t0] * max(0, cap - sum(n for _, n in busy)) + [max(t0, f) for f, n in busy for _ in range(n)])
+            end, last = max([t0] + [f for f, _ in busy]), t0
+            for j in jobs:
+                need = min(j["seats"] or 1, cap)
+                start = max(slots[need - 1], last)   # in line order
+                slots = sorted(slots[need:] + [start + est(j)] * need)
+                out[j["id"]]["starts_in_s"] = round(start - now)
+                last, end = start, max(end, start + est(j))
+            return end
+
+        dem = self.demand()
+        later = []
+        if cur:
+            mine = lines[cur]
+            if self.draining:   # only its high work goes before the others (unless the drain is for high work)
+                later = [j for j in mine if (self.drain_high or not j["priority"]) and not self.committed(j["created"])]
+                mine = [j for j in mine if j not in later]
+            t = max(phase(cur, mine, t, busy), door_end)
+        others = {s: d for s, d in dem.items() if s != cur}
+        while others:
+            s = self.next_setup(others)
+            t = phase(s, lines[s], t + self.switch_s(s), [])
+            del others[s]
+            cur = s
+        if later:
+            phase(later[0]["setup"], later, t + self.switch_s(later[0]["setup"]), [])
+        return out
+
+    def where(self, jid):
+        """a job's place in the plan, for its own view"""
+        with self.cv:
+            return self.plan(time.time()).get(jid, {})
+
     def status(self, who):
+        """what the service does now: the dashboard's and callers' view. Other callers' jobs show without id,
+        summary or caller unless the token is an admin's"""
+        now = time.time()
         with self.cv:
             st = {"loaded": self.loaded, "switching": self.switching, "held": self.held, "paused": self.paused,
-                  "draining": self.draining, "gpu_busy_with_bench": self.gpu_busy, "inflight": dict(self.inflight),
-                  "chat_waiting": len(self.waiting), "switches": self.switches[-5:]}
-        q = self.jobs.find(states=("queued", "awaiting_approval", "running", "waiting"))
-        st["queue"] = [{"kind": j["kind"], "setup": j["setup"], "state": j["state"], "age_s": round(time.time() - j["created"]),
-                        **({"id": j["id"], "progress": j["progress"]} if j["caller"] == who["name"] or who.get("admin")
-                           else {})} for j in sorted(q, key=lambda j: j["created"])]
+                  "draining": self.draining, "draining_for_high": self.drain_high, "gpu_busy_with_bench": self.gpu_busy,
+                  "inflight": dict(self.inflight), "chat_running": len(self.door), "chat_waiting": len(self.waiting),
+                  "switches": self.switches[-5:], "typical_s": {k: round(v) for k, v in self.typical().items()},
+                  "switch_s": {s: round(self.switch_s(s)) for s in SETUPS}}
+            plan = self.plan(now)
+        rows = []
+        for j in self.jobs.find(states=("queued", "awaiting_approval", "running", "waiting")):
+            r = {"kind": j["kind"], "setup": j["setup"], "state": j["state"],
+                 "priority": "high" if j["priority"] else "normal", "age_s": round(now - j["created"]), **plan.get(j["id"], {})}
+            if j["caller"] == who["name"] or who.get("admin"):
+                r.update(id=j["id"], summary=j["summary"], progress=j["progress"], yours=j["caller"] == who["name"])
+                if who.get("admin"):
+                    r["caller"] = j["caller"]
+            rows.append(r)
+        order = {"running": 0, "waiting": 1, "queued": 2, "awaiting_approval": 3}
+        st["queue"] = sorted(rows, key=lambda r: (order[r["state"]], r.get("ends_in_s", 0),
+                                                  r.get("starts_in_s", float("inf")), -r["age_s"]))
         return st
 
 
 def job_view(j, with_result=False):
     v = {k: j[k] for k in ("id", "kind", "setup", "state", "created", "started", "finished", "summary", "error",
                            "progress", "parent")}
+    v["priority"] = "high" if j.get("priority") else "normal"
+    if SVC and j["state"] in ("queued", "running"):   # its place in line and expected start, or expected end
+        v.update(SVC.where(j["id"]))
     if with_result and j["state"] in TERMINAL:
         try:
             v["result"] = json.load(open(os.path.join(jdir(j["id"]), "result.json")))
@@ -1015,9 +1211,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(403, {"error": "this token may not chat"})
         req = json.loads(self.body(BODY_MAX))
         setup = req.get("model") if req.get("model") in SETUPS else "main"
+        # ours as a header or a string field (taken out: vLLM's own "priority" is a number for its own scheduler)
+        field = req.pop("priority") if isinstance(req.get("priority"), str) else None
+        high = priority_of(who, self.headers.get("X-Priority") or field)
         t0 = time.time()
         try:
-            url = SVC.acquire(setup)
+            url, key = SVC.acquire(setup, bool(high))
         except JobError as e:
             return self.reply(503, {"error": str(e)})
         usage, code = {}, 200
@@ -1053,9 +1252,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             code = 499
         finally:
-            SVC.release(setup)
+            SVC.release(setup, key)
             with open(os.path.join(STATE, "requests.log"), "a") as f:   # no content: who, where, how much, how long
-                f.write(json.dumps({"t": round(t0), "caller": who["name"], "setup": setup, "code": code,
+                f.write(json.dumps({"t": round(t0), "caller": who["name"], "setup": setup, "code": code, "high": bool(high),
                                     "s": round(time.time() - t0, 1), "prompt_tokens": usage.get("prompt_tokens"),
                                     "completion_tokens": usage.get("completion_tokens")}) + "\n")
 
@@ -1077,11 +1276,13 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve")
     t = sub.add_parser("token")
-    t.add_argument("action", choices=["add", "list", "remove"])
+    t.add_argument("action", choices=["add", "list", "remove", "set"])
     t.add_argument("name", nargs="?")
     t.add_argument("--admin", action="store_true")
     t.add_argument("--approve", default="", help="kinds held for an admin's approval, e.g. swarm,implement")
     t.add_argument("--scopes", default="chat,swarm,implement")
+    t.add_argument("--high", action="store_true", help="may mark work high priority")
+    t.add_argument("--no-high", action="store_true", help="with set: may no longer")
     a = ap.parse_args()
     if a.cmd == "serve":
         return serve()
@@ -1089,15 +1290,21 @@ def main():
     if a.action == "list":
         for x in toks:
             print(f"{x['name']:12s} scopes {','.join(x['scopes'])}" + (" admin" if x.get("admin") else "")
-                  + (f" approve {','.join(x['approve'])}" if x.get("approve") else ""))
+                  + (" high" if x.get("high") else "") + (f" approve {','.join(x['approve'])}" if x.get("approve") else ""))
         return
     if not a.name:
         sys.exit("a token name is needed")
+    if a.action == "set":   # change a token's high flag, keeping its secret
+        x = next((x for x in toks if x["name"] == a.name), None)
+        if not x or a.high == a.no_high:
+            sys.exit("set needs an existing token and one of --high, --no-high")
+        x["high"] = a.high
+        return save_tokens(toks)
     toks = [x for x in toks if x["name"] != a.name]
     if a.action == "add":
         raw = "lc_" + secrets.token_urlsafe(32)
         toks.append({"name": a.name, "sha256": token_hash(raw), "scopes": [s for s in a.scopes.split(",") if s],
-                     "approve": [s for s in a.approve.split(",") if s], "admin": a.admin})
+                     "approve": [s for s in a.approve.split(",") if s], "admin": a.admin, "high": a.high})
         print(raw)
     save_tokens(toks)
 

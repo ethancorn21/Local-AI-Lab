@@ -399,9 +399,21 @@ def grade(a):
     json.dump(out, open(a.run[:-5] + ".grade.json", "w"), indent=1)
 
 
-VERIFY = ("A scout reviewing this Python code for bugs reported the finding below. Decide whether it is a real bug: code "
-          "that does the wrong thing when it runs. Style, naming, missing features, missing error handling and guesses "
-          "about intent are not bugs.\n\n{path}, lines {x}-{y}, the reported line marked >>:\n\n{code}\n\n"
+# Why this wording (10-24, docs/serving-bench.md, Swarm): the first prompt said "guesses about intent are not bugs" to
+# cut noise, and the 27B dismissed logic bugs as guesses: it kept 31 of the 57 planted bugs scouts named and 2 of 11
+# hand-checked real ones. This one judges a line against its own code's evidence (names, messages, the lines beside
+# it), the report's claim rather than the line (a test report of "test" was called a bug for another problem), and
+# drops what no realistic input tells apart: 45 of 57, 6 of 11, and 6 real among 17 kept from a random 500 others
+# (the first: 1 among 5). Showing the lines a report cites changed nothing measured.
+VERIFY = ("A scout reviewing this Python code for bugs reported the finding below. Decide whether the report is right: "
+          "the code has the defect the report describes. A different problem than the one reported does not count.\n\n"
+          "Judge the code against what the code itself says it should do: its names, comments, docstrings, messages, "
+          "and the nearby code that does the same job. A line that contradicts that evidence is a bug even when nothing "
+          "crashes; when a line and its evidence disagree, the line is usually the mistake. If the report finds a real "
+          "defect but gets its consequence wrong, it is still a bug.\nIt is not a bug when the report misreads the code "
+          "(what it describes does not happen), when no realistic input would make the code behave differently, or when "
+          "it is only about style, naming, missing features or missing error handling.\n\n"
+          "{path}, lines {x}-{y}, the reported line marked >>:\n\n{code}\n\n"
           "The report, at line {line}: {finding}\n\nAnswer with BUG or NOT A BUG on the first line, then one sentence why.")
 
 

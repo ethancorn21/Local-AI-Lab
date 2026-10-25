@@ -38,10 +38,11 @@ ancient-works matchers that own it; the bench measured a 4B swarm on it beside m
 | Tool | Does |
 |---|---|
 | `ask` | one question to main or big, with local files inlined; waits for the answer (up to 5 minutes, then a job id) |
+| (each of ask, swarm, implement) | `priority: high` when the owner is waiting on it: next after what runs now |
 | `swarm` | packs a folder (git-tracked files), sends it, starts a swarm job: a bug hunt, or a brief of what to look for; `verify` adds main's check |
 | `implement` | packs a folder, sends a spec and a test command; the implementation agent edits a sandboxed copy until the tests pass |
 | `job` | a job's state and result: an answer, findings (saved in full to `~/.cache/localcompute/`), or a patch file with the command that applies it |
-| `status`, `cancel` | what is loaded and waiting; cancel a job |
+| `status`, `cancel` | what is loaded, what runs and waits with expected starts; cancel a job |
 
 The tool descriptions carry the measured numbers, so Claude can judge when a hand-off pays. The local models are
 weaker than Claude: a patch is a proposal Claude reviews, swarm findings are leads.
@@ -52,13 +53,14 @@ weaker than Claude: a patch is a proposal Claude reviews, swarm findings are lea
 - base URL `http://<the box's tailnet name>:8080/v1`, header `Authorization: Bearer <GrokBot's token>`
 - `model`: `main` (default; any unknown name means main), `swarm` or `big`
 - `POST /v1/chat/completions` (streaming works), `GET /v1/models`
+- normal priority only: its token is not marked high
 
 Its swarm and implement jobs (the `/jobs` API below) wait for the owner's approval, the owner's rule of
 2026-10-17: the owner's phone gets the request with its id, and `lc approve <id>` or `lc cancel <id>` answers it.
 Its chats need no approval.
 
 **The owner and scripts**: the `lc` CLI (`server/localcompute/lc`, linked into the PATH on the Mac and the box):
-`lc status`, `lc jobs`, `lc job <id>`, `lc ask "..." [--setup big] [--file F]`, `lc cancel <id>`, and with the admin
+`lc status`, `lc queue`, `lc jobs`, `lc job <id>`, `lc ask "..." [--setup big] [--file F] [--high]`, `lc cancel <id>`, and with the admin
 token `lc approve <id>`, `lc pause [--stop]`, `lc resume`, `lc load <setup>`. The address and tokens live in
 `~/.config/localcompute/` (`url`, `token`, `admin-token`), or `LC_URL`, `LC_TOKEN`, `LC_ADMIN_TOKEN`.
 
@@ -68,12 +70,12 @@ Every request but `/health` carries a bearer token.
 
 | Request | Does |
 |---|---|
-| `POST /v1/chat/completions`, `GET /v1/models` | OpenAI-compatible; waits (up to 30 min) for its setup to be loaded |
+| `POST /v1/chat/completions`, `GET /v1/models` | OpenAI-compatible; waits (up to 30 min) for its setup to be loaded; `X-Priority: high` (or `"priority": "high"`) for a token marked high |
 | `POST /uploads` | body: a `.tar.gz` (at most 64 MB, 512 MB unpacked) of the files a job works on → `{"upload": id}`; only its uploader can use it |
-| `POST /jobs` | `{"kind": "chat", "setup", "messages", "thinking", "max_tokens"}`, `{"kind": "swarm", "upload", "brief", "glob", "areas", "verify"}` or `{"kind": "implement", "upload", "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout"}` |
-| `GET /jobs`, `GET /jobs/<id>[?wait=N]` | the caller's own jobs; `wait` holds the request up to N s (at most 600) for the job's end |
+| `POST /jobs` | `{"kind": "chat", "setup", "messages", "thinking", "max_tokens"}`, `{"kind": "swarm", "upload", "brief", "glob", "areas", "verify"}` or `{"kind": "implement", "upload", "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout"}`, each with `"priority": "high"` or `"normal"` (default) |
+| `GET /jobs`, `GET /jobs/<id>[?wait=N]` | the caller's own jobs (a queued one with its `position` and `starts_in_s`, a running one with `ends_in_s`); `wait` holds the request up to N s (at most 600) for the job's end |
 | `POST /jobs/<id>/cancel`, `POST /jobs/<id>/approve` | approve: admin only |
-| `GET /status` | loaded setup, switches, queue (other callers' jobs without ids or content) |
+| `GET /status` | loaded setup, drain, switches, expected lengths, and the queue in expected order with expected starts and ends (other callers' jobs without ids or content) |
 | `POST /admin/pause` (`{"stop": true}` frees the GPUs), `/admin/resume`, `/admin/load` | admin only |
 
 ## Jobs
@@ -86,8 +88,10 @@ Every request but `/health` carries a bearer token.
   fewer finds. No thinking (it found no more for three times the noise), whole context (rolling context lost on every
   model). Reports within 3 lines of each other are one finding; the result lists the most-reported first.
 - **verify** (a swarm job's `verify`): after the swarm, a child job on main checks each finding against the 50 lines
-  around it, thinking on, and the swarm job ends with a verdict on each. It costs a switch and some minutes; the
-  bench's measure of what it keeps is in [serving-bench.md](serving-bench.md).
+  around it, thinking on, and the swarm job ends with a verdict on each, confirmed findings first. Nothing is dropped:
+  in the bench the check confirmed 45 of the 57 real planted bugs it was shown, and about a third of what it confirmed
+  among other reports was real, so the verdict ranks, it does not prove ([serving-bench.md](serving-bench.md), Swarm).
+  It costs a switch and some minutes.
 - **implement**: the implementation agent, the local model as a tight implementation agent working from a spec,
   checked by tests it may not edit. Tools: list, read, search, write a file, edit a file (exact text, once),
   `run_tests`, finish. `finish` is refused until the tests have passed since the last change. Test files are
@@ -106,12 +110,30 @@ system Python 3.14 and pytest are there; project packages are not.
 ## Scheduling
 
 One setup is loaded at a time. Each job kind has its setup (implement and verify: main; swarm: swarm; chat: the one
-named). A setup runs its own queue in order, main up to 8 seats (an implement job takes one per attempt), swarm and
-big one job at a time. When work for another setup waits:
+named). A setup runs its own queue in order, high priority first, main up to 8 seats (an implement job takes one per
+attempt), swarm and big one job at a time. Running work is never stopped. When work for another setup waits:
 
 - if the loaded setup has nothing queued, the service switches as soon as what runs has finished;
-- if the loaded setup keeps getting work, after 10 minutes (`LC_MAX_WAIT`) it stops taking new work, finishes what
-  runs, and the service switches. So no caller waits behind another for long, and a switch is not paid for every job.
+- if the loaded setup keeps getting work, it keeps taking it (work for one setup is batched, no switch between two
+  of its jobs) until the other work has waited 10 minutes (`LC_MAX_WAIT`); then it **drains**: it takes no new work,
+  finishes what runs, and the service switches. So no caller waits behind another for long, and a switch is not paid
+  for every job.
+- **High priority** (`"priority": "high"` on a job, `X-Priority: high` or `"priority": "high"` on a door chat): high
+  work for another setup starts the drain at once instead of after 10 minutes, so it runs next, after what is running
+  now. Between setups, high work goes first, the oldest of it; the loaded setup's own high work still starts during a
+  drain for someone's normal work. Tokens marked high (Claude's) and admins may send it; GrokBot's is not marked, or
+  everything it sends would be high (`lcd.py token set <name> --high|--no-high` changes that, the secret kept).
+- **Backfill.** During a drain, work for the loaded setup still starts if it is expected to end before the longest
+  running job (with 30 s to spare): the switch waits for that job anyway, so the short work costs the waiting setup
+  nothing. A quick question to main while a long implement job holds it for a switch is answered at once.
+
+How long work takes comes from the service's own history: a job kind's median over its last 20 done jobs once it has
+5, until then the bench's numbers (chat 90 s, implement 15 min, a 100-area swarm 30 min, a check 10 min); switch
+times are the median of the last switches to that setup. `GET /status` plays the rules forward from those numbers:
+every job running (expected end) and queued (place in its setup's line, expected start), in expected order, with
+the loaded setup, any drain and the last switches. It is the feed for a live view of the lab's work; other callers'
+jobs appear there without id, summary or caller unless the token is an admin's. `lc queue` prints it as a table.
+The expected starts are estimates: backfill can start work sooner, and real lengths vary.
 
 Idle on swarm or big for 15 minutes (`LC_IDLE_RETURN`), the service goes back to main, so a chat finds main loaded.
 
@@ -153,12 +175,15 @@ lcd adopts it.
 ## Tests
 
 `analysis/tests/test_localcompute.py` runs lcd end to end with a stub `lc-setup` that starts stub OpenAI servers
-answering with scripted tool calls: no model, no GPU, about a minute (needs bubblewrap, so it runs on the box). 41
+answering with scripted tool calls: no model, no GPU, about two minutes (needs bubblewrap, so it runs on the box). 62
 checks: tokens, the hold while the bench runs, the idle setup, the OpenAI door plain and streamed, a switch to big
 and back, chat jobs, a swarm with main's check (main → swarm → main), globs, the implementation agent (a protected
 test file refused, finish refused before the tests pass, the patch applying with `patch -p1`), the sandbox (no
 `/home`, no `/opt`, no network), GrokBot's approval and the owner's ping, job and upload privacy, cancel, a setup
-that stops on its own (held, 503, resume), and the MCP server over stdio. Run it with `LC_SANDBOX_SCOPE=1` to use the
+that stops on its own (held, 503, resume), priority (who may send it, the door's header and field, `token set`),
+batching, a drain at once for high work, backfill of a short job and a door chat but not of a long job, a setup's
+line with high work first, the plan's order and its run in that order (main → big → swarm → main), the queue's view
+per caller, and the MCP server over stdio. Run it with `LC_SANDBOX_SCOPE=1` to use the
 systemd scope as the service does.
 
 ## Not done, on purpose

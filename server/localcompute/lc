@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """lc: the local-compute service from a terminal (lc_client.py says where it is and which token).
 
-  lc status                     what is loaded, what waits
+  lc status                     what is loaded, what runs and waits (JSON)
+  lc queue                      the same as a table: running, then queued in expected order with expected starts
   lc jobs [--all]               your jobs (--all: everyone's, admin)
   lc job <id> [--wait N]        one job, with its result once done
-  lc ask "<prompt>" [--setup main|big] [--file F]...   a quick question
+  lc ask "<prompt>" [--setup main|big] [--file F]... [--high]   a quick question (--high: next in line)
   lc cancel <id>
   admin (~/.config/localcompute/admin-token):
   lc approve <id>               start a job held for approval (GrokBot's swarm and implement jobs)
@@ -22,10 +23,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("queue")
     p = sub.add_parser("jobs"); p.add_argument("--all", action="store_true")
     p = sub.add_parser("job"); p.add_argument("id"); p.add_argument("--wait", type=int, default=0)
     p = sub.add_parser("ask"); p.add_argument("prompt"); p.add_argument("--setup", default="main")
     p.add_argument("--file", action="append", default=[]); p.add_argument("--no-thinking", action="store_true")
+    p.add_argument("--high", action="store_true")
     p = sub.add_parser("cancel"); p.add_argument("id")
     p = sub.add_parser("approve"); p.add_argument("id")
     p = sub.add_parser("pause"); p.add_argument("--stop", action="store_true")
@@ -37,14 +40,28 @@ def main():
     try:
         if a.cmd == "status":
             print(json.dumps(c.call("GET", "/status"), indent=1))
+        elif a.cmd == "queue":
+            st = c.call("GET", "/status")
+            now = f"switching to {st['switching']}" if st["switching"] else f"{st['loaded'] or 'nothing'} loaded"
+            flags = [f for f, on in (("paused", st["paused"]), (f"held: {st['held']}", st["held"]),
+                                     ("draining for high work" if st["draining_for_high"] else "draining", st["draining"]),
+                                     ("the bench holds the GPUs", st["gpu_busy_with_bench"])) if on]
+            print(", ".join([now] + flags) + f"; door chats {st['chat_running']} running, {st['chat_waiting']} waiting")
+            for r in st["queue"]:
+                when = (f"ends in ~{lc.mins(r['ends_in_s'])}" if "ends_in_s" in r else
+                        f"#{r['position']} starts in ~{lc.mins(r['starts_in_s'])}" if r.get("starts_in_s") is not None else "")
+                who = r.get("caller") or ("you" if r.get("yours") else "")
+                print(f"  {r['state']:17s} {r['setup']:5s} {r['kind']:9s} {'HIGH' if r['priority'] == 'high' else '    '} "
+                      f"{when:24s} {who:8s} {r.get('id', ''):12s} {(r.get('summary') or '')[:60]}")
         elif a.cmd == "jobs":
             for j in c.call("GET", "/jobs" + ("?all=1" if a.all else ""))["jobs"]:
-                print(f"{j['id']}  {j['kind']:9s} {j['state']:17s} {j['summary'] or ''}"[:160])
+                print(f"{j['id']}  {j['kind']:9s} {j['state']:17s} {j['summary'] or ''}"[:160] + lc.place(j))
         elif a.cmd == "job":
             print(lc.describe(c.wait(a.id, a.wait), lc.recall(a.id).get("folder")))
         elif a.cmd == "ask":
             parts = [f"=== {f} ===\n{open(f, encoding='utf-8', errors='replace').read()}" for f in a.file]
             j = c.call("POST", "/jobs", {"kind": "chat", "setup": a.setup, "thinking": not a.no_thinking,
+                                         "priority": "high" if a.high else "normal",
                                          "messages": [{"role": "user", "content": "\n\n".join(parts + [a.prompt])}]})
             print(lc.describe(c.wait(j["id"], 3600)))
         elif a.cmd == "cancel":

@@ -125,9 +125,25 @@ def apply_command(folder, patch_file):
         return f"patch -p1 -d {folder} < {patch_file}"
 
 
+def mins(s):
+    return f"{max(1, round(s / 60))} min" if s < 5400 else f"{s / 3600:.1f} h"
+
+
+def place(j):
+    """", 2nd in main's line, expected to start in about 4 min" for a queued job (the service's estimate); "" else"""
+    if j.get("state") == "running" and j.get("ends_in_s") is not None:
+        return f", expected to end in about {mins(j['ends_in_s'])}"
+    if j.get("state") != "queued" or j.get("position") is None:
+        return ""
+    n, s = j["position"], j.get("starts_in_s")
+    nth = f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+    when = "" if s is None else ", starting now" if s < 30 else f", expected to start in about {mins(s)}"
+    return f", {nth} in {j['setup']}'s line{when}" + (" (high priority)" if j.get("priority") == "high" else "")
+
+
 def describe(j, folder=None):
     """a job as text for a person or a model: state, and its result once done (long parts saved to files)"""
-    lines = [f"job {j['id']} ({j['kind']} on {j['setup']}): {j['state']}"]
+    lines = [f"job {j['id']} ({j['kind']} on {j['setup']}): {j['state']}{place(j)}"]
     if j.get("progress"):
         lines.append(f"progress: {j['progress']}")
     if j.get("error"):

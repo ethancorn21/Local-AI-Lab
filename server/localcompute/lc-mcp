@@ -18,6 +18,9 @@ INSTRUCTIONS = (
     "context on (ask with files). Jobs queue; the box switches models as needed (1-3.5 min a switch). Check the "
     "results: the local models are weaker than you, a patch is a proposal, swarm findings are leads.")
 
+PRIORITY = ("high: goes next, after the work running now (a model switch included), ahead of normal work; for "
+            "work the owner is waiting on. normal work waits its turn; work for another model waits at most 10 min.")
+
 TOOLS = [
     {"name": "ask", "description": (
         "Ask a local model a question, with local files inlined if given (they are read on this machine and sent "
@@ -32,19 +35,24 @@ TOOLS = [
          "setup": {"type": "string", "enum": ["main", "big"], "default": "main"},
          "thinking": {"type": "boolean", "default": True},
          "max_tokens": {"type": "integer", "default": 8192, "description": "for the answer, after thinking"},
+         "priority": {"type": "string", "enum": ["normal", "high"], "default": "normal", "description": PRIORITY},
          "wait_seconds": {"type": "integer", "default": 300}}, "required": ["prompt"]}},
     {"name": "swarm", "description": (
         "Point a swarm of local scouts (Qwen3.6-35B-A3B, one per ~440-line area, as many at once as the GPUs hold) "
         "at a folder: a bug hunt by default, or a brief saying what to look for. Measured on a 44k-line codebase "
         "with 60 planted bugs: about 42 found in 30 minutes, with about as many other reports, a third of those real "
-        "bugs. Smaller folders take minutes. verify: the 27B then checks each finding against its code (drops "
-        "noise, adds a switch and some minutes). Returns a job id; get results with the job tool."),
+        "bugs. Smaller folders take minutes. verify: the 27B then checks each finding against its code and labels it "
+        "(confirmed first; in the bench it confirmed 45 of 57 real planted bugs, and about a third of what it confirmed "
+        "among other reports was real): a ranking, not proof; it adds a switch and some minutes. Returns a job id; get "
+        "results with the job tool."),
      "inputSchema": {"type": "object", "properties": {
          "path": {"type": "string", "description": "a folder on this machine (git-tracked files, or all but build/cache folders)"},
          "brief": {"type": "string", "description": "what to look for; leave out for a bug hunt"},
          "glob": {"type": "string", "default": "*.py", "description": "file name patterns, comma separated, e.g. *.py,*.ts"},
          "areas": {"type": "integer", "description": "how many areas (default: one per ~440 lines, at most 100)"},
-         "verify": {"type": "boolean", "default": False}}, "required": ["path"]}},
+         "verify": {"type": "boolean", "default": False},
+         "priority": {"type": "string", "enum": ["normal", "high"], "default": "normal", "description": PRIORITY}},
+     "required": ["path"]}},
     {"name": "implement", "description": (
         "Hand a well-specified change to the local implementation agent (Qwen3.8-27B, thinking on): it edits a "
         "sandboxed copy of the folder until test_command passes, then returns a patch for you to review and apply. "
@@ -59,11 +67,14 @@ TOOLS = [
          "protect": {"type": "array", "items": {"type": "string"}},
          "attempts": {"type": "integer", "default": 1, "minimum": 1, "maximum": 4},
          "max_turns": {"type": "integer", "default": 60},
-         "test_timeout": {"type": "integer", "default": 600}}, "required": ["path", "spec", "test_command"]}},
+         "test_timeout": {"type": "integer", "default": 600},
+         "priority": {"type": "string", "enum": ["normal", "high"], "default": "normal", "description": PRIORITY}},
+     "required": ["path", "spec", "test_command"]}},
     {"name": "job", "description": "A local-compute job's state and, once done, its result (waits up to wait_seconds).",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"},
                                                        "wait_seconds": {"type": "integer", "default": 60}}, "required": ["id"]}},
-    {"name": "status", "description": "What the AI box has loaded, what waits, and your recent jobs.",
+    {"name": "status", "description": ("What the AI box has loaded, what runs and waits (each job's place in line and "
+                                       "expected start), and your recent jobs."),
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "cancel", "description": "Cancel one of your local-compute jobs.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
@@ -90,18 +101,20 @@ def call(name, a):
         content = ("\n\n".join(parts) + "\n\n" if parts else "") + a["prompt"]
         j = c.call("POST", "/jobs", {"kind": "chat", "setup": a.get("setup", "main"),
                                      "messages": [{"role": "user", "content": content}],
-                                     "thinking": a.get("thinking", True), "max_tokens": a.get("max_tokens", 8192)})
+                                     "thinking": a.get("thinking", True), "max_tokens": a.get("max_tokens", 8192),
+                                     "priority": a.get("priority", "normal")})
         j = c.wait(j["id"], a.get("wait_seconds", 300))
         if j["state"] != "done":
             return lc.describe(j) + "\n(still going: ask the job tool later)" * (j["state"] not in ("failed", "cancelled"))
         return lc.describe(j)
     if name == "swarm":
-        j, note = submit_folder(c, a["path"], {"kind": "swarm", **{k: a[k] for k in ("brief", "glob", "areas", "verify") if k in a}})
-        return f"swarm job {j['id']} {j['state']}: {note}. Results with the job tool (a 44k-line folder takes ~30 min)."
+        j, note = submit_folder(c, a["path"], {"kind": "swarm", **{k: a[k] for k in ("brief", "glob", "areas", "verify", "priority") if k in a}})
+        return (f"swarm job {j['id']} {j['state']}{lc.place(j)}: {note}. Results with the job tool (a 44k-line folder "
+                "takes ~30 min).")
     if name == "implement":
         j, note = submit_folder(c, a["path"], {"kind": "implement", **{k: a[k] for k in (
-            "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout") if k in a}})
-        return f"implement job {j['id']} {j['state']}: {note}. The patch comes with the job tool."
+            "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout", "priority") if k in a}})
+        return f"implement job {j['id']} {j['state']}{lc.place(j)}: {note}. The patch comes with the job tool."
     if name == "job":
         j = c.wait(a["id"], a.get("wait_seconds", 60))
         return lc.describe(j, lc.recall(a["id"]).get("folder"))

@@ -4,7 +4,8 @@ OpenAI servers (one per setup) answering with scripted tool calls. Checked: toke
 runs, the idle setup, the OpenAI door (plain and streamed) and its switch to another setup and back, chat jobs, a
 swarm job with the 27B's check, the implementation agent (a protected test file, finish refused before the tests
 pass, the patch), the sandbox (no /home, no /opt, no network), GrokBot's approval rule and the owner's ping, job
-privacy, cancel, a setup that stops on its own (held until resume), and the MCP server over stdio.
+privacy, cancel, a setup that stops on its own (held until resume), priority, batching and backfill with the queue's
+expected order, a switch's own job going first when high work arrives during it, and the MCP server over stdio.
 
 Needs bwrap (the AI box has it). usage: python3 analysis/tests/test_localcompute.py [path/to/server/localcompute]
 """
@@ -34,10 +35,14 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         b = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         assert b["model"] == SETUP, (b["model"], SETUP)
+        if isinstance(b.get("priority"), str):   # lcd takes its own field out before the server sees it
+            return self.send(400, b'{"error": "priority"}')
         ms = b["messages"]; turn = 1 + sum(m["role"] == "assistant" for m in ms)
         text = "\n".join(str(m.get("content") or "") for m in ms)
         if b.get("tools") and "implementation agent" in ms[0]["content"]:
-            if "SANDBOXCHECK" in text:
+            if "SANDBOXCHECK" in text or "SLOWIMPL" in text:
+                if "SLOWIMPL" in text and turn == 1:
+                    time.sleep(12)
                 msg = calls(("run_tests", {})) if turn == 1 else calls(("finish", {"summary": "checked"}))
             elif turn == 1:
                 msg = calls(("read_file", {"path": "calc.py"}))
@@ -71,7 +76,8 @@ http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
 SETUP_SH = r'''#!/usr/bin/env bash
 D=$(dirname "$0")
 case $1 in
-  start) "$0" stop; python3 "$D/stub.py" "$2" "$3" >/dev/null 2>&1 & echo "$! $2" > "$D/running"
+  start) "$0" stop; [ -f "$D/slow-start" ] && sleep 4
+         python3 "$D/stub.py" "$2" "$3" >/dev/null 2>&1 & echo "$! $2" > "$D/running"
          for _ in $(seq 50); do curl -sf "http://127.0.0.1:$3/health" >/dev/null && exit 0; sleep 0.1; done; exit 1 ;;
   stop) [ -f "$D/running" ] && kill "$(cut -d' ' -f1 "$D/running")" 2>/dev/null; rm -f "$D/running"; exit 0 ;;
   running) [ -f "$D/running" ] && kill -0 "$(cut -d' ' -f1 "$D/running")" 2>/dev/null && cut -d' ' -f2 "$D/running"; exit 0 ;;
@@ -112,18 +118,18 @@ def main():
         ports = {s: free_port() for s in ("main", "swarm", "big")}
         env = {**os.environ, "LC_STATE": os.path.join(d, "state"), "LC_TOKENS": os.path.join(d, "tokens.json"),
                "LC_SETUP": setup, "LC_PORTS": str(port), "LC_SETUP_PORTS": ",".join(f"{k}={v}" for k, v in ports.items()),
-               "LC_CHECK_EVERY": "1", "LC_IDLE_RETURN": "3", "LC_MAX_WAIT": "5", "LC_PING": f"tee -a {pings}",
+               "LC_CHECK_EVERY": "1", "LC_IDLE_RETURN": "3", "LC_MAX_WAIT": "60", "LC_PING": f"tee -a {pings}",
                "LC_SANDBOX_SCOPE": os.environ.get("LC_SANDBOX_SCOPE", "0")}
         lcd = os.path.join(LC, "lcd.py")
         tok = {n: subprocess.run([sys.executable, lcd, "token", "add", n, *extra], env=env, capture_output=True, text=True,
                                  check=True).stdout.strip()
-               for n, extra in (("claude", []), ("grok", ["--approve", "swarm,implement"]), ("owner", ["--admin"]))}
+               for n, extra in (("claude", ["--high"]), ("grok", ["--approve", "swarm,implement"]), ("owner", ["--admin"]))}
         proc = subprocess.Popen([sys.executable, lcd, "serve"], env=env, stderr=open(os.path.join(d, "lcd.log"), "w"))
         base = f"http://127.0.0.1:{port}"
 
-        def call(method, path, body=None, who="claude", raw=None, timeout=60):
+        def call(method, path, body=None, who="claude", raw=None, timeout=60, headers=None):
             data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-            h = {"Content-Type": "application/json"}
+            h = {"Content-Type": "application/json", **(headers or {})}
             if who:
                 h["Authorization"] = f"Bearer {tok.get(who, who)}"
             req = urllib.request.Request(base + path, data=data, method=method, headers=h)
@@ -246,6 +252,78 @@ def main():
             check(call("POST", "/admin/resume", {})[0] == 403, "only an admin resumes")
             call("POST", "/admin/resume", {}, who="owner")
             check(until(lambda: status()["loaded"] == "main"), "after resume, main loads again")
+
+            # priority, batching, backfill and the queue's view (10-24)
+            msg = [{"role": "user", "content": "x"}]
+            code, r = call("POST", "/jobs", {"kind": "chat", "priority": "high", "messages": msg}, who="grok")
+            check(code == 403, f"a token not marked high cannot queue high work: {code}")
+            code, r = call("POST", "/v1/chat/completions", {"model": "main", "messages": msg}, who="grok", headers={"X-Priority": "high"})
+            check(code == 403, f"nor send a high door chat: {code}")
+            subprocess.run([sys.executable, lcd, "token", "set", "grok", "--high"], env=env, check=True)
+            code, r = call("POST", "/v1/chat/completions", {"model": "main", "messages": msg}, who="grok", headers={"X-Priority": "high"})
+            subprocess.run([sys.executable, lcd, "token", "set", "grok", "--no-high"], env=env, check=True)
+            code2, r = call("POST", "/v1/chat/completions", {"model": "main", "messages": msg}, who="grok", headers={"X-Priority": "high"})
+            check(code == 200 and code2 == 403, f"token set grants and takes back high, the secret kept: {code} {code2}")
+            code, r = call("POST", "/v1/chat/completions", {"model": "main", "priority": "high", "messages": msg})
+            check(code == 200 and r["choices"][0]["message"]["content"] == "echo main",
+                  f"Claude's token sends a high door chat; the field never reaches the server: {code}")
+            code, upi = call("POST", "/uploads", raw=targz({"f.txt": "x\n"}))
+            code, i1 = call("POST", "/jobs", {"kind": "implement", "upload": upi["upload"], "spec": "SLOWIMPL", "test_command": "true"})
+            check(until(lambda: call("GET", f"/jobs/{i1['id']}")[1]["state"] == "running", 5), "a slow implement job runs on main")
+            code, up3 = call("POST", "/uploads", raw=targz(proj))
+            code, sn = call("POST", "/jobs", {"kind": "swarm", "upload": up3["upload"], "areas": 1})
+            code, c1 = call("POST", "/jobs", {"kind": "chat", "messages": msg, "thinking": False})
+            code, c1 = call("GET", f"/jobs/{c1['id']}?wait=10")
+            st = status()
+            check(c1["state"] == "done" and st["loaded"] == "main" and not st["draining"],
+                  "batching: swarm work waiting (under MAX_WAIT) does not stop main taking its own")
+            code, bh = call("POST", "/jobs", {"kind": "chat", "setup": "big", "priority": "high", "messages": msg, "thinking": False})
+            check(code == 200 and bh["priority"] == "high", "Claude queues high work for big")
+            check(until(lambda: status()["draining_for_high"], 5), "high work for another setup: main drains at once, not after MAX_WAIT")
+            code, c2 = call("POST", "/jobs", {"kind": "chat", "messages": msg, "thinking": False})
+            code, c2 = call("GET", f"/jobs/{c2['id']}?wait=10")
+            check(c2["state"] == "done", f"backfill: a short chat job still runs while the slow job holds main: {c2['state']}")
+            code, r = call("POST", "/v1/chat/completions", {"model": "main", "messages": msg}, timeout=10)
+            check(code == 200, f"backfill: a door chat to main too: {code}")
+            code, i2 = call("POST", "/jobs", {"kind": "implement", "upload": upi["upload"], "spec": "SANDBOXCHECK", "test_command": "true"})
+            code, n1 = call("POST", "/jobs", {"kind": "chat", "setup": "swarm", "messages": msg, "thinking": False})
+            code, h1 = call("POST", "/jobs", {"kind": "chat", "setup": "swarm", "priority": "high", "messages": msg, "thinking": False})
+            time.sleep(1.5)
+            q = {r.get("id"): r for r in status()["queue"]}
+            check(q[i2["id"]]["state"] == "queued", "no backfill for an implement job, expected to outlast the slow one")
+            check(q[h1["id"]]["position"] == 1 and q[sn["id"]]["position"] == 2 and q[n1["id"]]["position"] == 3,
+                  "in a setup's line high work goes first: swarm's high chat ahead of its older swarm job")
+            check(q[bh["id"]]["starts_in_s"] < q[h1["id"]]["starts_in_s"] < q[i2["id"]]["starts_in_s"],
+                  f"the plan: big's high chat (oldest high) first, then swarm's line, then main's implement after a switch back: "
+                  f"{[q[x['id']].get('starts_in_s') for x in (bh, h1, sn, n1, i2)]}")
+            check(q[i1["id"]].get("ends_in_s") is not None and q[i1["id"]]["yours"], "a running job has an expected end")
+            gq = call("GET", "/status", who="grok")[1]["queue"]
+            check(gq and all("id" not in r and "summary" not in r for r in gq), "GrokBot sees Claude's jobs without id or summary")
+            check(any(r.get("caller") == "claude" for r in call("GET", "/status", who="owner")[1]["queue"]), "the owner sees callers")
+            code, jv = call("GET", f"/jobs/{i2['id']}")
+            check(jv.get("position") == 1 and jv.get("starts_in_s") is not None, f"a queued job's own view: place and expected start {jv}")
+            code, bh = call("GET", f"/jobs/{bh['id']}?wait=40", timeout=60)
+            code, i1 = call("GET", f"/jobs/{i1['id']}")
+            check(bh["state"] == "done" and bh["started"] >= i1["finished"], "big's high chat runs once the slow job ends, not before")
+            done = {}
+            for x in (h1, sn, n1, i2):
+                done[x["id"]] = call("GET", f"/jobs/{x['id']}?wait=60", timeout=90)[1]
+            check(all(v["state"] == "done" for v in done.values()), f"then everything runs: {[v['state'] for v in done.values()]}")
+            check(done[h1["id"]]["started"] < done[sn["id"]]["started"] < done[n1["id"]]["started"] < done[i2["id"]]["started"],
+                  "in the planned order: swarm's high chat, its swarm job, its chat, then main's implement")
+            sw = [(s["from"], s["to"]) for s in status()["switches"]]
+            check(sw[-3:] == [("main", "big"), ("big", "swarm"), ("swarm", "main")], f"switches main -> big -> swarm -> main: {sw}")
+            check(until(lambda: status()["loaded"] == "main" and not any(status()["inflight"].values()), 20), "back on main, idle")
+            open(os.path.join(stubd, "slow-start"), "w").close()   # switches take 4 s from here
+            code, sj = call("POST", "/jobs", {"kind": "chat", "setup": "swarm", "messages": msg, "thinking": False})
+            check(until(lambda: status()["switching"] == "swarm", 5), "a switch to swarm for a normal job")
+            code, hm = call("POST", "/jobs", {"kind": "chat", "priority": "high", "messages": msg, "thinking": False})
+            sj = call("GET", f"/jobs/{sj['id']}?wait=30", timeout=40)[1]
+            hm = call("GET", f"/jobs/{hm['id']}?wait=30", timeout=40)[1]
+            os.remove(os.path.join(stubd, "slow-start"))
+            sw = [(s["from"], s["to"]) for s in status()["switches"]]
+            check(sj["state"] == hm["state"] == "done" and sj["started"] < hm["started"] and sw[-2:] == [("main", "swarm"), ("swarm", "main")],
+                  f"high work arriving during a switch waits for the job the switch was for (no bounce back): {sw[-3:]}")
 
             mcp = subprocess.Popen([sys.executable, os.path.join(LC, "lc-mcp")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    text=True, env={**env, "LC_URL": base, "LC_TOKEN": tok["claude"], "HOME": d})

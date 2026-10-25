@@ -2,8 +2,8 @@
 
 Status (2026-10-24): decided (Decision, below). Done: speed, long context, power, switch times, coding quality, the
 4-bit Flash-Next, big's coding order, main's agents at 40k and 128k, the swarm (every model at the pool's fit, the
-27B and the 5060 Ti included), main and swarm at once, and the 27B's check of every swarm's reports. Running: the
-check again with its prompt rewritten (Swarm, last paragraph). Sections marked _pending_ fill in as they finish.
+27B and the 5060 Ti included), main and swarm at once, and the 27B's check of every swarm's reports, with its prompt
+rewritten (Swarm, the last paragraphs), now the service's.
 
 ## The question
 
@@ -785,7 +785,8 @@ by one or two: two passes found 46-47 between them, three 49, all six of its run
 lower quality adds about as much as a third copy of the better one. Among the A3B's other reports, 11 spots were
 flagged by all three passes and 80 by only one; 5 of the 11 are bugs the hand check confirmed real, against 1 of
 the 80. That check covered 28 reports of an earlier run, so it leans toward what the A3B flags often and overstates
-the gap; the 27B's check of every report (pending) measures it properly.
+the gap. The 27B's check cannot settle it: only about a third of the other reports it confirms are real, too weak a
+signal for one spot.
 
 **Main and the 5060 Ti's swarm at once cost main nothing.** With main (w4-27b-tp2m1r4080) serving 8 agents of 128k
 on the 3090s and the 4B swarming on the 5060 Ti (combo-main-q4b), main served 291-294 tok/s (37 each) in seven
@@ -811,9 +812,34 @@ logic bugs as guesses. Off the answer key it is the same: of the reports the han
 service keeps every report and only labels it with the verdict, but a "not a bug" on a third of the real ones
 misleads whoever reads it.
 
-_Pending: the check again, the same model and lines, with a prompt that judges a line against what its own code says
-it should do (names, comments, messages, the lines beside it), and a second arm that also shows the lines a report
-cites._
+**Rewritten, the check confirms about nine in ten of the real planted bugs, and finds six times the real bugs
+among the rest.** The same 27B, the same lines and wording, through the service: every line near a planted bug, the
+hand-checked lines, and a seeded random 500 of the 2,273 others. The new prompt asks whether the report is right,
+judges the code against what the code itself says it should do (names, comments, docstrings, messages, the lines
+doing the same job beside it), and drops what no realistic input tells apart. A first draft asked whether "the code
+at the line is wrong", and a smoke test with the report "test" came back BUG for another problem on that line: the
+check must judge the report, not the line, or it confirms wrong reports at buggy lines.
+
+| | old prompt | new prompt |
+|---|---|---|
+| planted bugs some run named, confirmed at some line | 31 of 57 | 45 of 57 (47 with the wording that named them) |
+| hand-checked real bugs off the answer key | 2 of 11 | 6 of 11 |
+| hand-checked false reports | 0 of 23 | 2 of 23 |
+| random 500 other reports confirmed | 5, of which 1 real | 17, of which about 6 real |
+
+Of the 12 planted bugs it still drops, 3 are the float thresholds and ties no input tells apart (it now says so), 3
+are the cache's wrong first reports (it rightly rejects those reports), 1 needs another function, and 5 it gets wrong
+or are arguable. Among the 17 others it confirms, 6 hold up in the code (a check that writes its golden file before
+the check fails, a set comparison that misses the duplicates its message promises to catch, a substring test taken
+for membership), 1 is a misleading log label, and 10 do not: three misread the code (a comma or an index the code
+has), one trusts a table it could see only part of, one gets an API's argument order wrong, and the rest are design
+choices or missing features. Showing the lines a report cites (a second arm, 32 reports) changed nothing measured and
+showed the wrong lines when the report cited another file, so the service uses the plain prompt. It runs about 1,800
+tokens a check with thinking, 16 at once in about 50 minutes for 650 lines.
+
+So the check ranks well and proves nothing: on the swarm's best run it would keep about four in five of the real
+finds, and what it confirms among the other reports (drawn from every model's runs, most of them the small models'
+noise) is about one third real. The service shows the verdict beside every report, confirmed first, and drops none.
 
 ### Power and heat
 
@@ -894,7 +920,9 @@ and takes five hours with it. Thinking, rolling context and smaller areas each c
 independent pass finds about 4 more, and the spots both passes flag are the ones most likely real.
 
 The 5060 Ti's 4B can swarm beside a busy main without slowing it (main 291-294 tok/s at 8 agents of 128k against 280
-alone), at the 4B's quality. _Pending: what the 27B's check of the swarm's reports keeps._
+alone), at the 4B's quality. The 27B's check of the reports ranks rather than filters: rewritten to judge each line
+against its own code's evidence, it confirms 45 of the 57 planted bugs scouts named (the first prompt 31) and about a
+third of what it confirms among the rest is real; the service shows its verdicts and drops nothing.
 
 ## Decision
 
@@ -972,6 +1000,18 @@ read to big only when one prompt holds more than main reads in reasonable time.
 - **A model that reads first and reports last needs its turn limit checked.** The 27B without thinking read every
   line of its areas and reported nothing in 84 of 100 scouts, its 40 turns spent before its report came. A test
   that ends agents by turns measures that habit as much as the model.
+
+- **A judge's prompt sets its blind spot.** "Guesses about intent are not bugs" was written to cut noise, and the
+  27B used it to dismiss a third of the real bugs. Read the judge's reasons on what it drops, not only its counts.
+- **"Precise" from a keep count is not precision.** The first check kept 5 of a random 500 reports and looked strict;
+  4 of the 5 were wrong. Check what a filter keeps, not just how little.
+- **A smoke test with a nonsense input finds a prompt that answers the wrong question.** The report "test" came back
+  BUG: the draft judged the line, not the report.
+- **A cache keyed coarser than its input decides for inputs it never saw.** Verdicts cached by line let the first
+  report's wording decide for every later report at that line; 3 planted bugs were lost to wrong first reports.
+- **Some planted bugs change nothing.** A `<` made `<=` on a float threshold is an equivalent mutant (the lab's
+  mutation test of 10-08 found 6 of 48 the same way). A checker that rejects them is right; count them before
+  reading its recall.
 
 ## Files
 
