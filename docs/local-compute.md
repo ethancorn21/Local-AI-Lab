@@ -39,6 +39,7 @@ on 10-24: to main 84-85 s, to big 104 s, to swarm 113 s). The RTX 5060 Ti stays 
 |---|---|
 | `ask` | one question to main or big, with local files inlined; waits for the answer (up to 5 minutes, then a job id) |
 | (each of ask, swarm, implement) | `priority: high` when the owner is waiting on it: next after what runs now |
+| (swarm, implement) | `public: true` for code that is public anyway: its text shows on the swarm page (below); needs a git repository whose commit is pushed, and sends only tracked files |
 | `swarm` | packs a folder (git-tracked files), sends it, starts a swarm job: a bug hunt, or a brief of what to look for; `verify` adds main's check |
 | `implement` | packs a folder, sends a spec and a test command; the implementation agent edits a sandboxed copy until the tests pass |
 | `job` | a job's state and result: an answer, findings (saved in full to `~/.cache/localcompute/`), or a patch file with the command that applies it |
@@ -72,10 +73,11 @@ Every request but `/health` carries a bearer token.
 |---|---|
 | `POST /v1/chat/completions`, `GET /v1/models` | OpenAI-compatible; waits (up to 30 min) for its setup to be loaded; `X-Priority: high` (or `"priority": "high"`) for a token marked high |
 | `POST /uploads` | body: a `.tar.gz` (at most 64 MB, 512 MB unpacked) of the files a job works on → `{"upload": id}`; only its uploader can use it |
-| `POST /jobs` | `{"kind": "chat", "setup", "messages", "thinking", "max_tokens"}`, `{"kind": "swarm", "upload", "brief", "glob", "areas", "verify"}` or `{"kind": "implement", "upload", "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout"}`, each with `"priority": "high"` or `"normal"` (default) |
+| `POST /jobs` | `{"kind": "chat", "setup", "messages", "thinking", "max_tokens"}`, `{"kind": "swarm", "upload", "brief", "glob", "areas", "verify"}` or `{"kind": "implement", "upload", "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout"}`, each with `"priority": "high"` or `"normal"` (default); swarm and implement also `"public": true` and `"label"` (the page's name for it) |
 | `GET /jobs`, `GET /jobs/<id>[?wait=N]` | the caller's own jobs (a queued one with its `position` and `starts_in_s`, a running one with `ends_in_s`); `wait` holds the request up to N s (at most 600) for the job's end |
 | `POST /jobs/<id>/cancel`, `POST /jobs/<id>/approve` | approve: admin only |
 | `GET /status` | loaded setup, drain, switches, expected lengths, and the queue in expected order with expected starts and ends (other callers' jobs without ids or content) |
+| `GET /view[?since=N&pv=M]` | the swarm page's view (below): the lab, every job shaped by its policy, the events after `since`, the minimaps when they changed since `pv`; tokens with the `view` scope or admins |
 | `POST /admin/pause` (`{"stop": true}` frees the GPUs), `/admin/resume`, `/admin/load` | admin only |
 
 ## Jobs
@@ -144,12 +146,38 @@ Idle on swarm or big for 15 minutes (`LC_IDLE_RETURN`), the service goes back to
 **The bench comes first.** While a `bench-*` container (the serving bench's) or the old production servers run, the
 service loads nothing and waits. To run a bench: `lc pause --stop`, bench, then `lc resume`.
 
+## The swarm page
+
+The owner's site shows the lab at work, read-only (2026-10-25: "a swarm view of the local agents just showing their
+activity"; the page and its Worker are `~/code/projects/swarm-view`). `server/localcompute/view.py` keeps what the page
+draws: every agent (each scout of a swarm, each attempt of an implement job, each of the 27B's checks, each chat job,
+each conversation through the door), the files they read, the queue with expected starts, and the jobs and door
+chats of the last day. A small feeder on the box (`lc-feed`, in swarm-view) reads `GET /view` every second with a
+token that may do nothing else, and sends one frame every two seconds over one outbound WebSocket to a Cloudflare
+Durable Object, which fans it out to viewers. Nothing reaches the box from outside.
+
+What leaves depends on the job:
+
+| Policy | Who | What the page gets |
+|---|---|---|
+| shape (default) | every job not marked public | states, counts, line ranges, numbered files in numbered folders (`d01/f003.py`), verdicts, pass or fail, tool names; no text of any kind (no lines, findings, diffs, test output, prompts, answers, search patterns, folder or file names) |
+| public | a swarm or implement job sent with `"public": true`, by a token marked public (Claude's; the owner's as admin) | the job's folder name, relative paths, the first 40 lines of each read, findings, diffs, the end of each test run, the check's reasons |
+| hidden | every job of a token set `--visibility hidden` | nothing: in the queue as a "private job" with its setup and state |
+
+Door chats are never public: a conversation shows as an agent thinking and the names of the tools it calls. Every
+string is scrubbed twice (absolute paths, addresses, host names, e-mails, key-shaped strings), in lcd and in the
+feeder, and the page sets it as text. A session (the page's "run") starts when work starts and ends 90 s after the
+last agent stops; between sessions the page replays the last public one. `lcd.py token set <name> --show-as Claude`
+names a caller on the page (Claude's and GrokBot's tokens are named; others show no caller).
+
 ## Security
 
 - Tokens are random (`lc_` + 43 characters), stored only as SHA-256 hashes in `/etc/localcompute/tokens.json`
   (mode 600). `lcd.py token add <name> [--admin] [--approve swarm,implement] [--scopes ...]` prints a new one once.
-  Three exist: Claude's, GrokBot's (its swarm and implement jobs held for approval) and the owner's (admin).
+  Four exist: Claude's (high, public), GrokBot's (its swarm and implement jobs held for approval), the owner's (admin) and the swarm page feeder's (view only).
 - A caller sees only its own jobs and uploads; `/status` shows other callers' work without ids or content.
+- The swarm page gets only what `/view` shapes (above). Its feeder's token has only the `view` scope (no chat, jobs
+  or uploads); the feeder runs as a throwaway systemd user that can read nothing but its two credentials.
 - lcd listens on 127.0.0.1 only. The tailnet reaches it through `tailscale serve` on 8080/8081: members, and
   `tag:grokbot` by the tailnet policy, which allows it nothing else on the box.
 - Content is kept only while a job needs it: uploads for a day, job results for 7 days; workspaces are deleted when
@@ -168,6 +196,8 @@ service loads nothing and waits. To run a bench: `lc pause --stop`, bench, then 
 | Thermal guard | `server/thermal/hwtemps-log`: a 3090 at 88 C stops any `lc-*` or `bench-*` container (since 2026-10-24; the bench's ran unguarded before) |
 | Production containers | `hyperqwen-single-1` and `hyperqwen-c-single-1` stay stopped, restart policy `no` (they held one card each; the service needs both) |
 
+| Swarm page feeder | `lc-feed.service` (`/opt/hive/lc-feed.py`, its venv; credentials `/etc/hive/token`, `/etc/hive/lc-token`); installed from swarm-view's `feed/install-lc-feed.sh` |
+
 Deploy: copy `server/localcompute/*` and `server/bench/scout.py` to `/opt/llm/localcompute/`, then
 `sudo systemctl restart localcompute`. A running model server survives the restart (`KillMode=process`) and the new
 lcd adopts it.
@@ -175,7 +205,7 @@ lcd adopts it.
 ## Tests
 
 `analysis/tests/test_localcompute.py` runs lcd end to end with a stub `lc-setup` that starts stub OpenAI servers
-answering with scripted tool calls: no model, no GPU, about two minutes (needs bubblewrap, so it runs on the box). 62
+answering with scripted tool calls: no model, no GPU, about two minutes (needs bubblewrap, so it runs on the box). 79
 checks: tokens, the hold while the bench runs, the idle setup, the OpenAI door plain and streamed, a switch to big
 and back, chat jobs, a swarm with main's check (main → swarm → main), globs, the implementation agent (a protected
 test file refused, finish refused before the tests pass, the patch applying with `patch -p1`), the sandbox (no
@@ -183,7 +213,9 @@ test file refused, finish refused before the tests pass, the patch applying with
 that stops on its own (held, 503, resume), priority (who may send it, the door's header and field, `token set`),
 batching, a drain at once for high work, backfill of a short job and a door chat but not of a long job, a setup's
 line with high work first, the plan's order and its run in that order (main → big → swarm → main), the queue's view
-per caller, and the MCP server over stdio. Run it with `LC_SANDBOX_SCOPE=1` to use the
+per caller, the swarm page's view (a poller keeps every `/view` answer of the whole run: no text, file name or prompt
+of a job not marked public ever appears in them, nor a token; a public job's lines and findings do; a hidden caller's
+jobs never show; the feeder's token can do nothing else; sessions end after quiet), and the MCP server over stdio. Run it with `LC_SANDBOX_SCOPE=1` to use the
 systemd scope as the service does.
 
 ## Not done, on purpose

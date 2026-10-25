@@ -58,15 +58,16 @@ class Client:
                 return j
 
 
-def files_of(root):
+def files_of(root, tracked_only=False):
     """the files a job should see: git's tracked and unignored files when root is in a repository, else a walk
-    that skips build and cache folders"""
+    that skips build and cache folders; tracked_only: git's tracked files, or an error outside a repository"""
     try:
-        out = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                             capture_output=True, check=True).stdout.decode()
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached"] + ([] if tracked_only else
+                             ["--others", "--exclude-standard"]), capture_output=True, check=True).stdout.decode()
         return sorted({f for f in out.split("\0") if f})
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+        if tracked_only:
+            raise RuntimeError(f"{root} is not in a git repository")
     found = []
     for r, ds, fs in os.walk(root):
         ds[:] = sorted(d for d in ds if d not in SKIP_DIRS and not d.startswith("."))
@@ -74,14 +75,29 @@ def files_of(root):
     return found
 
 
-def pack(path):
-    """-> (the folder as .tar.gz bytes, files packed, files skipped as too large)"""
+def public_label(path):
+    """for a job shown with its text on the swarm page (public): the folder must be in a git repository whose HEAD is
+    on a remote branch (pushed: code that is public anyway, not a local experiment); -> the page's name for it,
+    "<repository>/<subfolder>". Only tracked files are sent (pack(..., public=True))"""
+    root = os.path.realpath(os.path.expanduser(path))
+    git = lambda *a: subprocess.run(["git", "-C", root, *a], capture_output=True, text=True)
+    top = git("rev-parse", "--show-toplevel")
+    if top.returncode:
+        raise RuntimeError(f"public: {path} is not in a git repository")
+    if not git("branch", "-r", "--contains", "HEAD").stdout.strip():
+        raise RuntimeError("public: this commit is on no remote branch; only pushed code (public anyway) may be shown")
+    prefix = git("rev-parse", "--show-prefix").stdout.strip().rstrip("/")
+    return os.path.basename(top.stdout.strip()) + (f"/{prefix}" if prefix else "")
+
+
+def pack(path, public=False):
+    """-> (the folder as .tar.gz bytes, files packed, files skipped as too large); public: git-tracked files only"""
     root = os.path.realpath(os.path.expanduser(path))
     if not os.path.isdir(root):
         raise RuntimeError(f"{path} is not a folder")
     buf, n, skipped = io.BytesIO(), 0, []
     with tarfile.open(fileobj=buf, mode="w:gz") as t:
-        for rel in files_of(root):
+        for rel in files_of(root, tracked_only=public):
             full = os.path.join(root, rel)
             if os.path.islink(full) or not os.path.isfile(full):
                 continue

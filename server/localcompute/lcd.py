@@ -20,17 +20,23 @@ settings are the serving bench's decision (docs/serving-bench.md).
           POST /jobs/<id>/cancel
           POST /jobs/<id>/approve     admin: start a job that waits for the owner's approval
           GET  /status                what is loaded, what runs and waits, in expected order with expected starts
+          GET  /view[?since=N&pv=M]   the public face (view.py): the lab as the swarm page draws it, every job shaped
+                                      by its policy; tokens with the view scope (the page's feeder) or admins
           POST /admin/pause [{"stop": true}] | /admin/resume | /admin/load {"setup": ...}
           GET  /health                no token
   CLI     lcd.py serve
           lcd.py token add <name> [--admin] [--high] [--approve swarm,implement] [--scopes chat,swarm,implement]
-          lcd.py token set <name> --high|--no-high
+          lcd.py token set <name> [--high|--no-high] [--public|--no-public] [--visibility shape|hidden] [--show-as NAME]
           lcd.py token list | token remove <name>
 
 Scheduling: the loaded setup keeps taking its own work, so work for one setup is batched between switches; another
 setup's work waits at most MAX_WAIT, or none if it is high priority, before the loaded setup drains (finishes what
 runs, starting only work that ends sooner: backfill) and the service switches. High work goes first in its line.
 Running work is never stopped.
+
+What the world sees (view.py, 2026-10-25): the owner's swarm page shows every job's agents at work. A job shows as
+its shape (states, counts, numbered files, no text) unless its caller marked it "public": true, which only tokens
+marked public may, for code that is public anyway; a token set to visibility hidden is left out entirely.
 
 Every request but /health carries "Authorization: Bearer <token>"; the tokens are stored hashed. A caller sees only
 its own jobs, and a caller whose token lists a kind under "approve" (GrokBot's agent jobs, the owner's rule of
@@ -44,6 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.join(HERE, "..", "bench")]
 import scout   # noqa: E402  (the swarm's agent loop, server/bench/scout.py, deployed beside this file)
+import view    # noqa: E402  (what the public swarm page sees)
 
 STATE = os.environ.get("LC_STATE", "/var/lib/localcompute")
 TOKENS = os.environ.get("LC_TOKENS", "/etc/localcompute/tokens.json")
@@ -59,6 +66,7 @@ IDLE_RETURN = int(os.environ.get("LC_IDLE_RETURN", "900"))   # s idle on swarm o
 # 100 findings; switch times as measured.
 TYPICAL_S = {"chat": 90, "implement": 900, "swarm": 1800, "verify": 600}
 SWITCH_S = {"main": 85, "swarm": 115, "big": 105}   # measured live 10-24 (the bench: 90, 210, 90)
+WAVE_S = 150           # s a wave of scouts takes over ~440-line areas (10-24: 5 areas, 5 at once, 128 s)
 BACKFILL_MARGIN = 30   # s: work started during a drain must be expected to end this long before the running work
 CHECK_EVERY = int(os.environ.get("LC_CHECK_EVERY", "30"))   # s between looks at the containers and the bench
 PING_CMD = os.environ.get("LC_PING")   # tests: a command that takes the phone message on stdin
@@ -103,6 +111,16 @@ def _chat_or_stop(*a, **kw):   # a cancelled swarm's scouts stop at their next t
 
 
 scout.chat = _chat_or_stop
+VIEW = view.View()
+SWARM_JOB = [None]   # the swarm job running now (one at a time): where its scouts' events go
+
+
+def _emit(sid, ev, **kw):   # scout.py's event hook (its --events file in the bench), for the page
+    if SWARM_JOB[0] and sid:
+        VIEW.ev(SWARM_JOB[0], sid, ev, **kw)
+
+
+scout.emit = _emit
 
 # The implementation agent (the "slim worker" of 2026-10-17): the local model as a tight implementation agent working
 # from a spec that Claude or a person wrote, checked by tests it may not edit. The bench's best use of the 27B was to
@@ -174,6 +192,26 @@ def priority_of(who, value):
     return 1
 
 
+def visibility_of(who, public):
+    """how a job shows on the swarm page: "public" (its text too) when asked for and the token may (Claude's, the
+    owner's: for code that is public anyway), "hidden" for a token set so, else "shape" (no text, numbered files)"""
+    if who.get("visibility") == "hidden":
+        return "hidden"
+    if public in (None, False, "", "false"):
+        return "shape"
+    if public is not True and public != "true":
+        raise JobError("public must be true or false")
+    if not (who.get("public") or who.get("admin")):
+        raise PermissionError("this token may not mark work public (an admin grants it: lcd.py token set <name> --public)")
+    return "public"
+
+
+def show_as(caller):
+    """the name a caller goes by on the swarm page, if its token has one (lcd.py token set <name> --show-as Claude)"""
+    t = next((x for x in load_tokens() if x["name"] == caller), None)
+    return view.scrub(t["show_as"], 24) if t and t.get("show_as") else None
+
+
 def load_tokens():
     try:
         return json.load(open(TOKENS))["tokens"]
@@ -193,14 +231,14 @@ def save_tokens(toks):
 class Jobs:
     """The queue: one row per job in sqlite; a job's files (params, result, log, workspace) under STATE/jobs/<id>."""
     COLS = ("id", "caller", "kind", "setup", "state", "created", "started", "finished", "summary", "error", "parent",
-            "progress", "seats", "priority")
+            "progress", "seats", "priority", "visibility")
 
     def __init__(self, path):
         self.c = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.c.execute("pragma journal_mode=wal")
         self.c.execute(f"create table if not exists jobs ({', '.join(self.COLS)})")
         have = {r[1] for r in self.c.execute("pragma table_info(jobs)")}
-        for col in self.COLS:   # columns added since the table was made (priority, 10-24)
+        for col in self.COLS:   # columns added since the table was made (priority 10-24, visibility 10-25)
             if col not in have:
                 self.c.execute(f"alter table jobs add column {col}")
         self.lock = threading.Lock()
@@ -379,6 +417,7 @@ class Service:
         self.switch_t0 = None       # when the switch under way began
         self.since = None           # when the switch to the loaded setup began: work it waited for is committed
         self._typ = (0.0, dict(TYPICAL_S))
+        self._day = (0.0, {})
         self.gpu_busy = False       # the bench or the old production servers hold the 3090s
         self.inflight = {s: 0 for s in SETUPS}   # running jobs and open chat requests
         self.seats = {s: 0 for s in SETUPS}      # seats the running jobs take
@@ -435,6 +474,9 @@ class Service:
         m = re.match(r"(\d+)/(\d+) (areas|checked)", j["progress"] or "")
         if m and int(m[1]) > 0:
             return ran * (int(m[2]) - int(m[1])) / int(m[1])
+        w = re.match(r"0/(\d+) areas, (\d+) scouts at once", j["progress"] or "")
+        if w:   # no scout done yet: waves of scouts (10-25: the page said "ends in ~29 min" for a 4-area swarm)
+            return max(30.0, -(-int(w[1]) // max(1, int(w[2]))) * WAVE_S - ran)
         return max(0.0, self.typical().get(j["kind"], 600) - ran)
 
     def remaining(self, setup, now):
@@ -630,6 +672,7 @@ class Service:
         if len(self.jobs.find(caller=who["name"], states=("queued", "awaiting_approval"))) >= JOBS_PER_CALLER:
             raise JobError(f"{JOBS_PER_CALLER} of your jobs already wait")
         priority = priority_of(who, spec.get("priority"))
+        visibility = visibility_of(who, spec.get("public"))
         p, seats = {}, 1
         if kind == "chat":
             setup = spec.get("setup") or "main"
@@ -656,12 +699,15 @@ class Service:
             summary = f"implement: {spec['spec'][:120]}"
         if p.get("upload"):
             self.claim_upload(who, p["upload"])
+        if visibility == "public":   # the page's words for it: the folder's name, and what was asked
+            p["label"] = str(spec.get("label") or "")[:60]
         jid = secrets.token_hex(6)
         os.makedirs(jdir(jid))
         json.dump(p, open(os.path.join(jdir(jid), "params.json"), "w"))
         held = kind in who.get("approve", [])
         row = self.jobs.add(id=jid, caller=who["name"], kind=kind, setup=setup, created=time.time(), summary=summary,
-                            state="awaiting_approval" if held else "queued", seats=seats, priority=priority)
+                            state="awaiting_approval" if held else "queued", seats=seats, priority=priority,
+                            visibility=visibility)
         if held:
             ping(f"local-compute: {who['name']} asks for a {kind} job ({summary[:200]}). Approve: lc approve {jid}  "
                  f"Refuse: lc cancel {jid}")
@@ -682,6 +728,7 @@ class Service:
                 json.dump(result, f)
             os.replace(os.path.join(jdir(jid), "result.json.new"), os.path.join(jdir(jid), "result.json"))
         self.jobs.set(jid, state=state, finished=time.time(), error=error, progress=None)
+        VIEW.job_end(jid, state)
         with self.cv:
             self.cancel.discard(jid); self.cv.notify_all()
 
@@ -689,6 +736,8 @@ class Service:
         jid = j["id"]
         try:
             p = json.load(open(os.path.join(jdir(jid), "params.json")))
+            VIEW.job_start(jid, j["kind"], setup, j["visibility"] or "shape", label=p.get("label"), task=task_of(j, p),
+                           caller=show_as(j["caller"]), parent=p.get("parent"))
             res = getattr(self, f"run_{j['kind']}")(j, p, self.url(setup))
             if res == "waiting":
                 self.jobs.set(jid, state="waiting")
@@ -716,8 +765,12 @@ class Service:
                 "chat_template_kwargs": {"enable_thinking": bool(thinking)}}
         if thinking:   # vLLM's and Strata's names for the thinking budget (the bench's lcb-quick.py)
             body["reasoning_budget_tokens" if j["setup"] == "big" else "thinking_token_budget"] = budget
+        VIEW.ev(j["id"], "c", "ask", role="chat", turn=1)
         r = post(url + "/chat/completions", body)
         m = r["choices"][0]["message"]
+        VIEW.ev(j["id"], "c", "answer", role="chat", tokens=(r.get("usage") or {}).get("completion_tokens"),
+                text=m.get("content") or "")
+        VIEW.ev(j["id"], "c", "end", role="chat", end="finish")
         return {"content": m.get("content") or "", "reasoning_chars": len(m.get("reasoning_content") or m.get("reasoning") or ""),
                 "finish_reason": r["choices"][0].get("finish_reason"), "usage": r.get("usage")}
 
@@ -732,6 +785,8 @@ class Service:
         areas, total = split_areas(files, int(p["areas"]) if p.get("areas") else None)
         json.dump(areas, open(os.path.join(d, "assign.json"), "w"))
         at = pool_fit(url, len(areas))
+        VIEW.job_files(jid, dict(files), root=tgt)
+        VIEW.expect(jid, [x["id"] for x in areas], "scout")
         kind = "lc-bughunt"
         if p.get("brief"):
             kind = f"lc-{jid}"
@@ -754,10 +809,12 @@ class Service:
                 pass
 
         SWARM_CANCEL.clear()
+        SWARM_JOB[0] = jid
         try:
             with contextlib.redirect_stdout(Progress()):
                 scout.run(a)
         finally:
+            SWARM_JOB[0] = None
             scout.BRIEFS.pop(f"lc-{jid}", None)
         run_ = json.load(open(a.out))
         s = run_["summary"]
@@ -774,7 +831,8 @@ class Service:
             json.dump({"parent": jid}, open(os.path.join(jdir(vid), "params.json"), "w"))
             self.jobs.add(id=vid, caller=j["caller"], kind="verify", setup="main", created=time.time(), state="queued",
                           summary=f"verify {len(result['findings'])} findings of {jid}", parent=jid, seats=1,
-                          priority=j["priority"] or 0)   # a high swarm's check is high too
+                          priority=j["priority"] or 0, visibility=j["visibility"])   # a high swarm's check is high too
+            VIEW.job_wait(jid, "waiting for its check")
             self.progress(jid, f"swarm done; main checks {len(result['findings'])} findings (job {vid})")
             return "waiting"
         shutil.rmtree(tgt, ignore_errors=True)
@@ -788,7 +846,7 @@ class Service:
         res = json.load(open(os.path.join(d, "result.json")))
         brief = None if res["brief"] == "bug hunt" else res["brief"]
         target = scout.Target(os.path.join(d, "target"))
-        done = [0]
+        done, used = [0], set()
 
         def stopped():   # this check, or the swarm job it checks for, was cancelled
             return j["id"] in self.cancel or self.jobs.get(parent)["state"] == "cancelled"
@@ -796,6 +854,9 @@ class Service:
         def one(f):
             if stopped():
                 return
+            me = "c" + threading.current_thread().name.rsplit("_", 1)[-1]   # one checker per pool thread
+            used.add(me)
+            VIEW.ev(j["id"], me, "ask", role="check")
             try:
                 text = open(target.path(f["path"]), encoding="utf-8", errors="replace").read().splitlines()
                 x, y = max(1, f["line"] - 25), min(len(text), f["line"] + 25)
@@ -809,12 +870,16 @@ class Service:
                 f["why"] = ans[:300]
             except Exception as e:
                 f["verdict"], f["why"] = "error", str(e)[:200]
+            VIEW.ev(j["id"], me, "check", role="check", path=f["path"], line=f["line"], verdict=f["verdict"],
+                    why=f["why"].split("\n", 1)[-1])
             done[0] += 1
             if done[0] % 10 == 0:
                 self.progress(j["id"], f"{done[0]}/{len(res['findings'])} checked")
 
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(one, res["findings"]))
+        for c in used:
+            VIEW.ev(j["id"], c, "end", role="check", end="finish")
         res["verified"] = "partial" if j["id"] in self.cancel else True
         res["kept"] = sum(f.get("verdict") == "yes" for f in res["findings"])
         res["findings"].sort(key=lambda f: (f.get("verdict") != "yes", -f["scouts"], f["path"], f["line"]))
@@ -864,9 +929,13 @@ class Service:
                  "then call finish with a one-line summary."}]
         touched, passed, test_out, summary, end = set(), False, "", "", "max_turns"
         tokens, last_prompt, nudges, refusals, warned, turns = 0, 0, 0, 0, False, 0
+        me = f"a{i}"
+        show = lambda ev, **kw: VIEW.ev(jid, me, ev, role="attempt", root=ws, **kw)
+        show("start")
         for turns in range(1, int(p.get("max_turns") or 60) + 1):
             if stop.is_set() or jid in self.cancel:
                 end = "stopped"; break
+            show("ask", turn=turns)
             body = {"model": "main", "messages": msgs, "tools": IMPL_TOOLS, "temperature": 0.6, "top_p": 0.95,
                     "max_tokens": IMPL_ANSWER + IMPL_THINK, "thinking_token_budget": IMPL_THINK,
                     "chat_template_kwargs": {"enable_thinking": True}}
@@ -902,6 +971,7 @@ class Service:
                             open(full, "w", encoding="utf-8").write(args["content"])
                             touched.add(rel_); passed = False
                             out = f"wrote {rel_} ({args['content'].count(chr(10)) + 1} lines)"
+                            show("edit", path=rel_, old=None, new=args["content"])
                         else:
                             text = open(full, encoding="utf-8").read()
                             k = text.count(args["old"]) if args["old"] else 0
@@ -911,10 +981,13 @@ class Service:
                                 open(full, "w", encoding="utf-8").write(text.replace(args["old"], args["new"], 1))
                                 touched.add(rel_); passed = False
                                 out = f"edited {rel_}"
+                                show("edit", path=rel_, old=args["old"], new=args["new"])
                     elif name == "run_tests":
+                        show("ask", turn=turns)   # (the tests run: the page shows it thinking, then the result)
                         code, test_out = sandbox(ws, cmd, timeout)
                         passed = code == 0
                         out = f"exit code {code} ({'passed' if passed else 'failed'})\n{test_out[-6000:]}"
+                        show("test", passed=passed, code=code, output=test_out[-3000:])
                     elif name == "finish":
                         if passed:
                             done, summary, end = True, str(args.get("summary", ""))[:500], "finish"
@@ -926,6 +999,15 @@ class Service:
                                 done, end = True, "finish without passing"
                     elif name in ("list_dir", "read_file", "search"):
                         out = getattr(target, name)(**{k: v for k, v in args.items() if k in ("path", "start", "lines", "pattern")})
+                        if name == "read_file":   # the lines it got, as scout.py tells its event hook
+                            m_ = re.match(r".* lines (\d+)-(\d+) of \d+", str(out))
+                            show("read", path=scout.rel(target, args.get("path")), end=int(m_[2]) if m_ else 0,
+                                 start=int(m_[1]) if m_ else int(args.get("start") or 1))
+                        elif name == "search":
+                            show("search", pattern=str(args.get("pattern", ""))[:200],
+                                 path=scout.rel(target, args.get("path")) if args.get("path") else None)
+                        else:
+                            show("list", path=scout.rel(target, args.get("path")))
                     else:
                         out = f"error: no tool {name}"
                 except Exception as e:
@@ -945,6 +1027,7 @@ class Service:
             passed = code == 0
         if passed:
             stop.set()
+        show("end", end="pass" if passed else "stopped" if end == "stopped" else "fail", turns=turns)
         return {"passed": passed, "end": end, "turns": turns, "tokens_out": tokens, "summary": summary,
                 "patch": tree_diff(base, ws, touched), "test_output": test_out[-4000:]}
 
@@ -1038,6 +1121,36 @@ class Service:
         with self.cv:
             return self.plan(time.time()).get(jid, {})
 
+    def view_lab(self):
+        """the lab for the swarm page: what is loaded and doing what, the queue in expected order (private jobs by
+        setup and state only), how much was done in the last day"""
+        now = time.time()
+        with self.cv:
+            state = ("bench" if self.gpu_busy else "held" if self.held else "paused" if self.paused else
+                     "switching" if self.switching else "working" if any(self.inflight.values()) else
+                     "idle" if self.loaded else "off")
+            lab = {"setup": self.loaded, "switching": self.switching, "state": state, "draining": self.draining,
+                   "switch_s": round(self.switch_s(self.switching)) if self.switching else None,
+                   "switch_t": round(now - self.switch_t0) if self.switching and self.switch_t0 else None,
+                   "door": len(self.door)}
+            plan = self.plan(now)
+        order = {"running": 0, "waiting": 1, "queued": 2, "awaiting_approval": 3}
+        rows = [lab_row(j, plan) for j in self.jobs.find(states=tuple(order))]
+        lab["queue"] = sorted(rows, key=lambda r: (order[r["state"]], r.get("ends_in_s", 0), r.get("starts_in_s", 1e9)))[:30]
+        if now - self._day[0] > 60:   # jobs done and door chats answered in the last 24 h, counted once a minute
+            cut = now - 86400
+            n = sum(1 for j in self.jobs.find(states=("done",), limit=100000) if (j["finished"] or 0) > cut and j["kind"] != "verify")
+            try:
+                with open(os.path.join(STATE, "requests.log"), "rb") as f:
+                    f.seek(max(0, os.fstat(f.fileno()).st_size - (4 << 20)))
+                    ts = [m[1] for m in re.finditer(rb'^\{"t": (\d+),', f.read(), re.M)]
+                chats = sum(int(t) > cut for t in ts)
+            except OSError:
+                chats = 0
+            self._day = (now, {"jobs": n, "chats": chats})
+        lab["day"] = self._day[1]
+        return lab
+
     def status(self, who):
         """what the service does now: the dashboard's and callers' view. Other callers' jobs show without id,
         summary or caller unless the token is an admin's"""
@@ -1064,6 +1177,27 @@ class Service:
         return st
 
 
+def task_of(j, p):
+    """what a public job was asked, in the page's words (shown only for public jobs)"""
+    if j["kind"] == "swarm":
+        return p.get("brief") or "a bug hunt"
+    if j["kind"] == "implement":
+        return p.get("spec")
+    if j["kind"] == "chat":
+        return next((str(m.get("content")) for m in reversed(p.get("messages") or []) if m.get("role") == "user"), None)
+    return None
+
+
+def lab_row(j, plan):
+    vis = j["visibility"] or "shape"
+    r = {"kind": "private" if vis == "hidden" else j["kind"], "setup": j["setup"], "state": j["state"],
+         "priority": "high" if j["priority"] else "normal",
+         **{k: v for k, v in plan.get(j["id"], {}).items() if k in ("position", "starts_in_s", "ends_in_s")}}
+    if vis != "hidden":
+        r.update(job=VIEW.tag(j["id"] if j["kind"] != "verify" else j["parent"]), caller=show_as(j["caller"]))
+    return r
+
+
 def job_view(j, with_result=False):
     v = {k: j[k] for k in ("id", "kind", "setup", "state", "created", "started", "finished", "summary", "error",
                            "progress", "parent")}
@@ -1079,6 +1213,7 @@ def job_view(j, with_result=False):
 
 
 SVC = None
+TOOL_NAME = re.compile(r'"function":\s*\{\s*"name":\s*"([\w.-]{1,40})"')   # a tool call's name in a streamed answer
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1125,6 +1260,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, {"object": "list", "data": [{"id": s, "object": "model", "owned_by": "local"} for s in SETUPS]})
             if method == "GET" and path == "/status":
                 return self.reply(200, SVC.status(who))
+            if method == "GET" and path == "/view":
+                if "view" not in who.get("scopes", ()) and not who.get("admin"):
+                    return self.reply(403, {"error": "this token may not read the view"})
+                n = lambda k: int((re.search(rf"\b{k}=(\d+)", query) or [0, 0])[1])
+                return self.reply(200, VIEW.frame(n("since"), n("pv"), SVC.view_lab()))
             if method == "POST" and path == "/uploads":
                 return self.upload(who)
             if method == "POST" and path == "/jobs":
@@ -1187,6 +1327,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         log("paused and stopped the setup")
 
     def upload(self, who):
+        if not {"swarm", "implement"} & set(who.get("scopes", KINDS)):   # a chat-only or view-only token has no use for one
+            return self.reply(403, {"error": "this token may not upload"})
         data = self.body(UPLOAD_MAX)
         uid = secrets.token_hex(12)
         dest = os.path.join(STATE, "uploads", f"{uid}.tar.gz")
@@ -1219,7 +1361,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             url, key = SVC.acquire(setup, bool(high))
         except JobError as e:
             return self.reply(503, {"error": str(e)})
-        usage, code = {}, 200
+        usage, code, tools = {}, 200, []
+        vk = VIEW.door_start(who["name"], visibility_of(who, None), req.get("messages"))
         try:
             req["model"] = setup
             up = urllib.request.Request(url + "/chat/completions", data=json.dumps(req).encode(),
@@ -1241,11 +1384,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if not chunk:
                             break
                         self.wfile.write(chunk); self.wfile.flush()
+                        tools += TOOL_NAME.findall(chunk.decode("utf-8", "replace"))[:8]
                 else:
                     data = r.read()
                     try:
-                        usage = json.loads(data).get("usage") or {}
-                    except ValueError:
+                        d_ = json.loads(data)
+                        usage = d_.get("usage") or {}
+                        tools = [c["function"]["name"] for c in d_["choices"][0]["message"].get("tool_calls") or []]
+                    except (ValueError, KeyError, IndexError, TypeError):
                         pass
                     self.send_response(200); self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -1253,6 +1399,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = 499
         finally:
             SVC.release(setup, key)
+            VIEW.door_end(vk, code == 200, usage, tools)
             with open(os.path.join(STATE, "requests.log"), "a") as f:   # no content: who, where, how much, how long
                 f.write(json.dumps({"t": round(t0), "caller": who["name"], "setup": setup, "code": code, "high": bool(high),
                                     "s": round(time.time() - t0, 1), "prompt_tokens": usage.get("prompt_tokens"),
@@ -1280,9 +1427,13 @@ def main():
     t.add_argument("name", nargs="?")
     t.add_argument("--admin", action="store_true")
     t.add_argument("--approve", default="", help="kinds held for an admin's approval, e.g. swarm,implement")
-    t.add_argument("--scopes", default="chat,swarm,implement")
+    t.add_argument("--scopes", default="chat,swarm,implement", help="chat, swarm, implement; view for the page's feeder")
     t.add_argument("--high", action="store_true", help="may mark work high priority")
     t.add_argument("--no-high", action="store_true", help="with set: may no longer")
+    t.add_argument("--public", action="store_true", help="may mark work public (its text on the swarm page)")
+    t.add_argument("--no-public", action="store_true", help="with set: may no longer")
+    t.add_argument("--visibility", choices=["shape", "hidden"], help="how its work shows on the swarm page")
+    t.add_argument("--show-as", help="the name its work goes by on the swarm page ('' for none)")
     a = ap.parse_args()
     if a.cmd == "serve":
         return serve()
@@ -1290,21 +1441,33 @@ def main():
     if a.action == "list":
         for x in toks:
             print(f"{x['name']:12s} scopes {','.join(x['scopes'])}" + (" admin" if x.get("admin") else "")
-                  + (" high" if x.get("high") else "") + (f" approve {','.join(x['approve'])}" if x.get("approve") else ""))
+                  + (" high" if x.get("high") else "") + (f" approve {','.join(x['approve'])}" if x.get("approve") else "")
+                  + (" public" if x.get("public") else "") + (" hidden" if x.get("visibility") == "hidden" else "")
+                  + (f" shown as {x['show_as']}" if x.get("show_as") else ""))
         return
     if not a.name:
         sys.exit("a token name is needed")
-    if a.action == "set":   # change a token's high flag, keeping its secret
+    if a.action == "set":   # change a token's flags, keeping its secret
         x = next((x for x in toks if x["name"] == a.name), None)
-        if not x or a.high == a.no_high:
-            sys.exit("set needs an existing token and one of --high, --no-high")
-        x["high"] = a.high
+        if not x or (a.high and a.no_high) or (a.public and a.no_public) or not (
+                a.high or a.no_high or a.public or a.no_public or a.visibility or a.show_as is not None):
+            sys.exit("set needs an existing token and at least one of --high/--no-high, --public/--no-public, "
+                     "--visibility, --show-as")
+        if a.high or a.no_high:
+            x["high"] = a.high
+        if a.public or a.no_public:
+            x["public"] = a.public
+        if a.visibility:
+            x["visibility"] = a.visibility
+        if a.show_as is not None:
+            x["show_as"] = a.show_as[:24]
         return save_tokens(toks)
     toks = [x for x in toks if x["name"] != a.name]
     if a.action == "add":
         raw = "lc_" + secrets.token_urlsafe(32)
         toks.append({"name": a.name, "sha256": token_hash(raw), "scopes": [s for s in a.scopes.split(",") if s],
-                     "approve": [s for s in a.approve.split(",") if s], "admin": a.admin, "high": a.high})
+                     "approve": [s for s in a.approve.split(",") if s], "admin": a.admin, "high": a.high,
+                     "public": a.public, "visibility": a.visibility or "shape", **({"show_as": a.show_as[:24]} if a.show_as else {})})
         print(raw)
     save_tokens(toks)
 

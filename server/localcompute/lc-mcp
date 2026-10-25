@@ -18,6 +18,11 @@ INSTRUCTIONS = (
     "context on (ask with files). Jobs queue; the box switches models as needed (1.5-2 min a switch). Check the "
     "results: the local models are weaker than you, a patch is a proposal, swarm findings are leads.")
 
+PUBLIC = ("true: this job's text (the code its agents read, findings, diffs, test output) shows on the owner's public "
+          "swarm page, live. Only for code that is public anyway (a public GitHub repository): the folder must be in a "
+          "git repository whose commit is pushed, and only git-tracked files are sent (git add new files first). "
+          "Leave false for anything private: its work then shows only as shapes, with no text.")
+
 PRIORITY = ("high: goes next, after the work running now (a model switch included), ahead of normal work; for "
             "work the owner is waiting on. normal work waits its turn; work for another model waits at most 10 min.")
 
@@ -51,6 +56,7 @@ TOOLS = [
          "glob": {"type": "string", "default": "*.py", "description": "file name patterns, comma separated, e.g. *.py,*.ts"},
          "areas": {"type": "integer", "description": "how many areas (default: one per ~440 lines, at most 100)"},
          "verify": {"type": "boolean", "default": False},
+         "public": {"type": "boolean", "default": False, "description": PUBLIC},
          "priority": {"type": "string", "enum": ["normal", "high"], "default": "normal", "description": PRIORITY}},
      "required": ["path"]}},
     {"name": "implement", "description": (
@@ -68,6 +74,7 @@ TOOLS = [
          "attempts": {"type": "integer", "default": 1, "minimum": 1, "maximum": 4},
          "max_turns": {"type": "integer", "default": 60},
          "test_timeout": {"type": "integer", "default": 600},
+         "public": {"type": "boolean", "default": False, "description": PUBLIC},
          "priority": {"type": "string", "enum": ["normal", "high"], "default": "normal", "description": PRIORITY}},
      "required": ["path", "spec", "test_command"]}},
     {"name": "job", "description": "A local-compute job's state and, once done, its result (waits up to wait_seconds).",
@@ -82,7 +89,9 @@ TOOLS = [
 
 
 def submit_folder(c, path, spec):
-    data, n, skipped = lc.pack(path)
+    if spec.get("public"):
+        spec["label"] = lc.public_label(path)
+    data, n, skipped = lc.pack(path, public=bool(spec.get("public")))
     up = c.call("POST", "/uploads", raw=data)
     j = c.call("POST", "/jobs", {**spec, "upload": up["upload"]})
     lc.remember(j["id"], folder=os.path.realpath(os.path.expanduser(path)), kind=spec["kind"])
@@ -108,12 +117,13 @@ def call(name, a):
             return lc.describe(j) + "\n(still going: ask the job tool later)" * (j["state"] not in ("failed", "cancelled"))
         return lc.describe(j)
     if name == "swarm":
-        j, note = submit_folder(c, a["path"], {"kind": "swarm", **{k: a[k] for k in ("brief", "glob", "areas", "verify", "priority") if k in a}})
+        j, note = submit_folder(c, a["path"], {"kind": "swarm", **{k: a[k] for k in ("brief", "glob", "areas", "verify", "priority",
+                                                                                      "public") if k in a}})
         return (f"swarm job {j['id']} {j['state']}{lc.place(j)}: {note}. Results with the job tool (a 44k-line folder "
                 "takes ~30 min).")
     if name == "implement":
         j, note = submit_folder(c, a["path"], {"kind": "implement", **{k: a[k] for k in (
-            "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout", "priority") if k in a}})
+            "spec", "test_command", "protect", "attempts", "max_turns", "test_timeout", "priority", "public") if k in a}})
         return f"implement job {j['id']} {j['state']}{lc.place(j)}: {note}. The patch comes with the job tool."
     if name == "job":
         j = c.wait(a["id"], a.get("wait_seconds", 60))

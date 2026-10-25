@@ -5,7 +5,9 @@ runs, the idle setup, the OpenAI door (plain and streamed) and its switch to ano
 swarm job with the 27B's check, the implementation agent (a protected test file, finish refused before the tests
 pass, the patch), the sandbox (no /home, no /opt, no network), GrokBot's approval rule and the owner's ping, job
 privacy, cancel, a setup that stops on its own (held until resume), priority, batching and backfill with the queue's
-expected order, a switch's own job going first when high work arrives during it, and the MCP server over stdio.
+expected order, a switch's own job going first when high work arrives during it, the public swarm page's view (no
+text of a job not marked public ever reaches it, public jobs show theirs, hidden callers are left out, sessions end),
+and the MCP server over stdio.
 
 Needs bwrap (the AI box has it). usage: python3 analysis/tests/test_localcompute.py [path/to/server/localcompute]
 """
@@ -119,11 +121,12 @@ def main():
         env = {**os.environ, "LC_STATE": os.path.join(d, "state"), "LC_TOKENS": os.path.join(d, "tokens.json"),
                "LC_SETUP": setup, "LC_PORTS": str(port), "LC_SETUP_PORTS": ",".join(f"{k}={v}" for k, v in ports.items()),
                "LC_CHECK_EVERY": "1", "LC_IDLE_RETURN": "3", "LC_MAX_WAIT": "60", "LC_PING": f"tee -a {pings}",
-               "LC_SANDBOX_SCOPE": os.environ.get("LC_SANDBOX_SCOPE", "0")}
+               "LC_SANDBOX_SCOPE": os.environ.get("LC_SANDBOX_SCOPE", "0"), "LC_VIEW_GAP": "3", "LC_VIEW_LINGER": "4"}
         lcd = os.path.join(LC, "lcd.py")
         tok = {n: subprocess.run([sys.executable, lcd, "token", "add", n, *extra], env=env, capture_output=True, text=True,
                                  check=True).stdout.strip()
-               for n, extra in (("claude", ["--high"]), ("grok", ["--approve", "swarm,implement"]), ("owner", ["--admin"]))}
+               for n, extra in (("claude", ["--high", "--public", "--show-as", "Claude"]),
+                                ("grok", ["--approve", "swarm,implement"]), ("owner", ["--admin"]), ("feed", ["--scopes", "view"]))}
         proc = subprocess.Popen([sys.executable, lcd, "serve"], env=env, stderr=open(os.path.join(d, "lcd.log"), "w"))
         base = f"http://127.0.0.1:{port}"
 
@@ -154,8 +157,27 @@ def main():
         def status():
             return call("GET", "/status")[1]
 
+        # the swarm page's feeder, all along: every /view answer kept, raw, to look for what must never be in it
+        seen, frames, stop_poll = [], [], threading.Event()
+
+        def poll():
+            since = pv = 0
+            while not stop_poll.is_set():
+                try:
+                    req = urllib.request.Request(f"{base}/view?since={since}&pv={pv}", headers={"Authorization": f"Bearer {tok['feed']}"})
+                    raw = urllib.request.urlopen(req, timeout=10).read().decode()
+                    fr = json.loads(raw); since, pv = fr["seq"], fr["pv"]
+                    seen.append(raw); frames.append(fr)
+                except Exception:
+                    pass
+                time.sleep(0.25)
+
+        def events(**match):
+            return [e for fr in frames for e in fr["events"] if all(e.get(k) == v for k, v in match.items())]
+
         try:
             check(until(lambda: call("GET", "/health", who=None)[0] == 200), "the daemon answers /health without a token")
+            threading.Thread(target=poll, daemon=True).start()
             check(call("GET", "/status", who=None)[0] == 401 and call("GET", "/status", who="lc_wrong")[0] == 401,
                   "no token or a wrong one: 401")
             time.sleep(2.5)
@@ -193,11 +215,24 @@ def main():
                   f"findings clustered and judged: {[(f['path'], f['line'], f.get('verdict')) for f in fs]}")
             sw = [(s["from"], s["to"]) for s in status()["switches"]]
             check(("main", "swarm") in sw and ("swarm", "main") in sw, f"switches main -> swarm -> main: {sw}")
+            time.sleep(0.6)
+            check(call("GET", "/view")[0] == 403 and call("GET", "/view", who="owner")[0] == 200,
+                  "the view: Claude's token may not read it, the owner's may")
+            reads = events(ev="read")
+            check(reads and all(e["job"].startswith("swarm ") and e["ln"] and "text" not in e
+                                and e["path"].startswith(e["job"] + "/d01/f") for e in reads),
+                  f"the page sees the scouts read line ranges of numbered files, no text: {reads[:1]}")
+            checks = events(ev="check")
+            check(sorted(e["verdict"] for e in checks) == ["no", "no", "yes", "yes"] and not any("text" in e for e in checks),
+                  f"and the 27B's verdicts without its reasons: {[e.get('verdict') for e in checks]}")
+            check(any(fr["snap"]["lab"]["jobs"].get(reads[0]["job"], {}).get("caller") == "Claude" for fr in frames),
+                  "a job goes by its caller's shown name (token --show-as)")
             code, up2 = call("POST", "/uploads", raw=targz(proj))
             code, j2 = call("POST", "/jobs", {"kind": "swarm", "upload": up2["upload"], "glob": "*.md"})
             code, j2 = call("GET", f"/jobs/{j2['id']}?wait=60", timeout=90)
             check(j2["state"] == "done" and j2["result"]["files"] == 1 and j2["result"]["areas"] == 1, "glob picks the files: one .md area")
 
+            msg0 = [{"role": "user", "content": "x"}]
             calc = {"calc.py": "def add(a, b):\n    return a - b\n",
                     "tests/test_calc.py": "import sys, unittest\nsys.path.insert(0, '.')\nfrom calc import add\n\n"
                                           "class T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n"}
@@ -217,6 +252,10 @@ def main():
                 pf = os.path.join(g, "p.patch"); open(pf, "w").write(patch)
                 ap = subprocess.run(["patch", "-p1", "-d", g, "-i", pf], capture_output=True, text=True)
                 check(ap.returncode == 0 and "a + b" in open(os.path.join(g, "calc.py")).read(), "patch -p1 applies it")
+            time.sleep(0.6)
+            ed, ts = events(ev="edit"), events(ev="test")
+            check(ed and all("text" not in e and e["plus"] == 1 and e["minus"] == 1 for e in ed) and ts and ts[-1]["ok"]
+                  and events(ev="end", end="pass"), f"the page sees the attempt edit (+1 -1, no text) and pass its tests: {ed} {ts[-1:]}")
 
             sbx = f"test ! -e /home && test ! -e /opt && ! (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null && touch made.txt"
             code, up = call("POST", "/uploads", raw=targz({"f.txt": "x\n"}))
@@ -225,6 +264,40 @@ def main():
             check(j["state"] == "done" and j["result"]["passed"],
                   f"the tests' sandbox has no /home, no /opt and no network: {(j.get('result') or {}).get('test_output', '')[-300:]}")
 
+            pub = {"lib/pub.py": "".join(f"PUBLICTEXT_{i} = {i}\n" for i in range(20)),
+                   "lib/some_long_folder_name_here/and_a_long_module_name.py": "z = 1\n"}   # a path the token scrub once ate
+            code, up = call("POST", "/uploads", raw=targz(pub))
+            code, pj = call("POST", "/jobs", {"kind": "swarm", "upload": up["upload"], "public": True, "label": "demo/lib"})
+            code, pj = call("GET", f"/jobs/{pj['id']}?wait=60", timeout=90)
+            time.sleep(0.6)
+            pr = events(ev="read", job="demo")
+            check(pj["state"] == "done" and pr and pr[0]["path"] == "demo/lib/pub.py" and "PUBLICTEXT_0 = 0" in pr[0]["text"]
+                  and any(e.get("text") == "wrong operator" for e in events(ev="report", job="demo"))
+                  and any(fr["snap"]["lab"]["jobs"].get("demo", {}).get("label") == "demo/lib" for fr in frames)
+                  and any("demo/lib/some_long_folder_name_here/and_a_long_module_name.py" in fr["snap"]["files"] for fr in frames),
+                  f"a public job shows its paths, the lines read and the findings: {pr[:1]}")
+            sec = {"secret/canary_name.py": "".join(f"SHAPECANARY_{i} = {i}\n" for i in range(20))}
+            code, up = call("POST", "/uploads", raw=targz(sec))
+            code, sj = call("POST", "/jobs", {"kind": "swarm", "upload": up["upload"], "brief": "BRIEFCANARY"})
+            code, sj = call("GET", f"/jobs/{sj['id']}?wait=60", timeout=90)
+            code, up = call("POST", "/uploads", who="grok", raw=targz(proj))
+            check(call("POST", "/jobs", {"kind": "swarm", "upload": up["upload"], "public": True}, who="grok")[0] == 403,
+                  "GrokBot's token may not mark work public")
+            check(all(call("POST", p_, b_, who="feed")[0] == 403 for p_, b_ in (
+                ("/v1/chat/completions", {"messages": msg0}), ("/jobs", {"kind": "chat", "messages": msg0}), ("/uploads", {}))),
+                "the feeder's token (view scope) may not chat, start jobs or upload")
+            subprocess.run([sys.executable, lcd, "token", "set", "grok", "--visibility", "hidden"], env=env, check=True)
+            mark = len(frames)
+            code, hj = call("POST", "/jobs", {"kind": "chat", "messages": [{"role": "user", "content": "HIDDENCANARY"}]}, who="grok")
+            code, hj = call("GET", f"/jobs/{hj['id']}?wait=30", who="grok")
+            code, hs = call("POST", "/jobs", {"kind": "swarm", "upload": up["upload"]}, who="grok")
+            time.sleep(0.8)
+            q = frames[-1]["snap"]["lab"]["queue"]
+            check(hj["state"] == "done" and not [e for fr in frames[mark:] for e in fr["events"] if e["job"].startswith("chat ")]
+                  and any(r["kind"] == "private" and r["state"] == "awaiting_approval" and "job" not in r and "caller" not in r
+                          for r in q), f"a hidden caller's jobs never show; in the queue only as a private job: {q}")
+            call("POST", f"/jobs/{hs['id']}/cancel", who="grok")
+            subprocess.run([sys.executable, lcd, "token", "set", "grok", "--visibility", "shape"], env=env, check=True)
             code, up = call("POST", "/uploads", who="grok", raw=targz(proj))
             code, g = call("POST", "/jobs", {"kind": "swarm", "upload": up["upload"]}, who="grok")
             check(code == 200 and g["state"] == "awaiting_approval", f"GrokBot's swarm job waits for approval: {g.get('state')}")
@@ -325,6 +398,19 @@ def main():
             check(sj["state"] == hm["state"] == "done" and sj["started"] < hm["started"] and sw[-2:] == [("main", "swarm"), ("swarm", "main")],
                   f"high work arriving during a switch waits for the job the switch was for (no bounce back): {sw[-3:]}")
 
+            check(until(lambda: frames[-1]["snap"]["run"]["done"] and not frames[-1]["snap"]["scouts"], 20),
+                  "idle past the gap: the session ends and its agents leave the page")
+            dc = events(job="door", ev="answer")
+            check(dc and any(fr["snap"]["scouts"].get(dc[0]["s"], {}).get("role") == "chat" for fr in frames),
+                  "door chats show as chat agents")
+            sessions = {fr["snap"]["run"]["id"] for fr in frames if fr["snap"]["run"]}
+            check(len(sessions) >= 2, f"quiet spells end sessions, new work starts the next: {len(sessions)} sessions")
+            corpus = "\n".join(seen)
+            leaks = [w for w in ("SHAPECANARY", "canary_name", "secret/", "BRIEFCANARY", "HIDDENCANARY", "x0 = 0", "pkg/a.py",
+                                 "return a - b", "return a + b", "add must add", "echo main", "it subtracts",
+                                 tok["claude"], tok["feed"]) if w in corpus]
+            check(not leaks and "PUBLICTEXT_0" in corpus, f"no text of a job not marked public ever reached the view: {leaks}")
+
             mcp = subprocess.Popen([sys.executable, os.path.join(LC, "lc-mcp")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    text=True, env={**env, "LC_URL": base, "LC_TOKEN": tok["claude"], "HOME": d})
 
@@ -353,8 +439,12 @@ def main():
             check("tests PASS" in text and "apply: patch -p1 -d" in text, f"MCP: implement, then job gives the patch and how to apply it: {text[:200]}")
             r = rpc(6, "tools/call", {"name": "job", "arguments": {"id": "000000000000"}})
             check(r["result"].get("isError"), "MCP: a bad job id is an error, not a crash")
+            r = rpc(7, "tools/call", {"name": "swarm", "arguments": {"path": projd, "public": True}})
+            check(r["result"].get("isError") and "not in a git repository" in r["result"]["content"][0]["text"],
+                  "MCP: public needs a pushed git repository (here: none)")
             mcp.stdin.close(); mcp.wait(5)
         finally:
+            stop_poll.set()
             proc.terminate(); proc.wait(10)
             subprocess.run([setup, "stop"])
             if failed:
