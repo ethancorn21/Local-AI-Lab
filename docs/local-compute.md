@@ -26,8 +26,8 @@ runs each job there. A caller never starts or stops a model server; it names a s
 | swarm | Qwen3.6-35B-A3B, 4-bit AWQ; vLLM over both 3090s | 64k a scout | swarm jobs | about 42 of 60 planted bugs in a 44k-line codebase in 30 minutes |
 | big | Qwen3.8-Flash-Next IQ3_S on Strata, split by hand at layer 27 | 262k | one long read: a whole codebase or log in one prompt | 118-121 tok/s for one request; reads 175k tokens in 46 s (main: 188 s); holds up best at 191k |
 
-Only one setup runs at a time: each takes both 3090s. A switch costs 1-3.5 minutes. The RTX 5060 Ti stays with the
-ancient-works matchers that own it; the bench measured a 4B swarm on it beside main at no cost to main, but at the
+Only one setup runs at a time: each takes both 3090s. A switch costs 1.5-2 minutes (measured live
+on 10-24: to main 84-85 s, to big 104 s, to swarm 113 s). The RTX 5060 Ti stays with the ancient-works matchers that own it; the bench measured a 4B swarm on it beside main at no cost to main, but at the
 4B's quality, so it is not a setup.
 
 ## Callers

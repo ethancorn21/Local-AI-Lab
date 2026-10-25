@@ -15,7 +15,7 @@ INSTRUCTIONS = (
     "The owner's AI box at home: local models on two RTX 3090s, free to use (no API cost), private, and slower than "
     "you. Use it when work can be handed off: a well-specified change with tests (implement), a wide read of a "
     "codebase for bugs or for something specific (swarm), or reading large files you would rather not spend your "
-    "context on (ask with files). Jobs queue; the box switches models as needed (1-3.5 min a switch). Check the "
+    "context on (ask with files). Jobs queue; the box switches models as needed (1.5-2 min a switch). Check the "
     "results: the local models are weaker than you, a patch is a proposal, swarm findings are leads.")
 
 PRIORITY = ("high: goes next, after the work running now (a model switch included), ahead of normal work; for "

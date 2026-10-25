@@ -51,14 +51,14 @@ SETUP_CMD = os.environ.get("LC_SETUP", os.path.join(HERE, "lc-setup"))
 PORTS = [int(p) for p in os.environ.get("LC_PORTS", "8080,8081").split(",")]   # the two ports the tailnet forwards
 IDLE_SETUP = os.environ.get("LC_IDLE_SETUP", "main")   # loaded when nothing asks for another; "" leaves the cards empty
 MAX_WAIT = int(os.environ.get("LC_MAX_WAIT", "600"))   # s: another setup's work waits this long, then the loaded
-# setup stops taking new work, finishes what it runs, and the service switches (a switch costs 1-3.5 min)
+# setup stops taking new work, finishes what it runs, and the service switches (a switch costs 1.5-2 min)
 IDLE_RETURN = int(os.environ.get("LC_IDLE_RETURN", "900"))   # s idle on swarm or big before main comes back
 # How long work is expected to take, for backfill and the queue's expected starts (10-24, the owner: "don't put me
 # in the back of the queue", and a live view of the lab's work). A kind's median over its last 20 done jobs once it
 # has 5, before that these: the bench's chat of a few thousand tokens, implement task, 100-area swarm, check of about
-# 100 findings, and its switch times (docs/serving-bench.md, Switch time).
+# 100 findings; switch times as measured.
 TYPICAL_S = {"chat": 90, "implement": 900, "swarm": 1800, "verify": 600}
-SWITCH_S = {"main": 90, "swarm": 210, "big": 90}
+SWITCH_S = {"main": 85, "swarm": 115, "big": 105}   # measured live 10-24 (the bench: 90, 210, 90)
 BACKFILL_MARGIN = 30   # s: work started during a drain must be expected to end this long before the running work
 CHECK_EVERY = int(os.environ.get("LC_CHECK_EVERY", "30"))   # s between looks at the containers and the bench
 PING_CMD = os.environ.get("LC_PING")   # tests: a command that takes the phone message on stdin
